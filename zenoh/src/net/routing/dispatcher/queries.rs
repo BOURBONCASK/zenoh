@@ -292,14 +292,14 @@ impl Face {
                     src_qid: msg.id,
                 });
 
-                for (bnd, hat) in rtables.hats.iter() {
+                for (region, hat) in rtables.hats.iter() {
                     if hat.ingress_filter(&rtables.data, &self.state, &expr) {
                         let qabls = get_query_route(
                             &rtables,
                             &self.state,
                             &expr,
                             msg.ext_nodeid.node_id,
-                            bnd,
+                            region,
                         );
 
                         compute_final_route(

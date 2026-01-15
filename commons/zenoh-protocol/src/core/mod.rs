@@ -640,11 +640,125 @@ impl CongestionControl {
     pub(crate) const DEFAULT_OAM: Self = Self::Block;
 }
 
+/// Region name.
+///
+/// A region name is a non-empty UTF-8 string limited to [`Self::MAX_LEN`] bytes. It is used to
+/// communicate (north) regions names in establishment as well as to match against said names in
+/// `gateway` configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegionName(String);
+
+impl RegionName {
+    pub const MAX_LEN: usize = 32;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    fn validate<S>(s: S) -> Result<S, InvalidRegionNameError>
+    where
+        S: AsRef<str>,
+    {
+        if s.as_ref().is_empty() {
+            return Err(InvalidRegionNameError::Empty);
+        }
+
+        if s.as_ref().len() > Self::MAX_LEN {
+            return Err(InvalidRegionNameError::TooLong);
+        }
+
+        Ok(s)
+    }
+
+    #[cfg(feature = "test")]
+    #[doc(hidden)]
+    pub fn rand() -> Self {
+        use rand::distributions::{Alphanumeric, DistString};
+
+        Alphanumeric
+            .sample_string(&mut rand::thread_rng(), Self::MAX_LEN)
+            .try_into()
+            .unwrap()
+    }
+}
+
+impl FromStr for RegionName {
+    type Err = InvalidRegionNameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::validate(s).map(|s| Self(s.to_string()))
+    }
+}
+
+impl TryFrom<String> for RegionName {
+    type Error = InvalidRegionNameError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::validate(s).map(Self)
+    }
+}
+
+#[derive(Debug)]
+pub enum InvalidRegionNameError {
+    Empty,
+    TooLong,
+}
+
+impl Display for InvalidRegionNameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            InvalidRegionNameError::Empty => f.write_str("region names should be non-empty"),
+            InvalidRegionNameError::TooLong => write!(
+                f,
+                "region names should be at most {} bytes",
+                RegionName::MAX_LEN
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for InvalidRegionNameError {}
+
+impl<'de> Deserialize<'de> for RegionName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RegionNameVisitor;
+
+        impl serde::de::Visitor<'_> for RegionNameVisitor {
+            type Value = RegionName;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                write!(
+                    f,
+                    "a non-empty UTF-8 string of at most {} bytes",
+                    RegionName::MAX_LEN
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                RegionName::from_str(v).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(RegionNameVisitor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::str::FromStr;
 
-    use crate::core::{Priority, PriorityRange};
+    use crate::core::{Priority, PriorityRange, RegionName};
 
     #[test]
     fn test_priority_range() {
@@ -664,5 +778,16 @@ mod tests {
 
         assert!(PriorityRange::from_str("1-").is_err());
         assert!(PriorityRange::from_str("-5").is_err());
+    }
+
+    #[test]
+    fn test_region_name_ok() {
+        assert!(RegionName::from_str("1234567812345678").is_ok());
+    }
+
+    #[test]
+    fn test_region_name_err() {
+        assert!(RegionName::from_str("12345678123456789").is_err());
+        assert!(RegionName::from_str("").is_err());
     }
 }

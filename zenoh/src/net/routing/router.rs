@@ -18,7 +18,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use uhlc::HLC;
-use zenoh_config::{Config, ModeDependent};
+use zenoh_config::{ExpandedConfig, ModeDependent};
 use zenoh_protocol::core::{WhatAmI, ZenohIdProto};
 use zenoh_result::ZResult;
 use zenoh_transport::{
@@ -47,8 +47,8 @@ use crate::net::{
     },
 };
 
-pub struct RouterBuilder<'conf> {
-    config: &'conf Config,
+pub struct RouterBuilder<'c> {
+    config: &'c ExpandedConfig,
     hlc: Option<Arc<HLC>>,
     hats: Vec<(Region, WhatAmI)>,
     #[cfg(feature = "stats")]
@@ -56,7 +56,7 @@ pub struct RouterBuilder<'conf> {
 }
 
 impl<'conf> RouterBuilder<'conf> {
-    pub fn new(config: &'conf Config) -> RouterBuilder<'conf> {
+    pub fn new(config: &'conf ExpandedConfig) -> RouterBuilder<'conf> {
         Self {
             config,
             hlc: None,
@@ -84,30 +84,29 @@ impl<'conf> RouterBuilder<'conf> {
     }
 
     pub fn build(mut self) -> ZResult<Router> {
-        let zid = ZenohIdProto::from(self.config.id().expect("Config should be expanded"));
-        let mode = self.config.mode().expect("Config should be expanded");
-
-        let gateway_config = self
-            .config
-            .gateway
-            .get(mode)
-            .ok_or_else(|| zerror!("Undefined gateway configuration"))?;
+        let zid = ZenohIdProto::from(self.config.id());
+        let mode = self.config.mode();
 
         if self.hats.is_empty() {
             self.hats
                 .extend([(Region::North, mode), (Region::Local, WhatAmI::Client)]);
 
-            for mode in [WhatAmI::Client, WhatAmI::Peer, WhatAmI::Router] {
-                self.hats.push((Region::Undefined { mode }, mode));
+            if self.config.gateway.fallback.as_ref().unwrap().enabled {
+                for mode in [WhatAmI::Client, WhatAmI::Peer, WhatAmI::Router] {
+                    self.hats.push((Region::Fallback { mode }, mode));
+                }
             }
         }
 
-        for (index, _) in gateway_config.south.iter().enumerate() {
+        let south = self.config.gateway.south.get(mode).ok_or_else(|| {
+            zerror!("`mode` is set to `{mode}` but `gateway.south.{mode}` is not set")
+        })?;
+
+        for (number, _) in south.iter().enumerate() {
             // REVIEW(regions): we create three hats per subregion.
             // If memory usage is an issue, we should create then lazily.
             for mode in [WhatAmI::Client, WhatAmI::Peer, WhatAmI::Router] {
-                self.hats
-                    .push((Region::Subregion { id: index, mode }, mode));
+                self.hats.push((Region::South { number, mode }, mode));
             }
         }
 
@@ -280,6 +279,7 @@ impl Router {
             .filter(|(_, f)| f.remote_bound.is_south())
             .count();
 
+        // FIXME(regions): this error message is bad!
         if gwy_count > 1 {
             tracing::error!(
                 total = gwy_count,

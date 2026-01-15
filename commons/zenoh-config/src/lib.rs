@@ -37,7 +37,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     num::{NonZeroU16, NonZeroUsize},
-    ops::{self, Bound, Deref, RangeBounds},
+    ops::{self, Bound, Deref, DerefMut, RangeBounds},
     path::Path,
     sync::{Arc, Weak},
 };
@@ -69,6 +69,8 @@ pub use mode_dependent::*;
 
 pub mod connection_retry;
 pub use connection_retry::*;
+
+use crate::gateway::{FallbackBoundConf, NorthBoundConf, SouthBoundConf};
 
 // Wrappers for secrecy of values
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -473,7 +475,7 @@ validated_struct::validator! {
         metadata: Value,
         /// The node's mode ("router" (default value in `zenohd`), "peer" or "client").
         mode: Option<whatami::WhatAmI>,
-        pub gateway: ModeDependentValue<gateway::GatewayConf>,
+        pub gateway: gateway::GatewayConf,
         /// Which zenoh nodes to connect to.
         pub connect:
         ConnectConfig {
@@ -1335,16 +1337,68 @@ impl Config {
     /// Expands the config with missing but required fields.
     ///
     /// This method should be called before a user-supplied config is used in the runtime.
-    pub fn expanded(mut self) -> Self {
+    pub fn expanded(mut self) -> ExpandedConfig {
         if self.id.is_none() {
-            self.set_id(Some(ZenohId::default())).unwrap();
+            self.set_id(Some(Default::default())).unwrap();
         }
 
         if self.mode.is_none() {
-            self.set_mode(Some(WhatAmI::default())).unwrap();
+            self.set_mode(Some(Default::default())).unwrap();
         }
 
-        self
+        if self.gateway.north.is_none() {
+            self.gateway.north = Some(Default::default());
+        }
+
+        if self.gateway.south.is_none() {
+            self.gateway.south = Some(Default::default());
+        }
+
+        if self.gateway.fallback.is_none() {
+            self.gateway.fallback = Some(Default::default());
+        }
+
+        ExpandedConfig(self)
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ExpandedConfig(Config);
+
+impl ExpandedConfig {
+    pub fn id(&self) -> ZenohId {
+        self.0.id.unwrap()
+    }
+
+    pub fn mode(&self) -> WhatAmI {
+        self.0.mode.unwrap()
+    }
+
+    pub fn gateway_north(&self) -> &ModeDependentValue<NorthBoundConf> {
+        self.0.gateway.north.as_ref().unwrap()
+    }
+
+    pub fn gateway_south(&self) -> &ModeDependentValue<Vec<SouthBoundConf>> {
+        self.0.gateway.south.as_ref().unwrap()
+    }
+
+    pub fn gateway_fallback(&self) -> &FallbackBoundConf {
+        self.0.gateway.fallback.as_ref().unwrap()
+    }
+}
+
+impl Deref for ExpandedConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ExpandedConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 

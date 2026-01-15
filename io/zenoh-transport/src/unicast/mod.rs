@@ -32,7 +32,7 @@ pub use manager::*;
 use zenoh_core::zcondfeat;
 use zenoh_link::Link;
 use zenoh_protocol::{
-    core::{Bits, WhatAmI, ZenohIdProto},
+    core::{Bits, RegionName, WhatAmI, ZenohIdProto},
     network::NetworkMessageMut,
     transport::{close, init::ext::PatchType, TransportSn},
 };
@@ -53,6 +53,7 @@ use crate::{unicast::authentication::TransportAuthId, Bound};
 pub(crate) struct TransportConfigUnicast {
     pub(crate) zid: ZenohIdProto,
     pub(crate) whatami: WhatAmI,
+    pub(crate) region_name: Option<RegionName>,
     pub(crate) bound: Bound,
     pub(crate) sn_resolution: Bits,
     pub(crate) tx_initial_sn: TransportSn,
@@ -120,6 +121,7 @@ impl TransportUnicast {
             is_qos: transport.is_qos(),
             #[cfg(feature = "shared-memory")]
             is_shm: transport.is_shm(),
+            region_name: transport.region_name(),
         };
         Ok(tp)
     }

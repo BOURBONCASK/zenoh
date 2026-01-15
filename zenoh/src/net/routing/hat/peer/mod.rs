@@ -150,7 +150,7 @@ impl Hat {
 impl HatBaseTrait for Hat {
     fn init(&mut self, tables: &mut TablesData, runtime: Runtime) -> ZResult<()> {
         let config_guard = runtime.config().lock();
-        let config = &config_guard.0;
+        let config = &config_guard;
         let whatami = tables.hats[self.region].whatami;
         let gossip = unwrap_or_default!(config.scouting().gossip().enabled());
         let gossip_multihop = unwrap_or_default!(config.scouting().gossip().multihop());

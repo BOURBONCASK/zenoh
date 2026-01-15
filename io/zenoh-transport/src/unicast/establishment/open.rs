@@ -59,6 +59,7 @@ struct StateTransport {
     ext_shm: ext::shm::StateOpen,
     ext_lowlatency: ext::lowlatency::StateOpen,
     ext_patch: ext::patch::StateOpen,
+    ext_region_name: ext::region_name::StateOpen,
 }
 
 #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
@@ -128,6 +129,8 @@ struct OpenLink<'a> {
     #[cfg(feature = "transport_compression")]
     ext_compression: ext::compression::CompressionFsm<'a>,
     ext_patch: ext::patch::PatchFsm<'a>,
+    ext_region_name: ext::region_name::RegionNameFsm,
+    // TODO(regions): move this into `ext::region::RegionFsm` (?)
     ext_south: Option<BoundCallback>,
 }
 
@@ -204,6 +207,13 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
+        // Extension RegionName
+        let ext_region_name = self
+            .ext_region_name
+            .send_init_syn(&state.transport.ext_region_name)
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         let msg: TransportMessage = InitSyn {
             version: input.mine_version,
             whatami: input.mine_whatami,
@@ -219,6 +229,7 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             ext_lowlatency,
             ext_compression,
             ext_patch,
+            ext_region_name,
         }
         .into();
 
@@ -252,7 +263,7 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             TransportBody::Close(Close { reason, .. }) => {
                 let e = zerror!(
                     "Received a close message (reason {}) in response to an InitSyn on: {}",
-                    close::reason_to_str(reason),
+                    reason,
                     link,
                 );
                 match reason {
@@ -366,6 +377,15 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
+        // Extension RegionName
+        self.ext_region_name
+            .recv_init_ack((
+                &mut state.transport.ext_region_name,
+                init_ack.ext_region_name,
+            ))
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         let output = RecvInitAckOut {
             other_zid: init_ack.zid,
             other_whatami: init_ack.whatami,
@@ -438,7 +458,15 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
             None
         );
 
-        let ext_south = self.ext_south.as_ref().and_then(|f| {
+        // Extension RegionName
+        let region_name = self
+            .ext_region_name
+            .send_open_syn(&state.transport.ext_region_name)
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
+        // Extension South
+        let ext_south = if let Some(callback) = self.ext_south.as_ref() {
             let p = TransportPeer {
                 zid: input.other_zid,
                 whatami: input.other_whatami,
@@ -450,9 +478,16 @@ impl<'a, 'b: 'a> OpenFsm for &'a mut OpenLink<'b> {
                 is_qos: ext_qos.is_some(),
                 #[cfg(feature = "shared-memory")]
                 is_shm: ext_shm.is_some(),
+                region_name,
             };
-            (f(p) == Bound::South).then_some(South {})
-        });
+
+            callback(p)
+                .map_err(|e| (e, Some(close::reason::GENERIC)))?
+                .is_south()
+                .then_some(South {})
+        } else {
+            None
+        };
 
         // Build and send an OpenSyn message
         let mine_initial_sn =
@@ -617,6 +652,7 @@ pub(crate) async fn open_link(
         ext_compression: ext::compression::CompressionFsm::new(),
         ext_patch: ext::patch::PatchFsm::new(),
         ext_south: manager.config.bound_callback.clone(),
+        ext_region_name: ext::region_name::RegionNameFsm::new(manager.config.region_name.clone()),
     };
 
     // Clippy raises a warning because `batch_size::UNICAST` is currently equal to `BatchSize::MAX`.
@@ -649,6 +685,7 @@ pub(crate) async fn open_link(
                     manager.config.unicast.is_lowlatency,
                 ),
                 ext_patch: ext::patch::StateOpen::new(),
+                ext_region_name: ext::region_name::StateOpen::new(),
             },
             #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
             link: StateLink {
@@ -717,6 +754,7 @@ pub(crate) async fn open_link(
         #[cfg(feature = "auth_usrpwd")]
         auth_id: UsrPwdId(None),
         patch: state.transport.ext_patch.get(),
+        region_name: state.transport.ext_region_name.other_region_name(),
     };
 
     let o_config = TransportLinkUnicastConfig {

@@ -7,7 +7,7 @@ use zenoh_config::WhatAmI;
 pub(crate) use zenoh_transport::Bound;
 
 /// Subregion identifier.
-pub(crate) type SubregionId = usize;
+pub(crate) type SubregionNumber = usize;
 
 /// Region identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -16,17 +16,20 @@ pub(crate) enum Region {
     North,
     /// Subregion of local sessions.
     Local,
-    /// Subregion of remotes with no user-defined subregion.
-    Undefined { mode: WhatAmI }, // REVIEW(regions): call this "unbound" even though it's effectively south-bound?
     /// User-defined subregions.
-    Subregion { id: SubregionId, mode: WhatAmI },
+    South {
+        number: SubregionNumber,
+        mode: WhatAmI,
+    },
+    /// Subregion of remotes with no user-defined subregion.
+    Fallback { mode: WhatAmI },
 }
 
 impl Region {
     pub(crate) fn bound(&self) -> Bound {
         match self {
             Region::North => Bound::North,
-            Region::Local | Region::Undefined { .. } | Region::Subregion { .. } => Bound::South,
+            Region::Local | Region::Fallback { .. } | Region::South { .. } => Bound::South,
         }
     }
 }
@@ -36,8 +39,8 @@ impl Display for Region {
         match self {
             Region::North => f.write_str("north"),
             Region::Local => f.write_str("local"),
-            Region::Undefined { mode } => write!(f, "undef:{mode}"),
-            Region::Subregion { id, mode } => write!(f, "south:{mode}:{id}"),
+            Region::Fallback { mode } => write!(f, "undef:{mode}"),
+            Region::South { number: id, mode } => write!(f, "south:{mode}:{id}"),
         }
     }
 }

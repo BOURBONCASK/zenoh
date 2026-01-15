@@ -63,6 +63,7 @@ struct StateTransport {
     ext_shm: ext::shm::StateAccept,
     ext_lowlatency: ext::lowlatency::StateAccept,
     ext_patch: ext::patch::StateAccept,
+    ext_region_name: ext::region_name::StateAccept,
 }
 
 #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
@@ -149,6 +150,7 @@ struct AcceptLink<'a> {
     ext_compression: ext::compression::CompressionFsm<'a>,
     ext_patch: ext::patch::PatchFsm<'a>,
     ext_south: Option<BoundCallback>,
+    ext_region_name: ext::region_name::RegionNameFsm,
 }
 
 #[async_trait]
@@ -280,6 +282,15 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
+        // Extension RegionName
+        self.ext_region_name
+            .recv_init_syn((
+                &mut state.transport.ext_region_name,
+                init_syn.ext_region_name,
+            ))
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         let output = RecvInitSynOut {
             other_zid: init_syn.zid,
             other_whatami: init_syn.whatami,
@@ -359,6 +370,13 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             .await
             .map_err(|e| (e, Some(close::reason::GENERIC)))?;
 
+        // Extension RegionName
+        let ext_region_name = self
+            .ext_region_name
+            .send_init_ack(&state.transport.ext_region_name)
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         // Create the cookie
         let (cookie, cookie_nonce): (ZSlice, u64) = {
             let mut prng = zasynclock!(self.prng);
@@ -381,6 +399,7 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
                 #[cfg(feature = "transport_compression")]
                 ext_compression: state.link.ext_compression,
                 ext_patch: state.transport.ext_patch,
+                ext_region_name: state.transport.ext_region_name,
             };
 
             let mut encrypted = vec![];
@@ -416,6 +435,7 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             ext_lowlatency,
             ext_compression,
             ext_patch,
+            ext_region_name,
         }
         .into();
 
@@ -518,6 +538,7 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
                 ext_shm: cookie.ext_shm,
                 ext_lowlatency: cookie.ext_lowlatency,
                 ext_patch: cookie.ext_patch,
+                ext_region_name: cookie.ext_region_name,
             },
             #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
             link: StateLink {
@@ -650,8 +671,15 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
             None
         );
 
+        // Extension RegionName
+        let region_name = self
+            .ext_region_name
+            .send_open_ack(&state.transport.ext_region_name)
+            .await
+            .map_err(|e| (e, Some(close::reason::GENERIC)))?;
+
         // Extension South
-        let ext_south = self.ext_south.as_ref().and_then(|f| {
+        let ext_south = if let Some(callback) = self.ext_south.as_ref() {
             let p = TransportPeer {
                 zid: input.other_zid,
                 whatami: input.other_whatami,
@@ -663,9 +691,16 @@ impl<'a, 'b: 'a> AcceptFsm for &'a mut AcceptLink<'b> {
                 is_qos: ext_qos.is_some(),
                 #[cfg(feature = "shared-memory")]
                 is_shm: ext_shm.is_some(),
+                region_name,
             };
-            (f(p) == Bound::South).then_some(South {})
-        });
+
+            callback(p)
+                .map_err(|e| (e, Some(close::reason::GENERIC)))?
+                .is_south()
+                .then_some(South {})
+        } else {
+            None
+        };
 
         // Build OpenAck message
         let mine_initial_sn =
@@ -732,6 +767,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         ext_compression: ext::compression::CompressionFsm::new(),
         ext_patch: ext::patch::PatchFsm::new(),
         ext_south: manager.config.bound_callback.clone(),
+        ext_region_name: ext::region_name::RegionNameFsm::new(manager.config.region_name.clone()),
     };
 
     // Init handshake
@@ -775,6 +811,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
                         manager.config.unicast.is_lowlatency,
                     ),
                     ext_patch: ext::patch::StateAccept::new(),
+                    ext_region_name: ext::region_name::StateAccept::new(),
                 },
                 #[cfg(any(feature = "transport_auth", feature = "transport_compression"))]
                 link: StateLink {
@@ -842,6 +879,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         #[cfg(feature = "auth_usrpwd")]
         auth_id: osyn_out.other_auth_id,
         patch: state.transport.ext_patch.get(),
+        region_name: state.transport.ext_region_name.other_region_name(),
     };
 
     let a_config = TransportLinkUnicastConfig {

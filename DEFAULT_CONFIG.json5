@@ -247,6 +247,47 @@
     },
   },
 
+  /// Gateway configuration.
+  ///
+  /// - `gateway.region_name` is the (north) region's name: non-empty UTF-8 strings of
+  ///   at most 32 bytes. They are used during establishment to assign remotes to a region.
+  ///
+  /// - `gateway.north.filters` and `gateway.south.*.filters` are lists of objects. Each object may
+  ///   contain the following optional keys:
+  ///   - `modes`: a WhatAmI matcher. 
+  ///   - `interfaces`: a list of network interface names. 
+  ///   - `zids`: a list of Zenoh IDs.
+  ///   - `region_names`: a list of region names.
+  ///
+  /// `gateway.south` implicitly defines a list of subregions. Remotes are assigned subregion number
+  /// `i` if and only if `gateway.south[i].filters` matches said remote. The same applies to
+  /// `gateway.north.filters`. If no filters match, remotes are assigned to a builtin (south-bound)
+  /// region called "undefined".
+  ///
+  /// `gateway.fallback.enabled` allows for enabling/disabling the fallback region.
+  ///
+  /// The following is the mode-dependent default value of `gateway`. The mode-dependent structure
+  /// (i.e. the object with different `gateway` values for `router`, `peer` and `client`), is not
+  /// necessary and `gateway` can be assigned one mode-independent value.
+  gateway: {
+    region_name: null,
+    north: {
+      router: { filters: [{ modes: ["router"] }] },
+      peer: { filters: [{ modes: ["router", "peer"] }] },
+      client: { filters: [{ modes: ["router", "peer"] }] }
+    },
+    south: [
+      {
+        router: [{ modes: ["peer", "client"] }],
+        peer: [{ modes: ["client"] }],
+        client: []
+      }
+    ],
+    fallback: {
+      enabled: true
+    }
+  },
+
   // /// Overwrite QoS options for Zenoh messages by key expression (ignores Zenoh API QoS config for overwritten values)
   // qos: {
   //   /// Overwrite QoS options for PUT and DELETE messages

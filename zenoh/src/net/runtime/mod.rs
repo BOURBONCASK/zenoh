@@ -19,6 +19,7 @@
 //! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 mod adminspace;
 pub mod orchestrator;
+mod region;
 
 #[cfg(feature = "plugins")]
 use std::sync::{Mutex, MutexGuard};
@@ -39,8 +40,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uhlc::{HLCBuilder, HLC};
 use zenoh_config::{
-    gateway::BoundFilterConf, unwrap_or_default, GenericConfig, IConfig, Interface, ModeDependent,
-    ZenohId,
+    unwrap_or_default, ExpandedConfig, GenericConfig, IConfig, ModeDependent, ZenohId,
 };
 #[allow(unused_imports)]
 use zenoh_core::polyfill::*;
@@ -122,7 +122,7 @@ pub(crate) struct RuntimeState {
     whatami: WhatAmI,
     next_id: AtomicU32,
     router: Arc<Router>,
-    config: Notifier<Config>,
+    config: Notifier<ExpandedConfig>,
     manager: TransportManager,
     transport_handlers: std::sync::RwLock<Vec<Arc<dyn TransportEventHandler>>>,
     locators: std::sync::RwLock<Vec<Locator>>,
@@ -173,14 +173,16 @@ pub trait IRuntime: Send + Sync {
     fn get_config(&self) -> GenericConfig;
 }
 
-impl IConfig for Notifier<Config> {
+impl IConfig for Notifier<ExpandedConfig> {
     fn get(&self, key: &str) -> ZResult<String> {
-        self.lock().get_json(key)
+        self.lock()
+            .get_json(key)
+            .map_err(|err| zerror!("{err}").into())
     }
 
     fn queries_default_timeout_ms(&self) -> u64 {
         let guard = self.lock();
-        let config = &guard.0;
+        let config = &guard;
         unwrap_or_default!(config.queries_default_timeout())
     }
 
@@ -393,7 +395,7 @@ impl RuntimeState {
         self.router.clone()
     }
 
-    fn config(&self) -> &Notifier<Config> {
+    fn config(&self) -> &Notifier<ExpandedConfig> {
         &self.config
     }
 
@@ -425,7 +427,7 @@ impl WeakRuntime {
 }
 
 pub struct RuntimeBuilder {
-    config: zenoh_config::Config,
+    config: zenoh_config::ExpandedConfig,
     #[cfg(feature = "plugins")]
     plugins_manager: Option<PluginsManager>,
     #[cfg(feature = "shared-memory")]
@@ -465,10 +467,10 @@ impl RuntimeBuilder {
         } = self;
 
         tracing::debug!("Zenoh Rust API {}", GIT_VERSION);
-        let zid = ZenohIdProto::from(config.id().expect("Config should be expanded"));
+        let zid = ZenohIdProto::from(config.id());
         tracing::info!("Using ZID: {}", zid);
 
-        let whatami = unwrap_or_default!(config.mode());
+        let whatami = config.mode();
 
         #[cfg(feature = "stats")]
         let stats = zenoh_stats::StatsRegistry::new(zid, whatami, &*crate::LONG_VERSION);
@@ -496,11 +498,7 @@ impl RuntimeBuilder {
             .whatami(whatami)
             .bound_callback({
                 let config = config.clone();
-                move |p| {
-                    compute_transport_peer_region(&config, &p)
-                        .map(|b| b.bound())
-                        .unwrap_or_default()
-                }
+                move |p| region::compute_transient_region_of(&config, &p).map(|r| r.bound())
             });
 
         #[cfg(feature = "shared-memory")]
@@ -525,7 +523,7 @@ impl RuntimeBuilder {
         let shm_init_mode = *config.transport.shared_memory.mode();
 
         let namespace = config.namespace().clone();
-        let config = Notifier::new(crate::config::Config(config));
+        let config = Notifier::new(config);
         let span = tracing::trace_span!("rt", zid = %zid.short());
         let runtime = Runtime {
             state: Arc::new(RuntimeState {
@@ -657,7 +655,7 @@ impl Runtime {
         self.state.router()
     }
 
-    pub fn config(&self) -> &Notifier<Config> {
+    pub fn config(&self) -> &Notifier<ExpandedConfig> {
         self.state.config()
     }
 
@@ -737,7 +735,11 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                         })
                         .collect();
 
-                let region = compute_transport_peer_region(&runtime.config().lock().0, &peer)?;
+                // FIXME(regions): find a way to cache this value during establishment.
+                let transient_region =
+                    region::compute_transient_region_of(&runtime.config().lock(), &peer)?;
+
+                let region = region::compute_region_of(&transient_region, &transport.get_bound()?)?;
 
                 fn north_bound_transport_peer_count(
                     runtime: &Runtime,
@@ -765,21 +767,21 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
 
                                 // NOTE(regions): compute bound instead of querying the router as
                                 // the corresponding transport face might not exist yet
-                                let Ok(bound) = compute_transport_peer_region(
-                                    &runtime.config().lock().0,
+                                let Ok(region) = region::compute_transient_region_of(
+                                    &runtime.config().lock(),
                                     &peer,
                                 ) else {
                                     tracing::error!(
                                         zid = %peer.zid.short(),
-                                        wai = %peer.whatami.short(),
-                                        "Could not get transport peer bound \
+                                        wai = %peer.whatami,
+                                        "Could not get transport peer region \
                                         while computing north-bound transport count. \
                                         Will ignore this transport"
                                     );
                                     return false;
                                 };
 
-                                bound.bound().is_north()
+                                region.bound().is_north()
                             })
                             .count()
                     })
@@ -794,7 +796,7 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
 
                 tracing::trace!(
                     peer.zid = %peer.zid.short(),
-                    peer.mode = %peer.whatami.short(),
+                    peer.mode = %peer.whatami,
                     peer.region = %region
                 );
 
@@ -826,13 +828,14 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                         .filter_map(|handler| handler.new_multicast(transport.clone()).ok())
                         .collect();
 
-                let region =
-                    compute_multicast_group_region(&runtime.config().lock().0, &transport)?;
+                if runtime.config().lock().mode().is_client() {
+                    bail!("Multicast groups are only supported in north peer/router regions");
+                }
 
                 runtime
                     .state
                     .router
-                    .new_transport_multicast(transport.clone(), region)?;
+                    .new_transport_multicast(transport.clone(), Region::North)?;
                 Ok(Arc::new(RuntimeMulticastGroup {
                     runtime: runtime.clone(),
                     transport,
@@ -901,13 +904,11 @@ impl TransportMulticastEventHandler for RuntimeMulticastGroup {
             .filter_map(|handler| handler.new_peer(peer.clone()).ok())
             .collect();
 
-        let region = compute_transport_peer_region(&self.runtime.config().lock().0, &peer)?;
-
         Ok(Arc::new(RuntimeMulticastSession {
             main_handler: self.runtime.state.router.new_peer_multicast(
                 self.transport.clone(),
                 peer,
-                region,
+                Region::North,
             )?,
             slave_handlers,
         }))
@@ -987,84 +988,6 @@ impl Closeable for Runtime {
     fn get_closee(&self) -> Self::TClosee {
         self.state.clone()
     }
-}
-
-#[allow(clippy::incompatible_msrv)]
-#[tracing::instrument(level = "debug", skip_all, fields(zid = %peer.zid.short(), mode = %peer.whatami), ret)]
-fn compute_transport_peer_region(
-    config: &zenoh_config::Config,
-    peer: &TransportPeer,
-) -> ZResult<Region> {
-    let mode = config.mode().expect("Config should be expanded");
-
-    let gateway_config = config
-        .gateway
-        .get(mode)
-        .ok_or_else(|| zerror!("`mode` is set to `{mode}` but `gateway.{mode}` is not set"))?;
-
-    let is_match = |filter: &BoundFilterConf| {
-        filter
-            .zids
-            .as_ref()
-            .is_none_or(|zid| zid.contains(&peer.zid.into()))
-            && filter.interfaces.as_ref().is_none_or(|ifaces| {
-                peer.links
-                    .iter()
-                    .flat_map(|link| {
-                        link.interfaces
-                            .iter()
-                            .map(|iface| Interface(iface.to_owned()))
-                    })
-                    .all(|iface| ifaces.contains(&iface))
-            })
-            && filter
-                .modes
-                .as_ref()
-                .is_none_or(|mode| mode.matches(peer.whatami))
-    };
-
-    let north = gateway_config
-        .north
-        .filters
-        .as_ref()
-        .is_none_or(|filters| filters.iter().any(is_match));
-
-    let south = gateway_config.south.iter().position(|south| {
-        south
-            .filters
-            .as_ref()
-            .is_none_or(|filters| filters.iter().any(is_match))
-    });
-
-    let region = match (north, south) {
-        (true, None) => Region::North,
-        (false, Some(index)) => Region::Subregion {
-            id: index,
-            mode: peer.whatami,
-        },
-        (false, None) | (true, Some(_)) => Region::Undefined { mode: peer.whatami },
-    };
-
-    if peer.whatami.is_router() && region.bound().is_south() && !mode.is_router() {
-        bail!("Router regions cannot be subregions of non-router regions")
-    }
-
-    Ok(region)
-}
-
-#[allow(clippy::incompatible_msrv)]
-#[tracing::instrument(level = "debug", skip_all, ret)]
-fn compute_multicast_group_region(
-    config: &zenoh_config::Config,
-    _group: &TransportMulticast, // TODO(regions*): remove this
-) -> ZResult<Region> {
-    let mode = config.mode().expect("Config should be expanded");
-
-    if mode.is_client() {
-        bail!("Multicast groups are only supported in north peer/router regions");
-    }
-
-    Ok(Region::North)
 }
 
 #[derive(Clone)]
