@@ -26,6 +26,7 @@ use zenoh_protocol::{
     network::{
         declare::queryable::ext::QueryableInfoType,
         ext::{self, NodeIdType},
+        interest::{InterestMode, InterestOptions},
         request::ext::QueryTarget,
         Declare, DeclareBody, DeclareKeyExpr, Mapping, Push, Request, Response, UndeclareKeyExpr,
     },
@@ -39,6 +40,7 @@ use crate::{
         routing::{
             dispatcher::{
                 face::{Face, FaceState},
+                interests::declare_interest,
                 pubsub::SubscriberInfo,
                 tables::Tables,
             },
@@ -51,6 +53,20 @@ use crate::{
 fn new_router() -> Router {
     let zid = ZenohIdProto::try_from([1]).unwrap();
     let whatami = WhatAmI::Client;
+    Router::new(
+        zid,
+        whatami,
+        Some(Arc::new(HLC::default())),
+        &Config::default(),
+        #[cfg(feature = "stats")]
+        zenoh_stats::StatsRegistry::new(zid, whatami, "test"),
+    )
+    .unwrap()
+}
+
+fn new_peer() -> Router {
+    let zid = ZenohIdProto::try_from([2]).unwrap();
+    let whatami = WhatAmI::Peer;
     Router::new(
         zid,
         whatami,
@@ -545,6 +561,40 @@ async fn clean_test() {
     assert!(res3.upgrade().is_none());
     assert!(res4.upgrade().is_none());
     assert!(res5.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn interest_cleanup_on_close_test() {
+    let router = new_peer();
+    let tables = router.tables.clone();
+
+    let primitives = Arc::new(DummyPrimitives {});
+    let face0 = &router.new_primitives(primitives);
+
+    let expr: WireExpr = "interest_drop".into();
+    declare_interest(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face0.state.clone(),
+        42,
+        Some(&expr),
+        InterestMode::CurrentFuture,
+        InterestOptions::KEYEXPRS + InterestOptions::QUERYABLES,
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+
+    let optres = Resource::get_resource(zread!(tables.tables)._get_root(), "interest_drop")
+        .map(|res| Arc::downgrade(&res));
+    assert!(optres.is_some());
+    let res = optres.unwrap();
+    assert!(res.upgrade().is_some());
+
+    face0.send_close();
+    assert!(res.upgrade().is_none());
 }
 
 pub struct ClientPrimitives {

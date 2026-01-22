@@ -1011,6 +1011,8 @@ pub(crate) fn unregister_expr_interest(
     id: InterestId,
 ) {
     let wtables = zwrite!(tables.tables);
-    get_mut_unchecked(face).remote_key_interests.remove(&id);
+    if let Some(mut res) = get_mut_unchecked(face).remote_key_interests.remove(&id).flatten() {
+        Resource::clean(&mut res);
+    }
     drop(wtables);
 }

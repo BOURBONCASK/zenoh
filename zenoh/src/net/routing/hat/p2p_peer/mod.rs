@@ -51,6 +51,7 @@ use self::{
 use super::{
     super::dispatcher::{
         face::FaceState,
+        interests as dispatcher_interests,
         tables::{NodeId, Resource, RoutingExpr, Tables, TablesLock},
     },
     HatBaseTrait, HatTrait, SendDeclare,
@@ -227,6 +228,21 @@ impl HatBaseTrait for HatCode {
         face: &mut Arc<FaceState>,
         send_declare: &mut SendDeclare,
     ) {
+        let interest_ids = {
+            let face = get_mut_unchecked(face);
+            let hat_face = match face.hat.downcast_mut::<HatFace>() {
+                Some(hat_face) => hat_face,
+                None => {
+                    tracing::error!("Error downcasting face hat in close_face!");
+                    return;
+                }
+            };
+            hat_face.remote_interests.keys().cloned().collect::<Vec<_>>()
+        };
+        for id in interest_ids {
+            dispatcher_interests::undeclare_interest(self, tables, face, id);
+        }
+
         let mut wtables = zwrite!(tables.tables);
         let mut face_clone = face.clone();
         let face = get_mut_unchecked(face);

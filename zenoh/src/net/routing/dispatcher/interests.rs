@@ -292,7 +292,8 @@ pub(crate) fn undeclare_interest(
     id: InterestId,
 ) {
     tracing::debug!("{} Undeclare interest {}", face, id,);
-    unregister_expr_interest(tables, face, id);
     let mut wtables = zwrite!(tables.tables);
     hat_code.undeclare_interest(&mut wtables, face, id);
+    drop(wtables);
+    unregister_expr_interest(tables, face, id);
 }
