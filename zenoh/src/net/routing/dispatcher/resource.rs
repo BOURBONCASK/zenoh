@@ -647,10 +647,28 @@ impl Resource {
                             .unwrap_or(true)
                     })
                 {
-                    let ctx = get_mut_unchecked(&mut nonwild_prefix)
-                        .session_ctxs
-                        .entry(face.id)
-                        .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
+                    let face_id = face.id;
+                    let ctx = {
+                        let prefix_mut = get_mut_unchecked(&mut nonwild_prefix);
+                        let is_new = !prefix_mut.session_ctxs.contains_key(&face_id);
+                        let res_expr = if is_new && tracing::enabled!(tracing::Level::DEBUG) {
+                            Some(prefix_mut.expr().to_string())
+                        } else {
+                            None
+                        };
+                        let ctx = prefix_mut
+                            .session_ctxs
+                            .entry(face_id)
+                            .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
+                        if let Some(expr) = res_expr.as_ref() {
+                            tracing::debug!(
+                                "SESSION_CTX_CREATE face={} res={} reason=expr_local",
+                                face_id,
+                                expr
+                            );
+                        }
+                        ctx
+                    };
                     let expr_id = face.get_next_local_id();
                     get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
                     get_mut_unchecked(face)
@@ -926,6 +944,41 @@ pub(crate) fn count_session_ctxs_for_face(root: &Arc<Resource>, face_id: usize) 
     (total, unused)
 }
 
+pub(crate) fn dump_session_ctxs_for_face(
+    root: &Arc<Resource>,
+    face_id: usize,
+    limit: usize,
+) -> usize {
+    let mut stack = vec![root.clone()];
+    let mut total = 0usize;
+    let mut dumped = 0usize;
+    let enabled = tracing::enabled!(tracing::Level::DEBUG);
+    while let Some(res) = stack.pop() {
+        if let Some(ctx) = res.session_ctxs.get(&face_id) {
+            total += 1;
+            if enabled && dumped < limit {
+                tracing::debug!(
+                    "SESSION_CTX_REMAIN face={} res={} local_expr_id={:?} remote_expr_id={:?} subs={} qabl={} token={} sub_final={} qabl_final={}",
+                    face_id,
+                    res.expr(),
+                    ctx.local_expr_id,
+                    ctx.remote_expr_id,
+                    ctx.subs.is_some(),
+                    ctx.qabl.is_some(),
+                    ctx.token,
+                    ctx.subscriber_interest_finalized,
+                    ctx.queryable_interest_finalized
+                );
+                dumped += 1;
+            }
+        }
+        for child in res.children.iter() {
+            stack.push(child.0.clone());
+        }
+    }
+    total
+}
+
 pub(crate) fn register_expr(
     tables: &TablesLock,
     face: &mut Arc<FaceState>,
@@ -974,10 +1027,28 @@ pub(crate) fn register_expr(
                         Resource::match_resource(&wtables, &mut res, matches);
                         (res, wtables)
                     };
-                let ctx = get_mut_unchecked(&mut res)
-                    .session_ctxs
-                    .entry(face.id)
-                    .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
+                let face_id = face.id;
+                let ctx = {
+                    let res_mut = get_mut_unchecked(&mut res);
+                    let is_new = !res_mut.session_ctxs.contains_key(&face_id);
+                    let res_expr = if is_new && tracing::enabled!(tracing::Level::DEBUG) {
+                        Some(res_mut.expr().to_string())
+                    } else {
+                        None
+                    };
+                    let ctx = res_mut
+                        .session_ctxs
+                        .entry(face_id)
+                        .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
+                    if let Some(expr) = res_expr.as_ref() {
+                        tracing::debug!(
+                            "SESSION_CTX_CREATE face={} res={} reason=expr_remote",
+                            face_id,
+                            expr
+                        );
+                    }
+                    ctx
+                };
 
                 get_mut_unchecked(ctx).remote_expr_id = Some(expr_id);
 
@@ -1004,6 +1075,13 @@ pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, ex
         Some(mut res) => {
             if let Some(ctx) = get_mut_unchecked(&mut res).session_ctxs.get_mut(&face.id) {
                 get_mut_unchecked(ctx).remote_expr_id = None;
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    tracing::debug!(
+                        "SESSION_CTX_CLEAR face={} res={} field=remote_expr",
+                        face.id,
+                        res.expr()
+                    );
+                }
             }
             disable_matches_data_routes(&mut wtables, &mut res);
             disable_matches_query_routes(&mut wtables, &mut res);

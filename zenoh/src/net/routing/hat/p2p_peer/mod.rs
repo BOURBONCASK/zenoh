@@ -52,7 +52,7 @@ use super::{
     super::dispatcher::{
         face::FaceState,
         interests as dispatcher_interests,
-        resource::{count_session_ctxs_for_face, count_tree},
+            resource::{count_session_ctxs_for_face, count_tree, dump_session_ctxs_for_face},
         tables::{NodeId, Resource, RoutingExpr, Tables, TablesLock},
     },
     HatBaseTrait, HatTrait, SendDeclare,
@@ -424,6 +424,16 @@ impl HatBaseTrait for HatCode {
                 post_face_total,
                 post_face_unused
             );
+            if post_face_total > 0 {
+                let limit = 50;
+                let total = dump_session_ctxs_for_face(&wtables.root_res, face.id, limit);
+                tracing::debug!(
+                    "SESSION_CTX_REMAIN_SUMMARY face={} total={} limit={}",
+                    face.id,
+                    total,
+                    limit
+                );
+            }
         }
 
         if face.whatami != WhatAmI::Client {

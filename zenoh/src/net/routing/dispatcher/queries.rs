@@ -650,10 +650,27 @@ pub(crate) fn update_queryable_info(
     face_id: usize,
     new_qabl_info: &Option<QueryableInfoType>,
 ) -> bool {
+    let res_expr = if tracing::enabled!(tracing::Level::DEBUG) {
+        Some(res.expr().to_string())
+    } else {
+        None
+    };
     if let Some(ctx) = get_mut_unchecked(res).session_ctxs.get_mut(&face_id) {
         let (changed, should_cleanup) = {
             let mut changed = false;
             if ctx.qabl != *new_qabl_info {
+                if new_qabl_info.is_none()
+                    && ctx.qabl.is_some()
+                    && tracing::enabled!(tracing::Level::DEBUG)
+                {
+                    if let Some(expr) = res_expr.as_ref() {
+                        tracing::debug!(
+                            "SESSION_CTX_CLEAR face={} res={} field=qabl",
+                            face_id,
+                            expr
+                        );
+                    }
+                }
                 get_mut_unchecked(ctx).qabl = *new_qabl_info;
                 changed = true;
             }
