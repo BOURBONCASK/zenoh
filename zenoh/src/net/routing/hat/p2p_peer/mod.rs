@@ -51,6 +51,8 @@ use self::{
 use super::{
     super::dispatcher::{
         face::FaceState,
+        interests as dispatcher_interests,
+        resource::count_tree,
         tables::{NodeId, Resource, RoutingExpr, Tables, TablesLock},
     },
     HatBaseTrait, HatTrait, SendDeclare,
@@ -227,7 +229,87 @@ impl HatBaseTrait for HatCode {
         face: &mut Arc<FaceState>,
         send_declare: &mut SendDeclare,
     ) {
+        let (interest_ids, debug_begin) = {
+            let face = get_mut_unchecked(face);
+            let hat_face = match face.hat.downcast_mut::<HatFace>() {
+                Some(hat_face) => hat_face,
+                None => {
+                    tracing::error!("Error downcasting face hat in close_face!");
+                    return;
+                }
+            };
+            let debug = if tracing::enabled!(tracing::Level::DEBUG) {
+                Some((
+                    face.whatami,
+                    face.local_interests.len(),
+                    face.remote_key_interests.len(),
+                    face.pending_current_interests.len(),
+                    face.pending_queries.len(),
+                    face.local_mappings.len(),
+                    face.remote_mappings.len(),
+                    hat_face.remote_interests.len(),
+                    hat_face.remote_subs.len(),
+                    hat_face.remote_qabls.len(),
+                    hat_face.remote_tokens.len(),
+                    hat_face.local_subs.simple_resources().count(),
+                    hat_face.local_qabls.simple_resources().count(),
+                ))
+            } else {
+                None
+            };
+            (
+                hat_face
+                    .remote_interests
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                debug,
+            )
+        };
+        if let Some((
+            whatami,
+            local_interests,
+            remote_key_interests,
+            pending_current_interests,
+            pending_queries,
+            local_mappings,
+            remote_mappings,
+            remote_interests,
+            remote_subs,
+            remote_qabls,
+            remote_tokens,
+            local_subs_simple,
+            local_qabls_simple,
+        )) = debug_begin
+        {
+            tracing::debug!(
+                "{} Close face begin: whatami={:?} local_interests={} remote_key_interests={} pending_current_interests={} pending_queries={} local_mappings={} remote_mappings={} remote_interests={} remote_subs={} remote_qabls={} remote_tokens={} local_subs_simple={} local_qabls_simple={}",
+                face,
+                whatami,
+                local_interests,
+                remote_key_interests,
+                pending_current_interests,
+                pending_queries,
+                local_mappings,
+                remote_mappings,
+                remote_interests,
+                remote_subs,
+                remote_qabls,
+                remote_tokens,
+                local_subs_simple,
+                local_qabls_simple
+            );
+        }
+        for id in interest_ids {
+            dispatcher_interests::undeclare_interest(self, tables, face, id);
+        }
+
         let mut wtables = zwrite!(tables.tables);
+        let pre_tree = if tracing::enabled!(tracing::Level::DEBUG) {
+            Some(count_tree(&wtables.root_res))
+        } else {
+            None
+        };
         let mut face_clone = face.clone();
         let face = get_mut_unchecked(face);
         let hat_face = match face.hat.downcast_mut::<HatFace>() {
@@ -321,6 +403,20 @@ impl HatBaseTrait for HatCode {
             Resource::clean(&mut res);
         }
         wtables.faces.remove(&face.id);
+        if let Some((nodes, contexts, session_ctxs)) = pre_tree {
+            let (post_nodes, post_contexts, post_session_ctxs) = count_tree(&wtables.root_res);
+            tracing::debug!(
+                "{} Close face end: faces={} res_nodes={} res_ctxs={} res_session_ctxs={} post_res_nodes={} post_res_ctxs={} post_res_session_ctxs={}",
+                face,
+                wtables.faces.len(),
+                nodes,
+                contexts,
+                session_ctxs,
+                post_nodes,
+                post_contexts,
+                post_session_ctxs
+            );
+        }
 
         if face.whatami != WhatAmI::Client {
             if let Some(net) = hat_mut!(wtables).gossip.as_mut() {
