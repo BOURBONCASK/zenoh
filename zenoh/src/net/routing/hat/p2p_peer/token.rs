@@ -125,20 +125,34 @@ fn register_simple_token(
     id: TokenId,
     res: &mut Arc<Resource>,
 ) {
+    let res_expr = if tracing::enabled!(tracing::Level::DEBUG) {
+        Some(res.expr().to_string())
+    } else {
+        None
+    };
+    let face_id = face.id;
+    let face_clone = face.clone();
     // Register liveliness
     {
         let res = get_mut_unchecked(res);
-        match res.session_ctxs.get_mut(&face.id) {
+        match res.session_ctxs.get_mut(&face_id) {
             Some(ctx) => {
                 if !ctx.token {
                     get_mut_unchecked(ctx).token = true;
                 }
             }
             None => {
-                let ctx = res
-                    .session_ctxs
-                    .entry(face.id)
-                    .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
+                let ctx = res.session_ctxs.entry(face_id).or_insert_with(|| {
+                    let ctx = Arc::new(SessionContext::new(face_clone));
+                    if let Some(expr) = res_expr.as_ref() {
+                        tracing::debug!(
+                            "SESSION_CTX_CREATE face={} res={} reason=token",
+                            face_id,
+                            expr
+                        );
+                    }
+                    ctx
+                });
                 get_mut_unchecked(ctx).token = true;
             }
         }
@@ -270,12 +284,26 @@ pub(super) fn undeclare_simple_token(
     res: &mut Arc<Resource>,
     send_declare: &mut SendDeclare,
 ) {
+    let res_expr = if tracing::enabled!(tracing::Level::DEBUG) {
+        Some(res.expr().to_string())
+    } else {
+        None
+    };
     if !face_hat_mut!(face)
         .remote_tokens
         .values()
         .any(|s| *s == *res)
     {
         if let Some(ctx) = get_mut_unchecked(res).session_ctxs.get_mut(&face.id) {
+            if ctx.token && tracing::enabled!(tracing::Level::DEBUG) {
+                if let Some(expr) = res_expr.as_ref() {
+                    tracing::debug!(
+                        "SESSION_CTX_CLEAR face={} res={} field=token",
+                        face.id,
+                        expr
+                    );
+                }
+            }
             get_mut_unchecked(ctx).token = false;
         }
         Resource::cleanup_session_ctx(res, face.id, "token");

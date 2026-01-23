@@ -245,13 +245,30 @@ fn register_simple_queryable(
     res: &mut Arc<Resource>,
     qabl_info: &QueryableInfoType,
 ) {
+    let res_expr = if tracing::enabled!(tracing::Level::DEBUG) {
+        Some(res.expr().to_string())
+    } else {
+        None
+    };
+    let face_id = face.id;
+    let face_clone = face.clone();
     // Register queryable
     {
         let res = get_mut_unchecked(res);
         get_mut_unchecked(
             res.session_ctxs
-                .entry(face.id)
-                .or_insert_with(|| Arc::new(SessionContext::new(face.clone()))),
+                .entry(face_id)
+                .or_insert_with(|| {
+                    let ctx = Arc::new(SessionContext::new(face_clone));
+                    if let Some(expr) = res_expr.as_ref() {
+                        tracing::debug!(
+                            "SESSION_CTX_CREATE face={} res={} reason=qabl",
+                            face_id,
+                            expr
+                        );
+                    }
+                    ctx
+                }),
         )
         .qabl = Some(*qabl_info);
     }
