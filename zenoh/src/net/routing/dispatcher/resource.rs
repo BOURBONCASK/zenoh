@@ -980,6 +980,22 @@ pub(crate) fn dump_session_ctxs_for_face(
     total
 }
 
+pub(crate) fn clear_session_ctxs_for_face(root: &mut Arc<Resource>, face_id: usize) -> usize {
+    let mut stack = vec![root.clone()];
+    let mut removed = 0usize;
+    while let Some(mut res) = stack.pop() {
+        let children = {
+            let res_mut = get_mut_unchecked(&mut res);
+            if res_mut.session_ctxs.remove(&face_id).is_some() {
+                removed += 1;
+            }
+            res_mut.children.iter().map(|child| child.0.clone()).collect::<Vec<_>>()
+        };
+        stack.extend(children);
+    }
+    removed
+}
+
 pub(crate) fn register_expr(
     tables: &TablesLock,
     face: &mut Arc<FaceState>,

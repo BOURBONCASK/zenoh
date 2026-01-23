@@ -52,7 +52,10 @@ use super::{
     super::dispatcher::{
         face::FaceState,
         interests as dispatcher_interests,
-            resource::{count_session_ctxs_for_face, count_tree, dump_session_ctxs_for_face},
+        resource::{
+            clear_session_ctxs_for_face, count_session_ctxs_for_face, count_tree,
+            dump_session_ctxs_for_face,
+        },
         tables::{NodeId, Resource, RoutingExpr, Tables, TablesLock},
     },
     HatBaseTrait, HatTrait, SendDeclare,
@@ -423,6 +426,15 @@ impl HatBaseTrait for HatCode {
         }
         for mut res in tokens {
             Resource::clean(&mut res);
+        }
+
+        let sweep_removed = clear_session_ctxs_for_face(&mut wtables.root_res, face.id);
+        if sweep_removed > 0 && tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "SESSION_CTX_SWEEP face={} removed={}",
+                face.id,
+                sweep_removed
+            );
         }
         wtables.faces.remove(&face.id);
         if let Some((nodes, contexts, session_ctxs)) = pre_tree {

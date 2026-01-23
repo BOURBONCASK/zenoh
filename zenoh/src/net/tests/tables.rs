@@ -13,6 +13,7 @@
 //
 use std::{
     convert::{TryFrom, TryInto},
+    mem,
     sync::{Arc, Weak},
 };
 
@@ -32,6 +33,7 @@ use zenoh_protocol::{
     },
     zenoh::{PushBody, Put, RequestBody, ResponseBody},
 };
+use zenoh_sync::get_mut_unchecked;
 
 use crate::{
     key_expr::KeyExpr,
@@ -42,6 +44,7 @@ use crate::{
                 face::{Face, FaceState},
                 interests::declare_interest,
                 pubsub::SubscriberInfo,
+                resource::{clear_session_ctxs_for_face, SessionContext},
                 tables::Tables,
             },
             router::*,
@@ -715,6 +718,45 @@ fn session_ctx_cleanup_on_undeclare_test() {
         },
     );
     assert!(!res_token.session_ctxs.contains_key(&face_id));
+}
+
+#[test]
+fn session_ctx_sweep_removes_orphan_local_expr_test() {
+    let router = new_peer();
+    let tables = router.tables.clone();
+
+    let primitives = Arc::new(DummyPrimitives {});
+    let face = router.new_primitives(primitives);
+    let face_id = face.state.id;
+
+    {
+        let mut wtables = zwrite!(tables.tables);
+        let mut root = mem::replace(&mut wtables.root_res, Resource::root());
+        let res = Resource::make_resource(
+            tables.hat_code.as_ref(),
+            &mut wtables,
+            &mut root,
+            "scleanup/local_expr",
+        );
+        wtables.root_res = root;
+        let mut ctx = SessionContext::new(face.state.clone());
+        let expr_id: ExprId = 1;
+        ctx.local_expr_id = Some(expr_id);
+        let mut res = res.clone();
+        get_mut_unchecked(&mut res)
+            .session_ctxs
+            .insert(face_id, Arc::new(ctx));
+    }
+
+    let removed = {
+        let mut wtables = zwrite!(tables.tables);
+        clear_session_ctxs_for_face(&mut wtables.root_res, face_id)
+    };
+    assert_eq!(removed, 1);
+
+    let res = Resource::get_resource(zread!(tables.tables)._get_root(), "scleanup/local_expr")
+        .expect("local_expr resource should exist");
+    assert!(!res.session_ctxs.contains_key(&face_id));
 }
 
 pub struct ClientPrimitives {
