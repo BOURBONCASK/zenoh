@@ -52,7 +52,7 @@ use super::{
     super::dispatcher::{
         face::FaceState,
         interests as dispatcher_interests,
-        resource::count_tree,
+        resource::{count_session_ctxs_for_face, count_tree},
         tables::{NodeId, Resource, RoutingExpr, Tables, TablesLock},
     },
     HatBaseTrait, HatTrait, SendDeclare,
@@ -306,6 +306,11 @@ impl HatBaseTrait for HatCode {
         } else {
             None
         };
+        let pre_face_ctx = if tracing::enabled!(tracing::Level::DEBUG) {
+            Some(count_session_ctxs_for_face(&wtables.root_res, face.id))
+        } else {
+            None
+        };
         let mut face_clone = face.clone();
         let face = get_mut_unchecked(face);
         let hat_face = match face.hat.downcast_mut::<HatFace>() {
@@ -401,8 +406,11 @@ impl HatBaseTrait for HatCode {
         wtables.faces.remove(&face.id);
         if let Some((nodes, contexts, session_ctxs)) = pre_tree {
             let (post_nodes, post_contexts, post_session_ctxs) = count_tree(&wtables.root_res);
+            let (pre_face_total, pre_face_unused) = pre_face_ctx.unwrap_or((0, 0));
+            let (post_face_total, post_face_unused) =
+                count_session_ctxs_for_face(&wtables.root_res, face.id);
             tracing::debug!(
-                "{} Close face end: faces={} res_nodes={} res_ctxs={} res_session_ctxs={} post_res_nodes={} post_res_ctxs={} post_res_session_ctxs={}",
+                "{} Close face end: faces={} res_nodes={} res_ctxs={} res_session_ctxs={} post_res_nodes={} post_res_ctxs={} post_res_session_ctxs={} face_ctxs={} face_unused_ctxs={} post_face_ctxs={} post_face_unused_ctxs={}",
                 face,
                 wtables.faces.len(),
                 nodes,
@@ -410,7 +418,11 @@ impl HatBaseTrait for HatCode {
                 session_ctxs,
                 post_nodes,
                 post_contexts,
-                post_session_ctxs
+                post_session_ctxs,
+                pre_face_total,
+                pre_face_unused,
+                post_face_total,
+                post_face_unused
             );
         }
 
