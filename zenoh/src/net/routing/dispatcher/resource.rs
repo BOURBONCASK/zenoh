@@ -647,7 +647,8 @@ impl Resource {
                     })
                 {
                     let face_id = face.id;
-                    let ctx = {
+                    let expr_id = face.get_next_local_id();
+                    let res_expr = {
                         let prefix_mut = get_mut_unchecked(&mut nonwild_prefix);
                         let is_new = !prefix_mut.session_ctxs.contains_key(&face_id);
                         let res_expr = if is_new && tracing::enabled!(tracing::Level::DEBUG) {
@@ -659,17 +660,17 @@ impl Resource {
                             .session_ctxs
                             .entry(face_id)
                             .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
-                        if let Some(expr) = res_expr.as_ref() {
-                            tracing::debug!(
-                                "SESSION_CTX_CREATE face={} res={} reason=expr_local",
-                                face_id,
-                                expr
-                            );
-                        }
-                        ctx
+                        get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
+                        res_expr
                     };
-                    let expr_id = face.get_next_local_id();
-                    get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
+                    if let Some(expr) = res_expr.as_ref() {
+                        tracing::debug!(
+                            "SESSION_CTX_CREATE face={} res={} reason=expr_local expr_id={}",
+                            face_id,
+                            expr,
+                            expr_id
+                        );
+                    }
                     get_mut_unchecked(face)
                         .local_mappings
                         .insert(expr_id, nonwild_prefix.clone());
@@ -1027,7 +1028,7 @@ pub(crate) fn register_expr(
                         (res, wtables)
                     };
                 let face_id = face.id;
-                let ctx = {
+                let res_expr = {
                     let res_mut = get_mut_unchecked(&mut res);
                     let is_new = !res_mut.session_ctxs.contains_key(&face_id);
                     let res_expr = if is_new && tracing::enabled!(tracing::Level::DEBUG) {
@@ -1039,17 +1040,18 @@ pub(crate) fn register_expr(
                         .session_ctxs
                         .entry(face_id)
                         .or_insert_with(|| Arc::new(SessionContext::new(face.clone())));
-                    if let Some(expr) = res_expr.as_ref() {
-                        tracing::debug!(
-                            "SESSION_CTX_CREATE face={} res={} reason=expr_remote",
-                            face_id,
-                            expr
-                        );
-                    }
-                    ctx
+                    get_mut_unchecked(ctx).remote_expr_id = Some(expr_id);
+                    res_expr
                 };
 
-                get_mut_unchecked(ctx).remote_expr_id = Some(expr_id);
+                if let Some(expr) = res_expr.as_ref() {
+                    tracing::debug!(
+                        "SESSION_CTX_CREATE face={} res={} reason=expr_remote expr_id={}",
+                        face_id,
+                        expr,
+                        expr_id
+                    );
+                }
 
                 get_mut_unchecked(face)
                     .remote_mappings
