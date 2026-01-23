@@ -452,8 +452,8 @@ impl Resource {
         })
     }
 
-    pub fn clean(res: &mut Arc<Resource>) {
-        let mut resclone = res.clone();
+pub fn clean(res: &mut Arc<Resource>) {
+    let mut resclone = res.clone();
         let mutres = get_mut_unchecked(&mut resclone);
         if let Some(ref mut parent) = mutres.parent {
             if Arc::strong_count(res) <= 3 && res.children.is_empty() {
@@ -860,6 +860,24 @@ impl Resource {
     }
 }
 
+pub(crate) fn count_tree(root: &Arc<Resource>) -> (usize, usize, usize) {
+    let mut stack = vec![root.clone()];
+    let mut nodes = 0usize;
+    let mut contexts = 0usize;
+    let mut session_ctxs = 0usize;
+    while let Some(res) = stack.pop() {
+        nodes += 1;
+        if res.context.is_some() {
+            contexts += 1;
+        }
+        session_ctxs += res.session_ctxs.len();
+        for child in res.children.iter() {
+            stack.push(child.0.clone());
+        }
+    }
+    (nodes, contexts, session_ctxs)
+}
+
 pub(crate) fn register_expr(
     tables: &TablesLock,
     face: &mut Arc<FaceState>,
@@ -985,9 +1003,24 @@ pub(crate) fn register_expr_interest(
                     Resource::match_resource(&wtables, &mut res, matches);
                     (res, wtables)
                 };
+                let res_expr = if tracing::enabled!(tracing::Level::DEBUG) {
+                    Some(res.expr().to_string())
+                } else {
+                    None
+                };
                 get_mut_unchecked(face)
                     .remote_key_interests
                     .insert(id, Some(res));
+                if let Some(expr) = res_expr {
+                    let count = get_mut_unchecked(face).remote_key_interests.len();
+                    tracing::debug!(
+                        "{} Register keyexpr interest id={} res={} remote_key_interests={}",
+                        face,
+                        id,
+                        expr,
+                        count
+                    );
+                }
                 drop(wtables);
             }
             None => tracing::error!(
@@ -1001,6 +1034,15 @@ pub(crate) fn register_expr_interest(
         get_mut_unchecked(face)
             .remote_key_interests
             .insert(id, None);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let count = get_mut_unchecked(face).remote_key_interests.len();
+            tracing::debug!(
+                "{} Register keyexpr interest id={} res=<none> remote_key_interests={}",
+                face,
+                id,
+                count
+            );
+        }
         drop(wtables);
     }
 }
@@ -1012,7 +1054,25 @@ pub(crate) fn unregister_expr_interest(
 ) {
     let wtables = zwrite!(tables.tables);
     if let Some(mut res) = get_mut_unchecked(face).remote_key_interests.remove(&id).flatten() {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let count = get_mut_unchecked(face).remote_key_interests.len();
+            tracing::debug!(
+                "{} Unregister keyexpr interest id={} res={} remote_key_interests={}",
+                face,
+                id,
+                res.expr(),
+                count
+            );
+        }
         Resource::clean(&mut res);
+    } else if tracing::enabled!(tracing::Level::DEBUG) {
+        let count = get_mut_unchecked(face).remote_key_interests.len();
+        tracing::debug!(
+            "{} Unregister keyexpr interest id={} res=<none> remote_key_interests={}",
+            face,
+            id,
+            count
+        );
     }
     drop(wtables);
 }
