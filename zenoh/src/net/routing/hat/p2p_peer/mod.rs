@@ -53,8 +53,8 @@ use super::{
         face::FaceState,
         interests as dispatcher_interests,
         resource::{
-            clear_session_ctxs_for_face, count_session_ctxs_for_face, count_tree,
-            dump_session_ctxs_for_face,
+            clear_session_ctxs_for_face, collect_resource_stats, count_session_ctxs_for_face,
+            count_tree, dump_session_ctxs_for_face,
         },
         tables::{NodeId, Resource, RoutingExpr, Tables, TablesLock},
     },
@@ -339,6 +339,11 @@ impl HatBaseTrait for HatCode {
         } else {
             None
         };
+        let pre_stats = if tracing::enabled!(tracing::Level::DEBUG) {
+            Some(collect_resource_stats(&wtables.root_res, 5))
+        } else {
+            None
+        };
         let mut face_clone = face.clone();
         let face = get_mut_unchecked(face);
         let hat_face = match face.hat.downcast_mut::<HatFace>() {
@@ -461,6 +466,47 @@ impl HatBaseTrait for HatCode {
                 post_face_total,
                 post_face_unused
             );
+            if let Some(pre_stats) = pre_stats {
+                let post_stats = collect_resource_stats(&wtables.root_res, 5);
+                tracing::debug!(
+                    "RES_STATS pre: nodes={} ctxs={} sess={} ros2_lv_nodes={} ros2_lv_ctxs={} ros2_lv_sess={} ros2_lv_guids={} ros2_lv_guid_min={} ros2_lv_guid_max={} ros2_lv_guid_top={:?} ros2_nodes={} ros2_ctxs={} ros2_sess={} data_nodes={} data_ctxs={} data_sess={}",
+                    pre_stats.nodes,
+                    pre_stats.contexts,
+                    pre_stats.session_ctxs,
+                    pre_stats.ros2_lv_nodes,
+                    pre_stats.ros2_lv_contexts,
+                    pre_stats.ros2_lv_session_ctxs,
+                    pre_stats.ros2_lv_guid_total,
+                    pre_stats.ros2_lv_guid_min,
+                    pre_stats.ros2_lv_guid_max,
+                    pre_stats.ros2_lv_guid_top,
+                    pre_stats.ros2_nodes,
+                    pre_stats.ros2_contexts,
+                    pre_stats.ros2_session_ctxs,
+                    pre_stats.data_nodes,
+                    pre_stats.data_contexts,
+                    pre_stats.data_session_ctxs
+                );
+                tracing::debug!(
+                    "RES_STATS post: nodes={} ctxs={} sess={} ros2_lv_nodes={} ros2_lv_ctxs={} ros2_lv_sess={} ros2_lv_guids={} ros2_lv_guid_min={} ros2_lv_guid_max={} ros2_lv_guid_top={:?} ros2_nodes={} ros2_ctxs={} ros2_sess={} data_nodes={} data_ctxs={} data_sess={}",
+                    post_stats.nodes,
+                    post_stats.contexts,
+                    post_stats.session_ctxs,
+                    post_stats.ros2_lv_nodes,
+                    post_stats.ros2_lv_contexts,
+                    post_stats.ros2_lv_session_ctxs,
+                    post_stats.ros2_lv_guid_total,
+                    post_stats.ros2_lv_guid_min,
+                    post_stats.ros2_lv_guid_max,
+                    post_stats.ros2_lv_guid_top,
+                    post_stats.ros2_nodes,
+                    post_stats.ros2_contexts,
+                    post_stats.ros2_session_ctxs,
+                    post_stats.data_nodes,
+                    post_stats.data_contexts,
+                    post_stats.data_session_ctxs
+                );
+            }
             if post_face_total > 0 {
                 let limit = 50;
                 let total = dump_session_ctxs_for_face(&wtables.root_res, face.id, limit);
