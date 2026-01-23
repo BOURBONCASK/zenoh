@@ -295,6 +295,27 @@ impl HatBaseTrait for HatCode {
                 local_subs_simple,
                 local_qabls_simple
             );
+            let limit = 50usize;
+            let total = face.local_mappings.len();
+            tracing::debug!(
+                "LOCAL_MAPPINGS face={} total={} limit={}",
+                face.id,
+                total,
+                limit
+            );
+            for (expr_id, res) in face.local_mappings.iter().take(limit) {
+                let ctx = res.session_ctxs.get(&face.id);
+                let ctx_local = ctx.and_then(|c| c.local_expr_id);
+                let ctx_remote = ctx.and_then(|c| c.remote_expr_id);
+                tracing::debug!(
+                    "LOCAL_MAPPING face={} expr_id={} res={} ctx_local={:?} ctx_remote={:?}",
+                    face.id,
+                    expr_id,
+                    res.expr(),
+                    ctx_local,
+                    ctx_remote
+                );
+            }
         }
         for id in interest_ids {
             dispatcher_interests::undeclare_interest(self, tables, face, id);
