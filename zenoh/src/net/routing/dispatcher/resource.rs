@@ -14,7 +14,7 @@
 use std::{
     any::Any,
     borrow::{Borrow, Cow},
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::TryInto,
     hash::{Hash, Hasher},
     ops::{Deref, DerefMut},
@@ -925,6 +925,104 @@ pub(crate) fn count_tree(root: &Arc<Resource>) -> (usize, usize, usize) {
         }
     }
     (nodes, contexts, session_ctxs)
+}
+
+#[derive(Default, Debug)]
+pub(crate) struct ResourceStats {
+    pub(crate) nodes: usize,
+    pub(crate) contexts: usize,
+    pub(crate) session_ctxs: usize,
+    pub(crate) ros2_lv_nodes: usize,
+    pub(crate) ros2_lv_contexts: usize,
+    pub(crate) ros2_lv_session_ctxs: usize,
+    pub(crate) ros2_lv_guid_total: usize,
+    pub(crate) ros2_lv_guid_min: usize,
+    pub(crate) ros2_lv_guid_max: usize,
+    pub(crate) ros2_lv_guid_top: Vec<(String, usize)>,
+    pub(crate) ros2_nodes: usize,
+    pub(crate) ros2_contexts: usize,
+    pub(crate) ros2_session_ctxs: usize,
+    pub(crate) data_nodes: usize,
+    pub(crate) data_contexts: usize,
+    pub(crate) data_session_ctxs: usize,
+}
+
+fn extract_ros2_lv_guid(expr: &str) -> Option<&str> {
+    const PREFIX: &str = "@ros2_lv/20/";
+    if !expr.starts_with(PREFIX) {
+        return None;
+    }
+    let rest = &expr[PREFIX.len()..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(&rest[..end])
+}
+
+pub(crate) fn collect_resource_stats(root: &Arc<Resource>, guid_topn: usize) -> ResourceStats {
+    let mut stats = ResourceStats::default();
+    let mut stack = vec![root.clone()];
+    let mut guid_counts: HashMap<String, usize> = HashMap::new();
+    while let Some(res) = stack.pop() {
+        stats.nodes += 1;
+        if res.context.is_some() {
+            stats.contexts += 1;
+        }
+        stats.session_ctxs += res.session_ctxs.len();
+
+        let expr = res.expr();
+        if expr.starts_with("@ros2_lv/") {
+            stats.ros2_lv_nodes += 1;
+            if res.context.is_some() {
+                stats.ros2_lv_contexts += 1;
+            }
+            stats.ros2_lv_session_ctxs += res.session_ctxs.len();
+            if let Some(guid) = extract_ros2_lv_guid(expr) {
+                *guid_counts.entry(guid.to_string()).or_insert(0) += 1;
+            }
+        }
+        if expr.starts_with("@ros2/") {
+            stats.ros2_nodes += 1;
+            if res.context.is_some() {
+                stats.ros2_contexts += 1;
+            }
+            stats.ros2_session_ctxs += res.session_ctxs.len();
+        }
+        if expr.starts_with("20/") {
+            stats.data_nodes += 1;
+            if res.context.is_some() {
+                stats.data_contexts += 1;
+            }
+            stats.data_session_ctxs += res.session_ctxs.len();
+        }
+
+        for child in res.children.iter() {
+            stack.push(child.0.clone());
+        }
+    }
+    stats.ros2_lv_guid_total = guid_counts.len();
+    if !guid_counts.is_empty() {
+        let mut min = usize::MAX;
+        let mut max = 0usize;
+        for count in guid_counts.values() {
+            if *count < min {
+                min = *count;
+            }
+            if *count > max {
+                max = *count;
+            }
+        }
+        stats.ros2_lv_guid_min = min;
+        stats.ros2_lv_guid_max = max;
+        let mut top: Vec<(String, usize)> = guid_counts.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if guid_topn < top.len() {
+            top.truncate(guid_topn);
+        }
+        stats.ros2_lv_guid_top = top;
+    }
+    stats
 }
 
 pub(crate) fn count_session_ctxs_for_face(root: &Arc<Resource>, face_id: usize) -> (usize, usize) {
