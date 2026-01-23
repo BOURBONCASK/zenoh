@@ -636,12 +636,18 @@ pub(crate) fn update_queryable_info(
     new_qabl_info: &Option<QueryableInfoType>,
 ) -> bool {
     if let Some(ctx) = get_mut_unchecked(res).session_ctxs.get_mut(&face_id) {
-        if ctx.qabl != *new_qabl_info {
-            get_mut_unchecked(ctx).qabl = *new_qabl_info;
-            true
-        } else {
-            false
+        let (changed, should_cleanup) = {
+            let mut changed = false;
+            if ctx.qabl != *new_qabl_info {
+                get_mut_unchecked(ctx).qabl = *new_qabl_info;
+                changed = true;
+            }
+            (changed, new_qabl_info.is_none())
+        };
+        if should_cleanup {
+            Resource::cleanup_session_ctx(res, face_id, "qabl");
         }
+        changed
     } else if new_qabl_info.is_none() {
         true
     } else {

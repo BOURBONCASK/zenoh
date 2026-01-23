@@ -542,6 +542,160 @@ async fn clean_test() {
     assert!(res5.upgrade().is_none());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn interest_cleanup_on_close_test() {
+    let router = new_peer();
+    let tables = router.tables.clone();
+
+    let primitives = Arc::new(DummyPrimitives {});
+    let face0 = &router.new_primitives(primitives);
+
+    let expr: WireExpr = "interest_drop".into();
+    declare_interest(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face0.state.clone(),
+        42,
+        Some(&expr),
+        InterestMode::CurrentFuture,
+        InterestOptions::KEYEXPRS + InterestOptions::QUERYABLES,
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+
+    let optres = Resource::get_resource(zread!(tables.tables)._get_root(), "interest_drop")
+        .map(|res| Arc::downgrade(&res));
+    assert!(optres.is_some());
+    let res = optres.unwrap();
+    assert!(res.upgrade().is_some());
+
+    face0.send_close();
+    assert!(res.upgrade().is_none());
+}
+
+#[test]
+fn session_ctx_cleanup_on_undeclare_test() {
+    let router = new_peer();
+    let tables = router.tables.clone();
+
+    let primitives = Arc::new(DummyPrimitives {});
+    let face = router.new_primitives(primitives);
+    let face_id = face.state.id;
+
+    // Subscription cleanup
+    let sub_info = SubscriberInfo;
+    let sub_expr: WireExpr = "scleanup/sub".into();
+    declare_subscription(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face.state.clone(),
+        1,
+        &sub_expr,
+        &sub_info,
+        NodeId::default(),
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+    let res_sub = Resource::get_resource(zread!(tables.tables)._get_root(), "scleanup/sub")
+        .expect("sub resource should exist");
+    assert!(res_sub.session_ctxs.contains_key(&face_id));
+    undeclare_subscription(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face.state.clone(),
+        1,
+        &sub_expr,
+        NodeId::default(),
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+    assert!(!res_sub.session_ctxs.contains_key(&face_id));
+
+    // Queryable cleanup
+    let qinfo = QueryableInfoType {
+        complete: true,
+        distance: 1,
+    };
+    let q_expr: WireExpr = "scleanup/qabl".into();
+    declare_queryable(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face.state.clone(),
+        2,
+        &q_expr,
+        &qinfo,
+        NodeId::default(),
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+    let res_qabl = Resource::get_resource(zread!(tables.tables)._get_root(), "scleanup/qabl")
+        .expect("qabl resource should exist");
+    assert!(res_qabl.session_ctxs.contains_key(&face_id));
+    undeclare_queryable(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face.state.clone(),
+        2,
+        &q_expr,
+        NodeId::default(),
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+    assert!(!res_qabl.session_ctxs.contains_key(&face_id));
+
+    // Token cleanup
+    let t_expr: WireExpr = "scleanup/token".into();
+    declare_token(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face.state.clone(),
+        3,
+        &t_expr,
+        NodeId::default(),
+        None,
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+    let res_token = Resource::get_resource(zread!(tables.tables)._get_root(), "scleanup/token")
+        .expect("token resource should exist");
+    assert!(res_token.session_ctxs.contains_key(&face_id));
+    let ext_expr = zenoh_protocol::network::declare::common::ext::WireExprType {
+        wire_expr: t_expr.clone(),
+    };
+    undeclare_token(
+        tables.hat_code.as_ref(),
+        &tables,
+        &mut face.state.clone(),
+        3,
+        &ext_expr,
+        NodeId::default(),
+        &mut |p, m| {
+            m.with_mut(|m| {
+                p.send_declare(m);
+            })
+        },
+    );
+    assert!(!res_token.session_ctxs.contains_key(&face_id));
+}
+
 pub struct ClientPrimitives {
     data: std::sync::Mutex<Option<WireExpr<'static>>>,
     mapping: std::sync::Mutex<std::collections::HashMap<ExprId, String>>,

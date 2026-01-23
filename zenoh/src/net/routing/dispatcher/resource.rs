@@ -178,6 +178,15 @@ impl SessionContext {
     }
 }
 
+#[inline]
+fn session_ctx_unused(ctx: &SessionContext) -> bool {
+    ctx.local_expr_id.is_none()
+        && ctx.remote_expr_id.is_none()
+        && ctx.subs.is_none()
+        && ctx.qabl.is_none()
+        && !ctx.token
+}
+
 /// Global version number for route computation.
 /// Use 64bit to not care about rollover.
 pub type RoutesVersion = u64;
@@ -476,6 +485,27 @@ impl Resource {
                     get_mut_unchecked(parent).children.remove(res.suffix());
                 }
                 Resource::clean(parent);
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_session_ctx(res: &mut Arc<Resource>, face_id: usize, reason: &str) {
+        let should_remove = get_mut_unchecked(res)
+            .session_ctxs
+            .get(&face_id)
+            .map(|ctx| session_ctx_unused(ctx.as_ref()))
+            .unwrap_or(false);
+        if should_remove {
+            get_mut_unchecked(res).session_ctxs.remove(&face_id);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let count = res.session_ctxs.len();
+                tracing::debug!(
+                    "Cleanup session_ctx for face={} res={} reason={} session_ctxs={}",
+                    face_id,
+                    res.expr(),
+                    reason,
+                    count
+                );
             }
         }
     }
@@ -875,6 +905,24 @@ pub(crate) fn count_tree(root: &Arc<Resource>) -> (usize, usize, usize) {
         }
     }
     (nodes, contexts, session_ctxs)
+}
+
+pub(crate) fn count_session_ctxs_for_face(root: &Arc<Resource>, face_id: usize) -> (usize, usize) {
+    let mut stack = vec![root.clone()];
+    let mut total = 0usize;
+    let mut unused = 0usize;
+    while let Some(res) = stack.pop() {
+        if let Some(ctx) = res.session_ctxs.get(&face_id) {
+            total += 1;
+            if session_ctx_unused(ctx.as_ref()) {
+                unused += 1;
+            }
+        }
+        for child in res.children.iter() {
+            stack.push(child.0.clone());
+        }
+    }
+    (total, unused)
 }
 
 pub(crate) fn register_expr(
