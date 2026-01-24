@@ -1080,16 +1080,57 @@ pub(crate) fn dump_session_ctxs_for_face(
 pub(crate) fn clear_session_ctxs_for_face(root: &mut Arc<Resource>, face_id: usize) -> usize {
     let mut stack = vec![root.clone()];
     let mut removed = 0usize;
+    let mut skipped_in_use = 0usize;
+
     while let Some(mut res) = stack.pop() {
         let children = {
             let res_mut = get_mut_unchecked(&mut res);
-            if res_mut.session_ctxs.remove(&face_id).is_some() {
-                removed += 1;
+
+            // Check if the session_ctx exists for this face
+            if let Some(ctx) = res_mut.session_ctxs.get(&face_id) {
+                // Safety check: only remove if session_ctx is truly unused
+                // During close_face, this should always be true, but we check anyway
+                if session_ctx_unused(ctx.as_ref()) {
+                    res_mut.session_ctxs.remove(&face_id);
+                    removed += 1;
+                } else {
+                    // This shouldn't happen during close_face, but log for debugging
+                    skipped_in_use += 1;
+                    if tracing::enabled!(tracing::Level::WARN) {
+                        // Get resource expression before logging to avoid borrow conflict
+                        let res_expr = res_mut.expr().to_string();
+                        tracing::warn!(
+                            "SESSION_CTX_SWEEP skipped in-use context: face={} res={} local_expr={:?} remote_expr={:?} subs={} qabl={} token={}",
+                            face_id,
+                            res_expr,
+                            ctx.local_expr_id,
+                            ctx.remote_expr_id,
+                            ctx.subs.is_some(),
+                            ctx.qabl.is_some(),
+                            ctx.token
+                        );
+                    }
+                }
             }
-            res_mut.children.iter().map(|child| child.0.clone()).collect::<Vec<_>>()
+
+            res_mut
+                .children
+                .iter()
+                .map(|child| child.0.clone())
+                .collect::<Vec<_>>()
         };
         stack.extend(children);
     }
+
+    if skipped_in_use > 0 && tracing::enabled!(tracing::Level::WARN) {
+        tracing::warn!(
+            "SESSION_CTX_SWEEP face={} removed={} skipped_in_use={}",
+            face_id,
+            removed,
+            skipped_in_use
+        );
+    }
+
     removed
 }
 

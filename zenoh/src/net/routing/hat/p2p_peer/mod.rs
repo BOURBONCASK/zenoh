@@ -355,9 +355,28 @@ impl HatBaseTrait for HatCode {
         };
 
         hat_face.remote_interests.clear();
+
+        // Count items before clearing for diagnostics
+        let local_subs_count =
+            hat_face.local_subs.simple_len() + hat_face.local_subs.aggregated_len();
+        let local_qabls_count =
+            hat_face.local_qabls.simple_len() + hat_face.local_qabls.aggregated_len();
+        let local_tokens_count = hat_face.local_tokens.len();
+
         hat_face.local_subs.clear();
         hat_face.local_qabls.clear();
         hat_face.local_tokens.clear();
+
+        // Log cleanup statistics for memory leak debugging
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "LOCAL_CLEANUP face={} local_subs={} local_qabls={} local_tokens={}",
+                face.id,
+                local_subs_count,
+                local_qabls_count,
+                local_tokens_count
+            );
+        }
 
         for res in face.remote_mappings.values_mut() {
             get_mut_unchecked(res).session_ctxs.remove(&face.id);
@@ -452,7 +471,7 @@ impl HatBaseTrait for HatCode {
             let (post_face_total, post_face_unused) =
                 count_session_ctxs_for_face(&wtables.root_res, face.id);
             tracing::debug!(
-                "{} Close face end: faces={} res_nodes={} res_ctxs={} res_session_ctxs={} post_res_nodes={} post_res_ctxs={} post_res_session_ctxs={} face_ctxs={} face_unused_ctxs={} post_face_ctxs={} post_face_unused_ctxs={}",
+                "{} Close face end: faces={} res_nodes={} res_ctxs={} res_session_ctxs={} post_res_nodes={} post_res_ctxs={} post_res_session_ctxs={} face_ctxs={} face_unused_ctxs={} post_face_ctxs={} post_face_unused_ctxs={} session_ctx_swept={}",
                 face,
                 wtables.faces.len(),
                 nodes,
@@ -464,7 +483,8 @@ impl HatBaseTrait for HatCode {
                 pre_face_total,
                 pre_face_unused,
                 post_face_total,
-                post_face_unused
+                post_face_unused,
+                sweep_removed
             );
             if let Some(pre_stats) = pre_stats {
                 let post_stats = collect_resource_stats(&wtables.root_res, 5);
