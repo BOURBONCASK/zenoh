@@ -32,7 +32,7 @@ use zenoh_protocol::{
 };
 use zenoh_sync::get_mut_unchecked;
 
-use super::{face_hat, face_hat_mut, queryable_batch::PropagationType, HatCode, HatFace};
+use super::{face_hat, face_hat_mut, HatCode, HatFace};
 use crate::{
     key_expr::KeyExpr,
     net::routing::{
@@ -343,85 +343,27 @@ pub(super) fn undeclare_simple_queryable(
 
     if update_queryable_info(res, face.id, &remote_qabl_info) {
         let mut simple_qabls = simple_qabls(res);
-
-        // Check if we should flush before enqueueing (don't hold the reference)
-        let should_flush_before = {
-            let hat_tables = tables.hat.downcast_ref::<super::HatTables>().unwrap();
-            if let Ok(batch) = hat_tables.queryable_batch.lock() {
-                batch.should_flush()
-            } else {
-                false
-            }
-        };
-
         if simple_qabls.is_empty() {
-            // No queryables left for this resource - enqueue forget operation
-            let enqueue_success = {
-                let hat_tables = tables.hat.downcast_ref::<super::HatTables>().unwrap();
-                if let Ok(mut batch) = hat_tables.queryable_batch.lock() {
-                    batch.enqueue(res.clone(), PropagationType::ForgetOnly);
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if !enqueue_success {
-                // Fallback: immediate propagation if lock fails
-                tracing::warn!(
-                    "BATCH_LOCK_FAILED res={} - falling back to immediate propagation",
-                    res.expr()
-                );
-                propagate_forget_simple_queryable(tables, res, send_declare);
-            }
+            // No queryables left for this resource - clean up everywhere
+            propagate_forget_simple_queryable(tables, res, send_declare);
         } else {
-            // Still have queryables - enqueue double propagate (forget then declare)
-            // This fixes the memory leak: ensures proper REMOVE before INSERT
+            // CRITICAL FIX: Still have queryables, but need to update all faces
+            // Old bug: directly calling propagate_simple_queryable causes INSERT without REMOVE
+            // leading to 98.5% leak rate (44,517 INSERT vs 656 REMOVE)
+
+            // Solution: First forget old declarations, then propagate updated state
+            // This ensures local_qabls entries are properly removed before re-adding
             let faces_count = tables.faces.len();
-
-            let enqueue_success = {
-                let hat_tables = tables.hat.downcast_ref::<super::HatTables>().unwrap();
-                if let Ok(mut batch) = hat_tables.queryable_batch.lock() {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        tracing::debug!(
-                            "BATCH_ENQUEUE_DOUBLE_PROPAGATE res={} faces_count={} simple_qabls_remaining={} pending={}",
-                            res.expr(),
-                            faces_count,
-                            simple_qabls.len(),
-                            batch.stats().pending
-                        );
-                    }
-                    batch.enqueue(res.clone(), PropagationType::ForgetThenDeclare);
-                    true
-                } else {
-                    false
-                }
-            };
-
-            if !enqueue_success {
-                // Fallback: immediate propagation if lock fails
-                tracing::warn!(
-                    "BATCH_LOCK_FAILED res={} - falling back to immediate double propagation",
-                    res.expr()
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    "DOUBLE_PROPAGATE res={} faces_count={} simple_qabls_remaining={}",
+                    res.expr(),
+                    faces_count,
+                    simple_qabls.len()
                 );
-                propagate_forget_simple_queryable(tables, res, send_declare);
-                propagate_simple_queryable(tables, res, None, send_declare);
             }
-        }
-
-        // After enqueueing, check if we should flush
-        let should_flush_after = {
-            let hat_tables = tables.hat.downcast_ref::<super::HatTables>().unwrap();
-            if let Ok(batch) = hat_tables.queryable_batch.lock() {
-                batch.should_flush()
-            } else {
-                false
-            }
-        };
-
-        // If we crossed the flush threshold or enough time has passed, flush now
-        if should_flush_before || should_flush_after {
-            flush_queryable_batch(tables, send_declare);
+            propagate_forget_simple_queryable(tables, res, send_declare);
+            propagate_simple_queryable(tables, res, None, send_declare);
         }
 
         if simple_qabls.len() == 1 {
@@ -771,74 +713,5 @@ impl HatQueriesTrait for HatCode {
             }
         }
         matching_queryables
-    }
-}
-
-/// Flush pending queryable batch operations
-/// This should be called periodically (e.g., every 10-100ms) to process batched operations
-pub(super) fn flush_queryable_batch(tables: &mut Tables, send_declare: &mut SendDeclare) {
-    let hat_tables = tables.hat.downcast_ref::<super::HatTables>().unwrap();
-
-    // Take pending entries from the batch queue
-    let pending = if let Ok(mut batch) = hat_tables.queryable_batch.lock() {
-        if !batch.should_flush() {
-            return; // Nothing to flush yet
-        }
-        batch.take_pending()
-    } else {
-        tracing::error!("BATCH_FLUSH_LOCK_FAILED - skipping flush");
-        return;
-    };
-
-    if pending.is_empty() {
-        return;
-    }
-
-    let entries_count = pending.len();
-
-    if tracing::enabled!(tracing::Level::INFO) {
-        tracing::info!("BATCH_FLUSH_START entries={}", entries_count);
-    }
-
-    // Process each pending operation
-    for entry in pending {
-        let res = &entry.resource;
-
-        match entry.operation {
-            PropagationType::ForgetOnly => {
-                // No queryables left - remove from all faces
-                propagate_forget_simple_queryable(
-                    tables,
-                    &mut entry.resource.clone(),
-                    send_declare,
-                );
-            }
-            PropagationType::ForgetThenDeclare => {
-                // Double propagate: forget then declare
-                // This ensures proper REMOVE before INSERT to prevent memory leaks
-                propagate_forget_simple_queryable(
-                    tables,
-                    &mut entry.resource.clone(),
-                    send_declare,
-                );
-                propagate_simple_queryable(tables, res, None, send_declare);
-            }
-        }
-    }
-
-    if tracing::enabled!(tracing::Level::INFO) {
-        let hat_tables = tables.hat.downcast_ref::<super::HatTables>().unwrap();
-        if let Ok(batch) = hat_tables.queryable_batch.lock() {
-            let stats = batch.stats();
-            tracing::info!(
-                "BATCH_FLUSH_COMPLETE entries_flushed={} still_pending={} rate={}/s high_load={} total_enqueued={} total_flushes={}",
-                entries_count,
-                stats.pending,
-                stats.rate,
-                stats.high_load,
-                stats.total_enqueued,
-                stats.total_flushes
-            );
-        }
     }
 }
