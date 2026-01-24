@@ -77,6 +77,7 @@ use crate::net::{
 mod interests;
 mod pubsub;
 mod queries;
+mod queryable_batch;
 mod token;
 
 macro_rules! hat {
@@ -105,15 +106,20 @@ macro_rules! face_hat_mut {
 }
 use face_hat_mut;
 
+use self::queryable_batch::QueryableBatchQueue;
 use crate::net::common::AutoConnect;
 
 struct HatTables {
     gossip: Option<Gossip>,
+    queryable_batch: std::sync::Mutex<QueryableBatchQueue>,
 }
 
 impl HatTables {
     fn new() -> Self {
-        Self { gossip: None }
+        Self {
+            gossip: None,
+            queryable_batch: std::sync::Mutex::new(QueryableBatchQueue::with_default_config()),
+        }
     }
 }
 
