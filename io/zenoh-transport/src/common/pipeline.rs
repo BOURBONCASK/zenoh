@@ -15,7 +15,7 @@ use std::{
     fmt,
     ops::Add,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -54,6 +54,9 @@ use crate::common::batch::BatchConfig;
 type BoxedWBatch = Box<WBatch>;
 
 const RBLEN: usize = QueueSizeConf::MAX;
+static STAGEIN_REFILL_MISS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static STAGEIN_REFILL_ALLOC_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static STAGEIN_DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // Inner structure to reuse serialization batches
 struct StageInRefill {
@@ -78,9 +81,33 @@ impl StageInRefill {
             Some(b) => Some(b),
             None if self.batch_allocs < self.batch_config.0 => {
                 self.batch_allocs += 1;
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let alloc_count =
+                        STAGEIN_REFILL_ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    if alloc_count % 256 == 0 {
+                        tracing::debug!(
+                            "PIPELINE_REFILL_ALLOC allocs={} max_allocs={}",
+                            self.batch_allocs,
+                            self.batch_config.0
+                        );
+                    }
+                }
                 Some(Box::new(WBatch::new(self.batch_config.1)))
             }
-            None => None,
+            None => {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let miss_count =
+                        STAGEIN_REFILL_MISS_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    if miss_count % 256 == 0 {
+                        tracing::debug!(
+                            "PIPELINE_REFILL_EMPTY allocs={} max_allocs={}",
+                            self.batch_allocs,
+                            self.batch_config.0
+                        );
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -320,6 +347,21 @@ impl StageIn {
                                     // Still no available batch.
                                     // Restore the sequence number and drop the message
                                     $($restore_sn)?
+                                    if tracing::enabled!(tracing::Level::DEBUG) {
+                                        let drop_count =
+                                            STAGEIN_DROP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                        if drop_count % 128 == 0 {
+                                            tracing::debug!(
+                                                "PIPELINE_DROP deadline={:?} priority={:?} reliable={} express={} allocs={} max_allocs={}",
+                                                deadline.lazy_deadline.wait_time,
+                                                priority,
+                                                msg.is_reliable(),
+                                                msg.is_express(),
+                                                self.s_ref.batch_allocs,
+                                                self.s_ref.batch_config.0
+                                            );
+                                        }
+                                    }
                                     tracing::trace!(
                                         "Zenoh message dropped because it's over the deadline {:?}: {:?}",
                                         deadline.lazy_deadline.wait_time, msg

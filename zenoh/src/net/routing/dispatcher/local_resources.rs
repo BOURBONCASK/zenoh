@@ -120,6 +120,14 @@ impl<Id: Copy, Res: LocalResourceTrait, Info: LocalResourceInfoTrait<Res>>
         self.simple_resources.contains_key(key)
     }
 
+    pub(crate) fn simple_len(&self) -> usize {
+        self.simple_resources.len()
+    }
+
+    pub(crate) fn aggregated_len(&self) -> usize {
+        self.aggregated_resources.len()
+    }
+
     pub(crate) fn simple_resources(&self) -> impl Iterator<Item = &Res> {
         self.simple_resources.keys()
     }
