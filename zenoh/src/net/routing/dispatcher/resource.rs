@@ -1088,19 +1088,22 @@ pub(crate) fn clear_session_ctxs_for_face(root: &mut Arc<Resource>, face_id: usi
 
             // Check if the session_ctx exists for this face
             if let Some(ctx) = res_mut.session_ctxs.get(&face_id) {
-                // Safety check: only remove if session_ctx is truly unused
-                // During close_face, this should always be true, but we check anyway
-                if session_ctx_unused(ctx.as_ref()) {
+                // During face closure, we need to check if there are active subscriptions/queryables/tokens
+                // local_expr_id and remote_expr_id are just optimizations and should not block cleanup
+                let has_active_usage = ctx.subs.is_some() || ctx.qabl.is_some() || ctx.token;
+
+                if !has_active_usage {
+                    // Safe to remove - no active subscriptions/queryables/tokens
                     res_mut.session_ctxs.remove(&face_id);
                     removed += 1;
                 } else {
-                    // This shouldn't happen during close_face, but log for debugging
+                    // This shouldn't happen during close_face - log as ERROR
                     skipped_in_use += 1;
-                    if tracing::enabled!(tracing::Level::WARN) {
+                    if tracing::enabled!(tracing::Level::ERROR) {
                         // Get resource expression before logging to avoid borrow conflict
                         let res_expr = res_mut.expr().to_string();
-                        tracing::warn!(
-                            "SESSION_CTX_SWEEP skipped in-use context: face={} res={} local_expr={:?} remote_expr={:?} subs={} qabl={} token={}",
+                        tracing::error!(
+                            "SESSION_CTX_SWEEP skipped ACTIVE context during face closure: face={} res={} local_expr={:?} remote_expr={:?} subs={} qabl={} token={}",
                             face_id,
                             res_expr,
                             ctx.local_expr_id,
@@ -1122,9 +1125,9 @@ pub(crate) fn clear_session_ctxs_for_face(root: &mut Arc<Resource>, face_id: usi
         stack.extend(children);
     }
 
-    if skipped_in_use > 0 && tracing::enabled!(tracing::Level::WARN) {
-        tracing::warn!(
-            "SESSION_CTX_SWEEP face={} removed={} skipped_in_use={}",
+    if skipped_in_use > 0 && tracing::enabled!(tracing::Level::ERROR) {
+        tracing::error!(
+            "SESSION_CTX_SWEEP face={} removed={} skipped_active={} (should be 0!)",
             face_id,
             removed,
             skipped_in_use

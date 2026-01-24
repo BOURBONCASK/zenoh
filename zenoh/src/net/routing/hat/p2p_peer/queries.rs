@@ -353,6 +353,15 @@ pub(super) fn undeclare_simple_queryable(
 
             // Solution: First forget old declarations, then propagate updated state
             // This ensures local_qabls entries are properly removed before re-adding
+            let faces_count = tables.faces.len();
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    "DOUBLE_PROPAGATE res={} faces_count={} simple_qabls_remaining={}",
+                    res.expr(),
+                    faces_count,
+                    simple_qabls.len()
+                );
+            }
             propagate_forget_simple_queryable(tables, res, send_declare);
             propagate_simple_queryable(tables, res, None, send_declare);
         }
