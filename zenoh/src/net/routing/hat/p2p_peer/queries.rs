@@ -347,23 +347,18 @@ pub(super) fn undeclare_simple_queryable(
             // No queryables left for this resource - clean up everywhere
             propagate_forget_simple_queryable(tables, res, send_declare);
         } else {
-            // CRITICAL FIX: Still have queryables, but need to update all faces
-            // Old bug: directly calling propagate_simple_queryable causes INSERT without REMOVE
-            // leading to 98.5% leak rate (44,517 INSERT vs 656 REMOVE)
-
-            // Solution: First forget old declarations, then propagate updated state
-            // This ensures local_qabls entries are properly removed before re-adding
-            let faces_count = tables.faces.len();
+            // Still have queryables from other faces - no propagation needed
+            // The queryable state hasn't fundamentally changed from other faces' perspective
+            // Calling propagate here would cause unnecessary network traffic and
+            // redundant insert operations leading to "memory leak" (44K INSERT vs 656 REMOVE)
             if tracing::enabled!(tracing::Level::DEBUG) {
                 tracing::debug!(
-                    "DOUBLE_PROPAGATE res={} faces_count={} simple_qabls_remaining={}",
+                    "UNDECLARE_SKIP_PROPAGATE res={} simple_qabls_remaining={}",
                     res.expr(),
-                    faces_count,
                     simple_qabls.len()
                 );
             }
-            propagate_forget_simple_queryable(tables, res, send_declare);
-            propagate_simple_queryable(tables, res, None, send_declare);
+            // No propagation - other faces' local_qabls remain unchanged
         }
 
         if simple_qabls.len() == 1 {
