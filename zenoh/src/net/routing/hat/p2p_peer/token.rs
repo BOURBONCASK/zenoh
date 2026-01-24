@@ -74,6 +74,15 @@ fn propagate_simple_token_to(
     {
         let id = face_hat!(dst_face).next_id.fetch_add(1, Ordering::SeqCst);
         face_hat_mut!(dst_face).local_tokens.insert(res.clone(), id);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                "LOCAL_TOKEN_INSERT face={} res={} token_id={} local_tokens={}",
+                dst_face.id,
+                res.expr(),
+                id,
+                face_hat!(dst_face).local_tokens.len()
+            );
+        }
         let key_expr = Resource::decl_key(res, dst_face, super::push_declaration_profile(dst_face));
         send_declare(
             &dst_face.primitives,
@@ -158,6 +167,17 @@ fn register_simple_token(
         }
     }
     face_hat_mut!(face).remote_tokens.insert(id, res.clone());
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        if let Some(expr) = res_expr.as_ref() {
+            tracing::debug!(
+                "REMOTE_TOKEN_INSERT face={} res={} token_id={} remote_tokens={}",
+                face_id,
+                expr,
+                id,
+                face_hat!(face).remote_tokens.len()
+            );
+        }
+    }
 }
 
 fn declare_simple_token(
@@ -309,6 +329,16 @@ pub(super) fn undeclare_simple_token(
         Resource::cleanup_session_ctx(res, face.id, "token");
 
         let mut simple_tokens = simple_tokens(res);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if let Some(expr) = res_expr.as_ref() {
+                tracing::debug!(
+                    "LOCAL_TOKEN_REMOVE face={} res={} remaining_faces={}",
+                    face.id,
+                    expr,
+                    simple_tokens.len()
+                );
+            }
+        }
         if simple_tokens.is_empty() {
             propagate_forget_simple_token(tables, res, face, send_declare);
         }

@@ -106,6 +106,7 @@ fn maybe_register_local_queryable(
     }
 
     let new_info = local_qabl_info(tables, res, dst_face);
+    let face_id = dst_face.id;
     let face_hat_mut = face_hat_mut!(dst_face);
     let (_, qabls_to_notify) = face_hat_mut.local_qabls.insert_simple_resource(
         res.clone(),
@@ -113,6 +114,16 @@ fn maybe_register_local_queryable(
         || face_hat_mut.next_id.fetch_add(1, Ordering::SeqCst),
         simple_interests,
     );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            "LOCAL_QABL_INSERT face={} res={} notify={} simple={} aggregated={}",
+            face_id,
+            res.expr(),
+            qabls_to_notify.len(),
+            face_hat_mut.local_qabls.simple_len(),
+            face_hat_mut.local_qabls.aggregated_len()
+        );
+    }
 
     for update in qabls_to_notify {
         let key_expr = Resource::decl_key(
@@ -146,7 +157,20 @@ fn maybe_unregister_local_queryable(
     res: &Arc<Resource>,
     send_declare: &mut SendDeclare,
 ) {
-    for update in face_hat_mut!(face).local_qabls.remove_simple_resource(res) {
+    let face_id = face.id;
+    let face_hat_mut = face_hat_mut!(face);
+    let updates = face_hat_mut.local_qabls.remove_simple_resource(res);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            "LOCAL_QABL_REMOVE face={} res={} updates={} simple={} aggregated={}",
+            face_id,
+            res.expr(),
+            updates.len(),
+            face_hat_mut.local_qabls.simple_len(),
+            face_hat_mut.local_qabls.aggregated_len()
+        );
+    }
+    for update in updates {
         match update.update {
             Some(new_qabl_info) => {
                 let key_expr = Resource::decl_key(
