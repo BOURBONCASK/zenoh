@@ -279,21 +279,17 @@ fn register_simple_queryable(
     // Register queryable
     {
         let res = get_mut_unchecked(res);
-        get_mut_unchecked(
-            res.session_ctxs
-                .entry(face_id)
-                .or_insert_with(|| {
-                    let ctx = Arc::new(SessionContext::new(face_clone));
-                    if let Some(expr) = res_expr.as_ref() {
-                        tracing::debug!(
-                            "SESSION_CTX_CREATE face={} res={} reason=qabl",
-                            face_id,
-                            expr
-                        );
-                    }
-                    ctx
-                }),
-        )
+        get_mut_unchecked(res.session_ctxs.entry(face_id).or_insert_with(|| {
+            let ctx = Arc::new(SessionContext::new(face_clone));
+            if let Some(expr) = res_expr.as_ref() {
+                tracing::debug!(
+                    "SESSION_CTX_CREATE face={} res={} reason=qabl",
+                    face_id,
+                    expr
+                );
+            }
+            ctx
+        }))
         .qabl = Some(*qabl_info);
     }
     face_hat_mut!(face)
@@ -348,8 +344,16 @@ pub(super) fn undeclare_simple_queryable(
     if update_queryable_info(res, face.id, &remote_qabl_info) {
         let mut simple_qabls = simple_qabls(res);
         if simple_qabls.is_empty() {
+            // No queryables left for this resource - clean up everywhere
             propagate_forget_simple_queryable(tables, res, send_declare);
         } else {
+            // CRITICAL FIX: Still have queryables, but need to update all faces
+            // Old bug: directly calling propagate_simple_queryable causes INSERT without REMOVE
+            // leading to 98.5% leak rate (44,517 INSERT vs 656 REMOVE)
+
+            // Solution: First forget old declarations, then propagate updated state
+            // This ensures local_qabls entries are properly removed before re-adding
+            propagate_forget_simple_queryable(tables, res, send_declare);
             propagate_simple_queryable(tables, res, None, send_declare);
         }
         if simple_qabls.len() == 1 {

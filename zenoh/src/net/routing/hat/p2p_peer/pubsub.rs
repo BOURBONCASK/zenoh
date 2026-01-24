@@ -300,11 +300,7 @@ pub(super) fn undeclare_simple_subscription(
         if let Some(ctx) = get_mut_unchecked(res).session_ctxs.get_mut(&face.id) {
             if ctx.subs.is_some() && tracing::enabled!(tracing::Level::DEBUG) {
                 if let Some(expr) = res_expr.as_ref() {
-                    tracing::debug!(
-                        "SESSION_CTX_CLEAR face={} res={} field=sub",
-                        face.id,
-                        expr
-                    );
+                    tracing::debug!("SESSION_CTX_CLEAR face={} res={} field=sub", face.id, expr);
                 }
             }
             get_mut_unchecked(ctx).subs = None;
