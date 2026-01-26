@@ -11,9 +11,14 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+// Global counters for tracking link lifecycle
+static LINK_CREATE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static LINK_CLOSE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 use zenoh_buffers::ZSliceBuffer;
 use zenoh_link::Link;
 #[cfg(feature = "unstable")]
@@ -101,6 +106,16 @@ impl TransportLinkUnicastUniversal {
             block_first_notifiers.push(notifier);
             block_first_waiters.push(waiter);
         }
+
+        let create_count = LINK_CREATE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let close_count = LINK_CLOSE_COUNTER.load(Ordering::Relaxed);
+        tracing::debug!(
+            "TRANSPORT_LINK_CREATE created={} closed={} active={} link={}",
+            create_count,
+            close_count,
+            create_count.saturating_sub(close_count),
+            link.link
+        );
 
         let result = Self {
             link,
@@ -200,12 +215,29 @@ impl TransportLinkUnicastUniversal {
     }
 
     pub(super) async fn close(self) -> ZResult<()> {
-        tracing::trace!("{}: closing", self.link);
+        let close_count = LINK_CLOSE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let create_count = LINK_CREATE_COUNTER.load(Ordering::Relaxed);
+        tracing::debug!(
+            "TRANSPORT_LINK_CLOSE created={} closed={} active={} link={}",
+            create_count,
+            close_count,
+            create_count.saturating_sub(close_count),
+            self.link
+        );
 
         self.tracker.close();
         self.token.cancel();
         self.pipeline.disable();
+
+        tracing::debug!(
+            "TRANSPORT_LINK_CLOSE waiting for tracker link={}",
+            self.link
+        );
         self.tracker.wait().await;
+        tracing::debug!(
+            "TRANSPORT_LINK_CLOSE tracker done, closing link={}",
+            self.link
+        );
 
         self.link.close(None).await
     }

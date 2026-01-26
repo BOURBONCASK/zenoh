@@ -58,6 +58,11 @@ static STAGEIN_REFILL_MISS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static STAGEIN_REFILL_ALLOC_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static STAGEIN_DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+// Pipeline lifecycle tracking counters
+static PIPELINE_CREATE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static PIPELINE_PRODUCER_DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static PIPELINE_CONSUMER_DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 // Inner structure to reuse serialization batches
 struct StageInRefill {
     n_ref_r: Waiter,
@@ -82,8 +87,7 @@ impl StageInRefill {
             None if self.batch_allocs < self.batch_config.0 => {
                 self.batch_allocs += 1;
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    let alloc_count =
-                        STAGEIN_REFILL_ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let alloc_count = STAGEIN_REFILL_ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
                     if alloc_count % 256 == 0 {
                         tracing::debug!(
                             "PIPELINE_REFILL_ALLOC allocs={} max_allocs={}",
@@ -96,8 +100,7 @@ impl StageInRefill {
             }
             None => {
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    let miss_count =
-                        STAGEIN_REFILL_MISS_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let miss_count = STAGEIN_REFILL_MISS_COUNTER.fetch_add(1, Ordering::Relaxed);
                     if miss_count % 256 == 0 {
                         tracing::debug!(
                             "PIPELINE_REFILL_EMPTY allocs={} max_allocs={}",
@@ -834,6 +837,18 @@ impl TransmissionPipeline {
             status,
         };
 
+        // Track pipeline creation for leak debugging
+        let create_count = PIPELINE_CREATE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let producer_drops = PIPELINE_PRODUCER_DROP_COUNTER.load(Ordering::Relaxed);
+        let consumer_drops = PIPELINE_CONSUMER_DROP_COUNTER.load(Ordering::Relaxed);
+        tracing::debug!(
+            "PIPELINE_CREATE created={} producer_drops={} consumer_drops={} active={}",
+            create_count,
+            producer_drops,
+            consumer_drops,
+            create_count.saturating_sub(producer_drops.min(consumer_drops))
+        );
+
         (producer, consumer)
     }
 }
@@ -986,6 +1001,25 @@ impl TransmissionPipelineProducer {
     }
 }
 
+impl Drop for TransmissionPipelineProducer {
+    fn drop(&mut self) {
+        let drop_count = PIPELINE_PRODUCER_DROP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let create_count = PIPELINE_CREATE_COUNTER.load(Ordering::Relaxed);
+        let consumer_drops = PIPELINE_CONSUMER_DROP_COUNTER.load(Ordering::Relaxed);
+        let stage_in_refs = Arc::strong_count(&self.stage_in);
+        let status_refs = Arc::strong_count(&self.status);
+        tracing::debug!(
+            "PIPELINE_PRODUCER_DROP created={} producer_drops={} consumer_drops={} active={} stage_in_refs={} status_refs={}",
+            create_count,
+            drop_count,
+            consumer_drops,
+            create_count.saturating_sub(drop_count.min(consumer_drops)),
+            stage_in_refs,
+            status_refs
+        );
+    }
+}
+
 pub(crate) struct TransmissionPipelineConsumer {
     // A single Mutex for all the priority queues
     stage_out: Box<[StageOut]>,
@@ -1070,6 +1104,21 @@ impl TransmissionPipelineConsumer {
         }
 
         batches
+    }
+}
+
+impl Drop for TransmissionPipelineConsumer {
+    fn drop(&mut self) {
+        let drop_count = PIPELINE_CONSUMER_DROP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        let create_count = PIPELINE_CREATE_COUNTER.load(Ordering::Relaxed);
+        let producer_drops = PIPELINE_PRODUCER_DROP_COUNTER.load(Ordering::Relaxed);
+        tracing::debug!(
+            "PIPELINE_CONSUMER_DROP created={} producer_drops={} consumer_drops={} active={}",
+            create_count,
+            producer_drops,
+            drop_count,
+            create_count.saturating_sub(producer_drops.min(drop_count))
+        );
     }
 }
 

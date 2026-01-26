@@ -123,7 +123,7 @@ impl TransportUnicastUniversal {
     /*************************************/
     pub(super) async fn delete(&self) -> ZResult<()> {
         tracing::debug!(
-            "[{}] Closing transport with peer: {}",
+            "TRANSPORT_DELETE [{}] Closing transport with peer: {}",
             self.manager.config.zid,
             self.config.zid
         );
@@ -144,9 +144,18 @@ impl TransportUnicastUniversal {
             *l_guard = vec![].into_boxed_slice();
             links
         };
+
+        tracing::debug!(
+            "TRANSPORT_DELETE closing {} links for peer: {}",
+            links.len(),
+            self.config.zid
+        );
+
         for l in links.drain(..) {
             let _ = l.close().await;
         }
+
+        tracing::debug!("TRANSPORT_DELETE completed for peer: {}", self.config.zid);
 
         // Notify the callback that we have closed the transport
         if let Some(cb) = callback.as_ref() {
