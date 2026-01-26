@@ -24,7 +24,12 @@ use zenoh_protocol::{
     core::{
         key_expr::keyexpr, ExprId, Reliability, WhatAmI, WireExpr, ZenohIdProto, EMPTY_EXPR_ID,
     },
-    network::{ext, Declare, DeclareBody, DeclareKeyExpr, Push},
+    network::{
+        declare::queryable::ext::QueryableInfoType,
+        ext,
+        interest::{InterestMode, InterestOptions},
+        Declare, DeclareBody, DeclareKeyExpr, Push,
+    },
     zenoh::Put,
 };
 use zenoh_sync::get_mut_unchecked;
@@ -36,6 +41,7 @@ use crate::{
         routing::{
             dispatcher::{
                 face::{Face, FaceState},
+                interests::declare_interest,
                 pubsub::SubscriberInfo,
                 resource::{clear_session_ctxs_for_face, SessionContext},
                 tables::Tables,
@@ -49,6 +55,20 @@ use crate::{
 fn new_router() -> Router {
     let zid = ZenohIdProto::try_from([1]).unwrap();
     let whatami = WhatAmI::Client;
+    Router::new(
+        zid,
+        whatami,
+        Some(Arc::new(HLC::default())),
+        &Config::default(),
+        #[cfg(feature = "stats")]
+        zenoh_stats::StatsRegistry::new(zid, whatami, "test"),
+    )
+    .unwrap()
+}
+
+fn new_peer() -> Router {
+    let zid = ZenohIdProto::try_from([2]).unwrap();
+    let whatami = WhatAmI::Peer;
     Router::new(
         zid,
         whatami,

@@ -1254,6 +1254,8 @@ pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, ex
                     );
                 }
             }
+            // Clean up session_ctx if it's no longer needed (no subs/qabls/tokens/expr_ids)
+            Resource::cleanup_session_ctx(&mut res, face.id, "unregister_expr");
             disable_matches_data_routes(&mut wtables, &mut res);
             disable_matches_query_routes(&mut wtables, &mut res);
             face.update_interceptors_caches(&mut res);
