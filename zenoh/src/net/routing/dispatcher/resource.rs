@@ -1229,7 +1229,7 @@ pub(crate) fn register_expr(
 }
 
 pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, expr_id: ExprId) {
-    let wtables = zwrite!(tables.tables);
+    let mut wtables = zwrite!(tables.tables);
     match get_mut_unchecked(face).remote_mappings.remove(&expr_id) {
         Some(mut res) => {
             if let Some(ctx) = get_mut_unchecked(&mut res).session_ctxs.get_mut(&face.id) {
