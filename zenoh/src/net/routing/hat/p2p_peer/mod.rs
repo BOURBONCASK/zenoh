@@ -52,10 +52,6 @@ use super::{
     super::dispatcher::{
         face::FaceState,
         interests as dispatcher_interests,
-        resource::{
-            clear_session_ctxs_for_face, collect_resource_stats, count_session_ctxs_for_face,
-            count_tree, dump_session_ctxs_for_face,
-        },
         tables::{NodeId, Resource, RoutingExpr, Tables, TablesLock},
     },
     HatBaseTrait, HatTrait, SendDeclare,
@@ -329,21 +325,9 @@ impl HatBaseTrait for HatCode {
         }
 
         let mut wtables = zwrite!(tables.tables);
-        let pre_tree = if tracing::enabled!(tracing::Level::DEBUG) {
-            Some(count_tree(&wtables.root_res))
-        } else {
-            None
-        };
-        let pre_face_ctx = if tracing::enabled!(tracing::Level::DEBUG) {
-            Some(count_session_ctxs_for_face(&wtables.root_res, face.id))
-        } else {
-            None
-        };
-        let pre_stats = if tracing::enabled!(tracing::Level::DEBUG) {
-            Some(collect_resource_stats(&wtables.root_res, 5))
-        } else {
-            None
-        };
+        // NOTE: Removed expensive pre-cleanup tree traversals (count_tree, count_session_ctxs_for_face,
+        // collect_resource_stats) that were causing lock contention and system freezes in large P2P networks.
+        // These debug stats traversed the entire resource tree while holding the write lock.
         let mut face_clone = face.clone();
         let face = get_mut_unchecked(face);
         let hat_face = match face.hat.downcast_mut::<HatFace>() {
@@ -456,88 +440,15 @@ impl HatBaseTrait for HatCode {
             Resource::clean(&mut res);
         }
 
-        let sweep_removed = clear_session_ctxs_for_face(&mut wtables.root_res, face.id);
-        if sweep_removed > 0 && tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(
-                "SESSION_CTX_SWEEP face={} removed={}",
-                face.id,
-                sweep_removed
-            );
-        }
+        // NOTE: Removed clear_session_ctxs_for_face() call that was causing system freezes.
+        // The function traverses the entire resource tree while holding the write lock,
+        // causing lock starvation in large P2P networks. The session_ctxs are already
+        // cleaned up in the loops above (remote_mappings, local_mappings, remote_subs,
+        // remote_qabls, remote_tokens).
+
         wtables.faces.remove(&face.id);
-        if let Some((nodes, contexts, session_ctxs)) = pre_tree {
-            let (post_nodes, post_contexts, post_session_ctxs) = count_tree(&wtables.root_res);
-            let (pre_face_total, pre_face_unused) = pre_face_ctx.unwrap_or((0, 0));
-            let (post_face_total, post_face_unused) =
-                count_session_ctxs_for_face(&wtables.root_res, face.id);
-            tracing::debug!(
-                "{} Close face end: faces={} res_nodes={} res_ctxs={} res_session_ctxs={} post_res_nodes={} post_res_ctxs={} post_res_session_ctxs={} face_ctxs={} face_unused_ctxs={} post_face_ctxs={} post_face_unused_ctxs={} session_ctx_swept={}",
-                face,
-                wtables.faces.len(),
-                nodes,
-                contexts,
-                session_ctxs,
-                post_nodes,
-                post_contexts,
-                post_session_ctxs,
-                pre_face_total,
-                pre_face_unused,
-                post_face_total,
-                post_face_unused,
-                sweep_removed
-            );
-            if let Some(pre_stats) = pre_stats {
-                let post_stats = collect_resource_stats(&wtables.root_res, 5);
-                tracing::debug!(
-                    "RES_STATS pre: nodes={} ctxs={} sess={} ros2_lv_nodes={} ros2_lv_ctxs={} ros2_lv_sess={} ros2_lv_guids={} ros2_lv_guid_min={} ros2_lv_guid_max={} ros2_lv_guid_top={:?} ros2_nodes={} ros2_ctxs={} ros2_sess={} data_nodes={} data_ctxs={} data_sess={}",
-                    pre_stats.nodes,
-                    pre_stats.contexts,
-                    pre_stats.session_ctxs,
-                    pre_stats.ros2_lv_nodes,
-                    pre_stats.ros2_lv_contexts,
-                    pre_stats.ros2_lv_session_ctxs,
-                    pre_stats.ros2_lv_guid_total,
-                    pre_stats.ros2_lv_guid_min,
-                    pre_stats.ros2_lv_guid_max,
-                    pre_stats.ros2_lv_guid_top,
-                    pre_stats.ros2_nodes,
-                    pre_stats.ros2_contexts,
-                    pre_stats.ros2_session_ctxs,
-                    pre_stats.data_nodes,
-                    pre_stats.data_contexts,
-                    pre_stats.data_session_ctxs
-                );
-                tracing::debug!(
-                    "RES_STATS post: nodes={} ctxs={} sess={} ros2_lv_nodes={} ros2_lv_ctxs={} ros2_lv_sess={} ros2_lv_guids={} ros2_lv_guid_min={} ros2_lv_guid_max={} ros2_lv_guid_top={:?} ros2_nodes={} ros2_ctxs={} ros2_sess={} data_nodes={} data_ctxs={} data_sess={}",
-                    post_stats.nodes,
-                    post_stats.contexts,
-                    post_stats.session_ctxs,
-                    post_stats.ros2_lv_nodes,
-                    post_stats.ros2_lv_contexts,
-                    post_stats.ros2_lv_session_ctxs,
-                    post_stats.ros2_lv_guid_total,
-                    post_stats.ros2_lv_guid_min,
-                    post_stats.ros2_lv_guid_max,
-                    post_stats.ros2_lv_guid_top,
-                    post_stats.ros2_nodes,
-                    post_stats.ros2_contexts,
-                    post_stats.ros2_session_ctxs,
-                    post_stats.data_nodes,
-                    post_stats.data_contexts,
-                    post_stats.data_session_ctxs
-                );
-            }
-            if post_face_total > 0 {
-                let limit = 50;
-                let total = dump_session_ctxs_for_face(&wtables.root_res, face.id, limit);
-                tracing::debug!(
-                    "SESSION_CTX_REMAIN_SUMMARY face={} total={} limit={}",
-                    face.id,
-                    total,
-                    limit
-                );
-            }
-        }
+
+        tracing::debug!("{} Close face end: faces={}", face, wtables.faces.len());
 
         if face.whatami != WhatAmI::Client {
             if let Some(net) = hat_mut!(wtables).gossip.as_mut() {

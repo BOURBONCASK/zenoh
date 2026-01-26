@@ -908,6 +908,12 @@ impl Resource {
     }
 }
 
+// NOTE: The following debug/diagnostic functions are intentionally kept but not used in production.
+// They were removed from the hot path in close_face() due to causing lock contention and system
+// freezes in large P2P networks. They traverse the entire resource tree which is expensive.
+// Kept for potential future debugging use.
+
+#[allow(dead_code)]
 pub(crate) fn count_tree(root: &Arc<Resource>) -> (usize, usize, usize) {
     let mut stack = vec![root.clone()];
     let mut nodes = 0usize;
@@ -926,6 +932,7 @@ pub(crate) fn count_tree(root: &Arc<Resource>) -> (usize, usize, usize) {
     (nodes, contexts, session_ctxs)
 }
 
+#[allow(dead_code)]
 #[derive(Default, Debug)]
 pub(crate) struct ResourceStats {
     pub(crate) nodes: usize,
@@ -946,6 +953,7 @@ pub(crate) struct ResourceStats {
     pub(crate) data_session_ctxs: usize,
 }
 
+#[allow(dead_code)]
 fn extract_ros2_lv_guid(expr: &str) -> Option<&str> {
     const PREFIX: &str = "@ros2_lv/20/";
     if !expr.starts_with(PREFIX) {
@@ -959,6 +967,7 @@ fn extract_ros2_lv_guid(expr: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+#[allow(dead_code)]
 pub(crate) fn collect_resource_stats(root: &Arc<Resource>, guid_topn: usize) -> ResourceStats {
     let mut stats = ResourceStats::default();
     let mut stack = vec![root.clone()];
@@ -1024,6 +1033,7 @@ pub(crate) fn collect_resource_stats(root: &Arc<Resource>, guid_topn: usize) -> 
     stats
 }
 
+#[allow(dead_code)]
 pub(crate) fn count_session_ctxs_for_face(root: &Arc<Resource>, face_id: usize) -> (usize, usize) {
     let mut stack = vec![root.clone()];
     let mut total = 0usize;
@@ -1042,6 +1052,7 @@ pub(crate) fn count_session_ctxs_for_face(root: &Arc<Resource>, face_id: usize) 
     (total, unused)
 }
 
+#[allow(dead_code)]
 pub(crate) fn dump_session_ctxs_for_face(
     root: &Arc<Resource>,
     face_id: usize,
@@ -1077,6 +1088,7 @@ pub(crate) fn dump_session_ctxs_for_face(
     total
 }
 
+#[allow(dead_code)]
 pub(crate) fn clear_session_ctxs_for_face(root: &mut Arc<Resource>, face_id: usize) -> usize {
     let mut stack = vec![root.clone()];
     let mut removed = 0usize;
