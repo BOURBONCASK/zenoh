@@ -735,7 +735,6 @@ impl Session {
                 session.to_weak(),
             )));
 
-            runtime.new_handler(Arc::new(admin::Handler::new(session.to_weak())));
             let (_face_id, primitives) = runtime.new_primitives(Arc::new(session.to_weak()));
 
             zwrite!(session.0.state).primitives = Some(primitives);
@@ -910,7 +909,7 @@ impl Session {
     /// ```
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
-            session: self.downgrade(),
+            session: self.to_weak(),
         }
     }
 

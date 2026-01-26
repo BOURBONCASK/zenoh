@@ -25,7 +25,10 @@ use zenoh_transport::{
     TransportEventHandler, TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler,
 };
 
-use crate::{api::session::WeakSession, sample::SampleKind};
+use crate::{
+    api::session::{Session, WeakSession},
+    sample::SampleKind,
+};
 pub(crate) struct ConnectivityHandler {
     session: WeakSession,
 }
@@ -43,9 +46,9 @@ impl TransportEventHandler for ConnectivityHandler {
         _transport: zenoh_transport::unicast::TransportUnicast,
     ) -> ZResult<Arc<dyn TransportPeerEventHandler>> {
         // Broadcast transport opened event only if session is not closed
-        if !self.session.session().is_closed() {
+        if !Session::ref_cast(&self.session).is_closed() {
             self.session
-                .broadcast_transport_event(SampleKind::Put, &peer, false);
+                .broadcast_transport_event(SampleKind::Put, &peer, true);
         }
 
         // Return ConnectivityPeerHandler
@@ -83,7 +86,7 @@ impl TransportPeerEventHandler for ConnectivityPeerHandler {
 
     fn new_link(&self, link: zenoh_link::Link) {
         // Check if session is closed
-        if self.session.session().is_closed() {
+        if Session::ref_cast(&self.session).is_closed() {
             return;
         }
 
@@ -99,7 +102,7 @@ impl TransportPeerEventHandler for ConnectivityPeerHandler {
 
     fn del_link(&self, link: zenoh_link::Link) {
         // Check if session is closed
-        if self.session.session().is_closed() {
+        if Session::ref_cast(&self.session).is_closed() {
             return;
         }
 
@@ -115,7 +118,7 @@ impl TransportPeerEventHandler for ConnectivityPeerHandler {
 
     fn closed(&self) {
         // Check if session is closed
-        if self.session.session().is_closed() {
+        if Session::ref_cast(&self.session).is_closed() {
             return;
         }
 
@@ -137,7 +140,7 @@ pub(crate) struct ConnectivityMulticastHandler {
 impl TransportMulticastEventHandler for ConnectivityMulticastHandler {
     fn new_peer(&self, peer: TransportPeer) -> ZResult<Arc<dyn TransportPeerEventHandler>> {
         // Broadcast transport opened event only if session is not closed
-        if !self.session.session().is_closed() {
+        if !Session::ref_cast(&self.session).is_closed() {
             self.session
                 .broadcast_transport_event(SampleKind::Put, &peer, true);
         }

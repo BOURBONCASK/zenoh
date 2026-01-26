@@ -48,7 +48,7 @@ impl KeyExprWireDeclaration {
                 expr_id,
                 prefix_len,
                 mapping: Mapping::Sender,
-                session: session.downgrade(),
+                session: session.to_weak(),
                 undeclared: false,
             }))
     }
