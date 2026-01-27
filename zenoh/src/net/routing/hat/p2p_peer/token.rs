@@ -278,6 +278,8 @@ pub(super) fn undeclare_simple_token(
         if let Some(ctx) = get_mut_unchecked(res).session_ctxs.get_mut(&face.id) {
             get_mut_unchecked(ctx).token = false;
         }
+        // Clean up session_ctx if it's no longer needed
+        Resource::cleanup_session_ctx(res, face.id);
 
         let mut simple_tokens = simple_tokens(res);
         if simple_tokens.is_empty() {

@@ -307,10 +307,15 @@ pub(super) fn undeclare_simple_queryable(
     if update_queryable_info(res, face.id, &remote_qabl_info) {
         let mut simple_qabls = simple_qabls(res);
         if simple_qabls.is_empty() {
+            // No queryables left for this resource - clean up everywhere
             propagate_forget_simple_queryable(tables, res, send_declare);
-        } else {
-            propagate_simple_queryable(tables, res, None, send_declare);
         }
+        // When simple_qabls is not empty, we intentionally skip propagation.
+        // The queryable state hasn't changed from other faces' perspective -
+        // the resource still has queryables. Calling propagate_simple_queryable()
+        // here would cause unnecessary INSERT operations to local_qabls on all faces,
+        // leading to redundant network traffic and apparent memory growth.
+
         if simple_qabls.len() == 1 {
             maybe_unregister_local_queryable(&mut simple_qabls[0], res, send_declare);
         }

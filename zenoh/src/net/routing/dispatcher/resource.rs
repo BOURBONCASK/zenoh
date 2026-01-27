@@ -176,6 +176,18 @@ impl SessionContext {
             e_interceptor_cache: InterceptorCache::empty(),
         }
     }
+
+    /// Check if this session context is unused and can be removed.
+    /// A session context is unused when it has no local/remote expr ids,
+    /// no subscriptions, no queryables, and no tokens.
+    #[inline]
+    pub(crate) fn is_unused(&self) -> bool {
+        self.local_expr_id.is_none()
+            && self.remote_expr_id.is_none()
+            && self.subs.is_none()
+            && self.qabl.is_none()
+            && !self.token
+    }
 }
 
 /// Global version number for route computation.
@@ -489,6 +501,20 @@ impl Resource {
         r.nonwild_prefix.take();
         r.context.take();
         r.session_ctxs.clear();
+    }
+
+    /// Clean up a session context for a face if it's no longer needed.
+    /// This prevents session_ctx accumulation when expressions are unregistered
+    /// but the session_ctx remains with all fields set to None/false.
+    pub(crate) fn cleanup_session_ctx(res: &mut Arc<Resource>, face_id: usize) {
+        let should_remove = get_mut_unchecked(res)
+            .session_ctxs
+            .get(&face_id)
+            .map(|ctx| ctx.is_unused())
+            .unwrap_or(false);
+        if should_remove {
+            get_mut_unchecked(res).session_ctxs.remove(&face_id);
+        }
     }
 
     #[cfg(test)]
@@ -939,6 +965,8 @@ pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, ex
             if let Some(ctx) = get_mut_unchecked(&mut res).session_ctxs.get_mut(&face.id) {
                 get_mut_unchecked(ctx).remote_expr_id = None;
             }
+            // Clean up session_ctx if it's no longer needed (no subs/qabls/tokens/expr_ids)
+            Resource::cleanup_session_ctx(&mut res, face.id);
             disable_matches_data_routes(&mut wtables, &mut res);
             disable_matches_query_routes(&mut wtables, &mut res);
             face.update_interceptors_caches(&mut res);

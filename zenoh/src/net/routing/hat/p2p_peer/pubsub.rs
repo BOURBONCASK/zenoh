@@ -281,6 +281,8 @@ pub(super) fn undeclare_simple_subscription(
         if let Some(ctx) = get_mut_unchecked(res).session_ctxs.get_mut(&face.id) {
             get_mut_unchecked(ctx).subs = None;
         }
+        // Clean up session_ctx if it's no longer needed
+        Resource::cleanup_session_ctx(res, face.id);
 
         let mut simple_subs = simple_subs(res);
         if simple_subs.is_empty() {
