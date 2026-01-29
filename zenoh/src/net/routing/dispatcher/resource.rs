@@ -965,11 +965,11 @@ pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, ex
             if let Some(ctx) = get_mut_unchecked(&mut res).session_ctxs.get_mut(&face.id) {
                 get_mut_unchecked(ctx).remote_expr_id = None;
             }
-            // Clean up session_ctx if it's no longer needed (no subs/qabls/tokens/expr_ids)
-            Resource::cleanup_session_ctx(&mut res, face.id);
             disable_matches_data_routes(&mut wtables, &mut res);
             disable_matches_query_routes(&mut wtables, &mut res);
             face.update_interceptors_caches(&mut res);
+            // Clean up session_ctx AFTER update_interceptors_caches (which requires session_ctx)
+            Resource::cleanup_session_ctx(&mut res, face.id);
             Resource::clean(&mut res);
         }
         None => tracing::error!("{} Undeclare unknown resource!", face),
