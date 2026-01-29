@@ -162,6 +162,19 @@ impl HatBaseTrait for HatCode {
         }
         face.local_mappings.clear();
 
+        for (_, res) in face.remote_key_interests.drain() {
+            if let Some(mut res) = res {
+                Resource::cleanup_session_ctx(&mut res, face.id);
+                Resource::clean(&mut res);
+            }
+        }
+        for (_, interest) in face.local_interests.drain() {
+            if let Some(mut res) = interest.res {
+                Resource::cleanup_session_ctx(&mut res, face.id);
+                Resource::clean(&mut res);
+            }
+        }
+
         let mut subs_matches = vec![];
         for (_id, mut res) in hat_face.remote_subs.drain() {
             get_mut_unchecked(&mut res).session_ctxs.remove(&face.id);

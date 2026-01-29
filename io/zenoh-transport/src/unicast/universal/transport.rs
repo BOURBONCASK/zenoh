@@ -158,7 +158,7 @@ impl TransportUnicastUniversal {
 
     pub(crate) async fn del_link(&self, link: Link) -> ZResult<()> {
         // Try to remove the link
-        let target = {
+        let (target, is_last) = {
             let mut guard = zwrite!(self.links);
 
             if let Some(index) = guard.iter().position(|tl| {
@@ -171,19 +171,11 @@ impl TransportUnicastUniversal {
                 .eq(&link)
             }) {
                 let is_last = guard.len() == 1;
-                if is_last {
-                    // even if closing the whole transport, still need to remove the link from the list
-                    // because multiple concurrent del_link calls could be staying on this guard
-                    *guard = vec![].into_boxed_slice();
-                    // Close the whole transport
-                    None
-                } else {
-                    // Remove the link
-                    let mut links = guard.to_vec();
-                    let stl = links.remove(index);
-                    *guard = links.into_boxed_slice();
-                    Some(stl)
-                }
+                // Remove the link (even if last) to avoid concurrent del_link races
+                let mut links = guard.to_vec();
+                let stl = links.remove(index);
+                *guard = links.into_boxed_slice();
+                (stl, is_last)
             } else {
                 bail!(
                     "Can not delete Link {} with peer: {}",
@@ -199,9 +191,11 @@ impl TransportUnicastUniversal {
             callback.del_link(link);
         }
 
-        match target {
-            None => self.delete().await,
-            Some(stl) => stl.close().await,
+        target.close().await?;
+        if is_last {
+            self.delete().await
+        } else {
+            Ok(())
         }
     }
 
