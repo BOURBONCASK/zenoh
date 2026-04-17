@@ -4743,6 +4743,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite 0.2.17",
+ "signal-hook-registry",
  "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",
