@@ -37,7 +37,7 @@ use super::{
     tables::{register_expr_interest, Tables, TablesLock},
 };
 use crate::net::routing::{
-    hat::{HatTrait, SendDeclare},
+    hat::{HatTrait, SendDeclare, SendInterest},
     router::{unregister_expr_interest, Resource},
     RoutingContext,
 };
@@ -208,6 +208,7 @@ pub(crate) fn declare_interest(
     mode: InterestMode,
     options: InterestOptions,
     send_declare: &mut SendDeclare,
+    send_interest: &mut SendInterest,
 ) {
     if options.keyexprs() && mode != InterestMode::Current {
         register_expr_interest(tables_ref, face, id, expr);
@@ -261,6 +262,7 @@ pub(crate) fn declare_interest(
                     mode,
                     options,
                     send_declare,
+                    send_interest,
                 );
             }
             None => tracing::error!(
@@ -281,6 +283,7 @@ pub(crate) fn declare_interest(
             mode,
             options,
             send_declare,
+            send_interest,
         );
     }
 }
@@ -290,9 +293,10 @@ pub(crate) fn undeclare_interest(
     tables: &TablesLock,
     face: &mut Arc<FaceState>,
     id: InterestId,
+    send_interest: &mut SendInterest,
 ) {
     tracing::debug!("{} Undeclare interest {}", face, id,);
     unregister_expr_interest(tables, face, id);
     let mut wtables = zwrite!(tables.tables);
-    hat_code.undeclare_interest(&mut wtables, face, id);
+    hat_code.undeclare_interest(&mut wtables, face, id, send_interest);
 }

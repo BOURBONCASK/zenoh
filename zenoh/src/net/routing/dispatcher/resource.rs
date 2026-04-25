@@ -43,7 +43,7 @@ use crate::net::routing::{
         face::{Face, FaceId},
         tables::RoutingExpr,
     },
-    hat::HatTrait,
+    hat::{HatTrait, SendDeclare},
     interceptor::{InterceptorTrait, InterceptorsChain},
     router::{disable_matches_data_routes, disable_matches_query_routes},
     RoutingContext,
@@ -584,6 +584,26 @@ impl Resource {
         face: &mut Arc<FaceState>,
         push: bool,
     ) -> WireExpr<'static> {
+        Self::decl_key_inner(res, face, push, None)
+    }
+
+    #[inline]
+    pub fn decl_key_with_declare(
+        res: &Arc<Resource>,
+        face: &mut Arc<FaceState>,
+        push: bool,
+        send_declare: &mut SendDeclare,
+    ) -> WireExpr<'static> {
+        Self::decl_key_inner(res, face, push, Some(send_declare))
+    }
+
+    #[inline]
+    fn decl_key_inner(
+        res: &Arc<Resource>,
+        face: &mut Arc<FaceState>,
+        push: bool,
+        send_declare: Option<&mut SendDeclare>,
+    ) -> WireExpr<'static> {
         if face.is_local {
             return res.expr().to_string().into();
         }
@@ -626,19 +646,23 @@ impl Resource {
                     get_mut_unchecked(face)
                         .local_mappings
                         .insert(expr_id, nonwild_prefix.clone());
-                    face.primitives.send_declare(RoutingContext::with_expr(
-                        &mut Declare {
-                            interest_id: None,
-                            ext_qos: ext::QoSType::DECLARE,
-                            ext_tstamp: None,
-                            ext_nodeid: ext::NodeIdType::DEFAULT,
-                            body: DeclareBody::DeclareKeyExpr(DeclareKeyExpr {
-                                id: expr_id,
-                                wire_expr: nonwild_prefix.expr().to_string().into(),
-                            }),
-                        },
-                        nonwild_prefix.expr().to_string(),
-                    ));
+                    let expr = nonwild_prefix.expr().to_string();
+                    let mut declare = Declare {
+                        interest_id: None,
+                        ext_qos: ext::QoSType::DECLARE,
+                        ext_tstamp: None,
+                        ext_nodeid: ext::NodeIdType::DEFAULT,
+                        body: DeclareBody::DeclareKeyExpr(DeclareKeyExpr {
+                            id: expr_id,
+                            wire_expr: expr.clone().into(),
+                        }),
+                    };
+                    if let Some(send_declare) = send_declare {
+                        send_declare(&face.primitives, RoutingContext::with_expr(declare, expr));
+                    } else {
+                        face.primitives
+                            .send_declare(RoutingContext::with_expr(&mut declare, expr));
+                    }
                     face.update_interceptors_caches(&mut nonwild_prefix);
                     WireExpr {
                         scope: expr_id,

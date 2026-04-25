@@ -31,7 +31,7 @@ use crate::net::routing::{
         resource::Resource,
         tables::{Tables, TablesLock},
     },
-    hat::{CurrentFutureTrait, HatInterestTrait, SendDeclare},
+    hat::{CurrentFutureTrait, HatInterestTrait, SendDeclare, SendInterest},
     RoutingContext,
 };
 
@@ -46,6 +46,7 @@ impl HatInterestTrait for HatCode {
         mode: InterestMode,
         options: InterestOptions,
         send_declare: &mut SendDeclare,
+        _send_interest: &mut SendInterest,
     ) {
         if options.subscribers() {
             declare_sub_interest(
@@ -104,7 +105,13 @@ impl HatInterestTrait for HatCode {
         }
     }
 
-    fn undeclare_interest(&self, _tables: &mut Tables, face: &mut Arc<FaceState>, id: InterestId) {
+    fn undeclare_interest(
+        &self,
+        _tables: &mut Tables,
+        face: &mut Arc<FaceState>,
+        id: InterestId,
+        _send_interest: &mut SendInterest,
+    ) {
         if let Some(i) = face_hat_mut!(face).remote_interests.remove(&id) {
             if i.options.subscribers() {
                 if i.options.aggregate() {

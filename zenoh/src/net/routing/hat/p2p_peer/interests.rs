@@ -37,7 +37,7 @@ use crate::net::routing::{
         resource::Resource,
         tables::{Tables, TablesLock},
     },
-    hat::{CurrentFutureTrait, HatInterestTrait, SendDeclare},
+    hat::{CurrentFutureTrait, HatInterestTrait, SendDeclare, SendInterest},
     RoutingContext,
 };
 
@@ -93,6 +93,7 @@ impl HatInterestTrait for HatCode {
         mode: InterestMode,
         options: InterestOptions,
         send_declare: &mut SendDeclare,
+        send_interest: &mut SendInterest,
     ) {
         if options.subscribers() {
             declare_sub_interest(
@@ -188,22 +189,30 @@ impl HatInterestTrait for HatCode {
                     );
                 }
                 let wire_expr = res.as_ref().map(|res| {
-                    Resource::decl_key(res, dst_face, super::push_declaration_profile(dst_face))
+                    Resource::decl_key_with_declare(
+                        res,
+                        dst_face,
+                        super::push_declaration_profile(dst_face),
+                        send_declare,
+                    )
                 });
-                dst_face.primitives.send_interest(RoutingContext::with_expr(
-                    &mut Interest {
-                        id,
-                        mode: propagated_mode,
-                        options,
-                        wire_expr,
-                        ext_qos: ext::QoSType::DECLARE,
-                        ext_tstamp: None,
-                        ext_nodeid: ext::NodeIdType::DEFAULT,
-                    },
-                    res.as_ref()
-                        .map(|res| res.expr().to_string())
-                        .unwrap_or_default(),
-                ));
+                send_interest(
+                    &dst_face.primitives,
+                    RoutingContext::with_expr(
+                        Interest {
+                            id,
+                            mode: propagated_mode,
+                            options,
+                            wire_expr,
+                            ext_qos: ext::QoSType::DECLARE,
+                            ext_tstamp: None,
+                            ext_nodeid: ext::NodeIdType::DEFAULT,
+                        },
+                        res.as_ref()
+                            .map(|res| res.expr().to_string())
+                            .unwrap_or_default(),
+                    ),
+                );
             }
         }
 
@@ -228,7 +237,13 @@ impl HatInterestTrait for HatCode {
         }
     }
 
-    fn undeclare_interest(&self, tables: &mut Tables, face: &mut Arc<FaceState>, id: InterestId) {
+    fn undeclare_interest(
+        &self,
+        tables: &mut Tables,
+        face: &mut Arc<FaceState>,
+        id: InterestId,
+        send_interest: &mut SendInterest,
+    ) {
         if let Some(interest) = face_hat_mut!(face).remote_interests.remove(&id) {
             if interest.options.subscribers() {
                 if interest.options.aggregate() {
@@ -271,24 +286,27 @@ impl HatInterestTrait for HatCode {
                 {
                     dst_face.local_interests.retain(|id, local_interest| {
                         if *local_interest == interest {
-                            dst_face.primitives.send_interest(RoutingContext::with_expr(
-                                &mut Interest {
-                                    id: *id,
-                                    mode: InterestMode::Final,
-                                    // Note: InterestMode::Final options are undefined in the current protocol specification,
-                                    //       they are initialized here for internal use by local egress interceptors.
-                                    options: interest.options,
-                                    wire_expr: None,
-                                    ext_qos: ext::QoSType::DECLARE,
-                                    ext_tstamp: None,
-                                    ext_nodeid: ext::NodeIdType::DEFAULT,
-                                },
-                                local_interest
-                                    .res
-                                    .as_ref()
-                                    .map(|res| res.expr().to_string())
-                                    .unwrap_or_default(),
-                            ));
+                            send_interest(
+                                &dst_face.primitives,
+                                RoutingContext::with_expr(
+                                    Interest {
+                                        id: *id,
+                                        mode: InterestMode::Final,
+                                        // Note: InterestMode::Final options are undefined in the current protocol specification,
+                                        //       they are initialized here for internal use by local egress interceptors.
+                                        options: interest.options,
+                                        wire_expr: None,
+                                        ext_qos: ext::QoSType::DECLARE,
+                                        ext_tstamp: None,
+                                        ext_nodeid: ext::NodeIdType::DEFAULT,
+                                    },
+                                    local_interest
+                                        .res
+                                        .as_ref()
+                                        .map(|res| res.expr().to_string())
+                                        .unwrap_or_default(),
+                                ),
+                            );
                             return false;
                         }
                         true

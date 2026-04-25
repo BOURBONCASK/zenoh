@@ -25,7 +25,7 @@ use zenoh_protocol::{
     network::{
         declare::{queryable::ext::QueryableInfoType, QueryableId, SubscriberId, TokenId},
         interest::{InterestId, InterestMode, InterestOptions},
-        Declare, Oam,
+        Declare, Interest, Oam,
     },
 };
 use zenoh_result::ZResult;
@@ -74,6 +74,8 @@ impl Sources {
 }
 
 pub(crate) type SendDeclare<'a> = dyn FnMut(&Arc<dyn crate::net::primitives::EPrimitives + Send + Sync>, RoutingContext<Declare>)
+    + 'a;
+pub(crate) type SendInterest<'a> = dyn FnMut(&Arc<dyn crate::net::primitives::EPrimitives + Send + Sync>, RoutingContext<Interest>)
     + 'a;
 pub(crate) trait HatTrait:
     HatBaseTrait + HatInterestTrait + HatPubSubTrait + HatQueriesTrait + HatTokenTrait
@@ -181,8 +183,15 @@ pub(crate) trait HatInterestTrait {
         mode: InterestMode,
         options: InterestOptions,
         send_declare: &mut SendDeclare,
+        send_interest: &mut SendInterest,
     );
-    fn undeclare_interest(&self, tables: &mut Tables, face: &mut Arc<FaceState>, id: InterestId);
+    fn undeclare_interest(
+        &self,
+        tables: &mut Tables,
+        face: &mut Arc<FaceState>,
+        id: InterestId,
+        send_interest: &mut SendInterest,
+    );
     fn declare_final(&self, tables: &mut Tables, face: &mut Arc<FaceState>, id: InterestId);
 }
 

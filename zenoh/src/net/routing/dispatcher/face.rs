@@ -13,6 +13,7 @@
 //
 use std::{
     any::Any,
+    cell::RefCell,
     collections::HashMap,
     fmt,
     sync::{Arc, Weak},
@@ -26,7 +27,7 @@ use zenoh_protocol::{
     core::{ExprId, Reliability, WhatAmI, ZenohIdProto},
     network::{
         interest::{InterestId, InterestMode, InterestOptions},
-        Mapping, Push, Request, RequestId, Response, ResponseFinal,
+        Declare, Interest, Mapping, Push, Request, RequestId, Response, ResponseFinal,
     },
     zenoh::RequestBody,
 };
@@ -41,15 +42,34 @@ use super::{
     tables::TablesLock,
 };
 use crate::net::{
-    primitives::{McastMux, Mux, Primitives},
+    primitives::{EPrimitives, McastMux, Mux, Primitives},
     routing::{
         dispatcher::interests::{finalize_pending_interests, RemoteInterest},
         interceptor::{
             EgressInterceptor, IngressInterceptor, InterceptorFactory, InterceptorTrait,
             InterceptorsChain,
         },
+        RoutingContext,
     },
 };
+
+enum DeferredRoutingMessage {
+    Declare(Arc<dyn EPrimitives + Send + Sync>, RoutingContext<Declare>),
+    Interest(Arc<dyn EPrimitives + Send + Sync>, RoutingContext<Interest>),
+}
+
+fn flush_deferred_routing_messages(messages: Vec<DeferredRoutingMessage>) {
+    for message in messages {
+        match message {
+            DeferredRoutingMessage::Declare(p, m) => {
+                m.with_mut(|m| p.send_declare(m));
+            }
+            DeferredRoutingMessage::Interest(p, m) => {
+                m.with_mut(|m| p.send_interest(m));
+            }
+        }
+    }
+}
 
 pub(crate) struct InterestState {
     face: FaceId,
@@ -345,7 +365,7 @@ impl Primitives for Face {
     fn send_interest(&self, msg: &mut zenoh_protocol::network::Interest) {
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
         if msg.mode != InterestMode::Final {
-            let mut declares = vec![];
+            let deferred = RefCell::new(vec![]);
             declare_interest(
                 self.tables.hat_code.as_ref(),
                 &self.tables,
@@ -354,19 +374,34 @@ impl Primitives for Face {
                 msg.wire_expr.as_ref(),
                 msg.mode,
                 msg.options,
-                &mut |p, m| declares.push((p.clone(), m)),
+                &mut |p, m| {
+                    deferred
+                        .borrow_mut()
+                        .push(DeferredRoutingMessage::Declare(p.clone(), m));
+                },
+                &mut |p, m| {
+                    deferred
+                        .borrow_mut()
+                        .push(DeferredRoutingMessage::Interest(p.clone(), m));
+                },
             );
             drop(ctrl_lock);
-            for (p, m) in declares {
-                m.with_mut(|m| p.send_declare(m));
-            }
+            flush_deferred_routing_messages(deferred.into_inner());
         } else {
+            let deferred = RefCell::new(vec![]);
             undeclare_interest(
                 self.tables.hat_code.as_ref(),
                 &self.tables,
                 &mut self.state.clone(),
                 msg.id,
+                &mut |p, m| {
+                    deferred
+                        .borrow_mut()
+                        .push(DeferredRoutingMessage::Interest(p.clone(), m));
+                },
             );
+            drop(ctrl_lock);
+            flush_deferred_routing_messages(deferred.into_inner());
         }
     }
 
