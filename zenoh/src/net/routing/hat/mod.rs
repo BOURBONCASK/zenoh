@@ -304,11 +304,17 @@ pub(crate) trait HatBaseTrait: Any {
     }
 
     /// Disables this hat's data and query routes **for all resources**.
-    fn disable_all_routes(&mut self, tables: &mut TablesData) {
+    fn disable_all_routes(
+        &mut self,
+        tables: &mut TablesData,
+        source: crate::net::routing::dispatcher::diagnostics::InvalidationSource,
+    ) {
         let routes_version = &mut tables.hats[self.region()].routes_version;
         *routes_version = routes_version.saturating_add(1);
 
         tables.disable_all_routes();
+
+        crate::net::routing::dispatcher::diagnostics::record_disable_all_routes(source);
     }
 }
 

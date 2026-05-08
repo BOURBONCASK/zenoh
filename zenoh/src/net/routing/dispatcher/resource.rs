@@ -305,14 +305,17 @@ pub(crate) fn get_or_set_route<T: Clone>(
     compute_route: impl FnOnce() -> T,
 ) -> T {
     if let Some(route) = routes.read().unwrap().get_route(version, region, node_id) {
+        crate::net::routing::dispatcher::diagnostics::record_route_cache_hit();
         return route.clone();
     }
     let mut routes = routes.write().unwrap();
     // NOTE(regions): we supposedly re-read the routes here because they might've changed, but I'm
     // not sure this is true given that all callers would've acquired `TablesLock::tables`.
     if let Some(route) = routes.get_route(version, region, node_id) {
+        crate::net::routing::dispatcher::diagnostics::record_route_cache_hit();
         return route.clone();
     }
+    crate::net::routing::dispatcher::diagnostics::record_route_cache_miss();
     let route = compute_route();
     routes.set_route(version, region, node_id, route.clone());
     route
@@ -964,6 +967,7 @@ pub(crate) fn register_expr(
                 }
             }
             None => {
+                let wt_pre = std::time::Instant::now();
                 let res = Resource::get_resource(&prefix, &expr.suffix);
                 let (mut res, mut wtables) = if res
                     .as_ref()
@@ -987,6 +991,10 @@ pub(crate) fn register_expr(
                     Resource::match_resource(&wtables.data, &mut res, matches);
                     (res, wtables)
                 };
+                let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+                    crate::net::routing::dispatcher::diagnostics::WTableSite::RegisterExpr,
+                    wt_pre,
+                );
                 let ctx = get_mut_unchecked(&mut res)
                     .face_ctxs
                     .entry(face.id)
@@ -1006,6 +1014,7 @@ pub(crate) fn register_expr(
                 hats[region].disable_query_routes(&mut res);
 
                 face.update_interceptors_caches(&mut res);
+                _wt_timer.release();
                 drop(wtables);
             }
         },
@@ -1018,7 +1027,12 @@ pub(crate) fn register_expr(
 }
 
 pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, expr_id: ExprId) {
+    let wt_pre = std::time::Instant::now();
     let mut wtables = zwrite!(tables.tables);
+    let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+        crate::net::routing::dispatcher::diagnostics::WTableSite::RegisterExpr,
+        wt_pre,
+    );
 
     let tables = &mut *wtables;
     let hats = &mut tables.hats;
@@ -1037,6 +1051,7 @@ pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, ex
         None => tracing::error!("{} Undeclare unknown resource!", face),
     }
 
+    _wt_timer.release();
     drop(wtables);
 }
 
@@ -1054,6 +1069,7 @@ pub(crate) fn register_expr_interest(
             .cloned()
         {
             Some(mut prefix) => {
+                let wt_pre = std::time::Instant::now();
                 let res = Resource::get_resource(&prefix, &expr.suffix);
                 let (res, wtables) = if res.as_ref().map(|r| r.ctx.is_some()).unwrap_or(false) {
                     drop(rtables);
@@ -1073,9 +1089,14 @@ pub(crate) fn register_expr_interest(
                     Resource::match_resource(&wtables.data, &mut res, matches);
                     (res, wtables)
                 };
+                let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+                    crate::net::routing::dispatcher::diagnostics::WTableSite::RegisterExpr,
+                    wt_pre,
+                );
                 get_mut_unchecked(face)
                     .remote_key_interests
                     .insert(id, Some(res));
+                _wt_timer.release();
                 drop(wtables);
             }
             None => tracing::error!(
@@ -1085,10 +1106,16 @@ pub(crate) fn register_expr_interest(
             ),
         }
     } else {
+        let wt_pre = std::time::Instant::now();
         let wtables = zwrite!(tables.tables);
+        let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+            crate::net::routing::dispatcher::diagnostics::WTableSite::RegisterExpr,
+            wt_pre,
+        );
         get_mut_unchecked(face)
             .remote_key_interests
             .insert(id, None);
+        _wt_timer.release();
         drop(wtables);
     }
 }

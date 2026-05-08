@@ -75,14 +75,24 @@ impl Hat {
         dst_face: &mut Arc<FaceState>,
         send_declare: &mut SendDeclare,
     ) {
-        if self
-            .face_hat(dst_face)
-            .local_subs
-            .contains_simple_resource(res)
-        {
-            return;
+        use crate::net::routing::dispatcher::diagnostics::{
+            record_repropagate_subs_step, RepropagateSubsStep,
         };
 
+        let t_a = std::time::Instant::now();
+        let already = self
+            .face_hat(dst_face)
+            .local_subs
+            .contains_simple_resource(res);
+        record_repropagate_subs_step(
+            RepropagateSubsStep::ContainsCheck,
+            t_a.elapsed().as_micros() as u64,
+        );
+        if already {
+            return;
+        }
+
+        let t_b = std::time::Instant::now();
         // NOTE(regions): it's not because of initial interest that we push subscribers to north-bound peers.
         // Initial interest only exists to track current declarations at startup. This code is misleading.
         // See 20a95fb.
@@ -109,11 +119,16 @@ impl Hat {
                     },
                 ),
         };
+        record_repropagate_subs_step(
+            RepropagateSubsStep::ShouldNotifyCompute,
+            t_b.elapsed().as_micros() as u64,
+        );
 
         if !should_notify {
             return;
         }
 
+        let t_c = std::time::Instant::now();
         let face_hat_mut = self.face_hat_mut(dst_face);
         let (_, subs_to_notify) = face_hat_mut.local_subs.insert_simple_resource(
             res.clone(),
@@ -121,7 +136,12 @@ impl Hat {
             || face_hat_mut.next_id.fetch_add(1, Ordering::SeqCst),
             simple_interests,
         );
+        record_repropagate_subs_step(
+            RepropagateSubsStep::InsertSimpleResource,
+            t_c.elapsed().as_micros() as u64,
+        );
 
+        let t_d = std::time::Instant::now();
         for update in subs_to_notify {
             tracing::debug!(dst = %dst_face);
             let key_expr = Resource::decl_key(&update.resource, dst_face);
@@ -142,6 +162,10 @@ impl Hat {
                 ),
             );
         }
+        record_repropagate_subs_step(
+            RepropagateSubsStep::DeclKeyAndSend,
+            t_d.elapsed().as_micros() as u64,
+        );
     }
 
     fn maybe_unpropagate_subscriber(
@@ -236,6 +260,8 @@ impl HatPubSubTrait for Hat {
         expr: &RoutingExpr,
         _node_id: NodeId,
     ) -> Arc<Route> {
+        let _diag_timer =
+            crate::net::routing::dispatcher::diagnostics::ComputeDataRouteTimer::start();
         let mut route = RouteBuilder::<Direction>::new();
         let Some(key_expr) = expr.key_expr() else {
             return Arc::new(route.build());

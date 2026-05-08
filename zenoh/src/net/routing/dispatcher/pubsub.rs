@@ -236,7 +236,9 @@ pub fn route_data(
     reliability: Reliability,
     consume: bool,
 ) {
+    let mut _rt_timer = crate::net::routing::dispatcher::diagnostics::RTableTimer::start();
     let rtables = zread!(tables_ref.tables);
+    _rt_timer.acquired();
     let tables = &*rtables;
     let Some(prefix) =
         rtables

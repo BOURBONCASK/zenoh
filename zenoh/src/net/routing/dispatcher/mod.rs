@@ -17,6 +17,7 @@
 //! This module is intended for Zenoh's internal use.
 //!
 //! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
+pub mod diagnostics;
 pub mod face;
 pub mod interests;
 pub mod local_resources;

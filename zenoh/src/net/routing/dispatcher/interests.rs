@@ -347,7 +347,12 @@ impl Face {
         ret
     )]
     pub(crate) fn interest_final(&self, msg: &Interest) {
+        let wt_pre = std::time::Instant::now();
         let mut wtables = zwrite!(self.tables.tables);
+        let _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+            crate::net::routing::dispatcher::diagnostics::WTableSite::InterestFinal,
+            wt_pre,
+        );
         let tables = &mut *wtables;
 
         let mut ctx = DispatcherContext {
@@ -400,7 +405,10 @@ impl Face {
         // TODO(regions): this is too conservative, the north hat should be able to decide what
         // keyexpr(s)—if not all—are affected and whether this finalization concerns subscribers
         // or queryables or borth.
-        hats[region].disable_all_routes(ctx.tables);
+        hats[region].disable_all_routes(
+            ctx.tables,
+            crate::net::routing::dispatcher::diagnostics::InvalidationSource::DeclareFinal,
+        );
 
         match hats[region].route_declare_final(ctx.reborrow(), interest_id) {
             RouteCurrentDeclareResult::Noop | RouteCurrentDeclareResult::NoBreadcrumb => {} // ¯\_(ツ)_/¯
