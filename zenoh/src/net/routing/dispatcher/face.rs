@@ -32,6 +32,7 @@ use zenoh_protocol::{
     },
     zenoh::RequestBody,
 };
+use zenoh_runtime::ZRuntime;
 use zenoh_sync::get_mut_unchecked;
 use zenoh_task::TaskController;
 use zenoh_transport::multicast::TransportMulticast;
@@ -56,6 +57,7 @@ use crate::net::{
             EgressInterceptor, IngressInterceptor, InterceptorFactory, InterceptorTrait,
             InterceptorsChain,
         },
+        RoutingContext,
     },
 };
 
@@ -536,6 +538,28 @@ impl Face {
     }
 }
 
+/// Spawn the post-`drop(ctrl_lock)` flush of deferred declares on the given
+/// face's `task_controller`, so the calling thread does not block on
+/// transport pipeline backpressure. The task is bound to the face's
+/// lifetime: closing the face cancels in-flight flushes via
+/// `terminate_all_async()`. `tokio::task::yield_now().await` between
+/// iterations gives the runtime an opportunity to abort the loop without
+/// having to wait for a slow `send_declare` to return.
+fn spawn_declare_flush(
+    task_controller: &TaskController,
+    declares: Vec<(
+        Arc<dyn EPrimitives + Send + Sync>,
+        RoutingContext<zenoh_protocol::network::Declare>,
+    )>,
+) {
+    task_controller.spawn_abortable_with_rt(ZRuntime::Net, async move {
+        for (p, mut m) in declares {
+            m.with_mut(|m| p.send_declare(m));
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
 impl Primitives for Face {
     fn send_interest(&self, msg: &mut zenoh_protocol::network::Interest) {
         let cl_pre = std::time::Instant::now();
@@ -549,9 +573,7 @@ impl Primitives for Face {
             self.interest(msg, &mut |p, m| declares.push((p.clone(), m)));
             _cl_timer.release();
             drop(ctrl_lock);
-            for (p, m) in declares {
-                m.with_mut(|m| p.send_declare(m));
-            }
+            spawn_declare_flush(&self.state.task_controller, declares);
         } else {
             self.interest_final(msg);
         }
@@ -582,9 +604,7 @@ impl Primitives for Face {
                 );
                 _cl_timer.release();
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, declares);
             }
             zenoh_protocol::network::DeclareBody::UndeclareSubscriber(m) => {
                 let mut declares = vec![];
@@ -596,9 +616,7 @@ impl Primitives for Face {
                 );
                 _cl_timer.release();
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, declares);
             }
             zenoh_protocol::network::DeclareBody::DeclareQueryable(m) => {
                 let mut declares = vec![];
@@ -611,9 +629,7 @@ impl Primitives for Face {
                 );
                 _cl_timer.release();
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, declares);
             }
             zenoh_protocol::network::DeclareBody::UndeclareQueryable(m) => {
                 let mut declares = vec![];
@@ -625,9 +641,7 @@ impl Primitives for Face {
                 );
                 _cl_timer.release();
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, declares);
             }
             zenoh_protocol::network::DeclareBody::DeclareToken(m) => {
                 let mut declares = vec![];
@@ -640,9 +654,7 @@ impl Primitives for Face {
                 );
                 _cl_timer.release();
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, declares);
             }
             zenoh_protocol::network::DeclareBody::UndeclareToken(m) => {
                 let mut declares = vec![];
@@ -654,9 +666,7 @@ impl Primitives for Face {
                 );
                 _cl_timer.release();
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, declares);
             }
             zenoh_protocol::network::DeclareBody::DeclareFinal(_) => {
                 let Some(id) = msg.interest_id else {
@@ -681,13 +691,19 @@ impl Primitives for Face {
                 drop(ctrl_lock);
                 let n_declares = declares.len() as u64;
                 let flush_start = std::time::Instant::now();
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
-                crate::net::routing::dispatcher::diagnostics::record_wtables_flush(
-                    crate::net::routing::dispatcher::diagnostics::WTableSite::DeclareFinal,
-                    n_declares,
-                    flush_start.elapsed().as_micros() as u64,
+                self.state.task_controller.spawn_abortable_with_rt(
+                    ZRuntime::Net,
+                    async move {
+                        for (p, mut m) in declares {
+                            m.with_mut(|m| p.send_declare(m));
+                            tokio::task::yield_now().await;
+                        }
+                        crate::net::routing::dispatcher::diagnostics::record_wtables_flush(
+                            crate::net::routing::dispatcher::diagnostics::WTableSite::DeclareFinal,
+                            n_declares,
+                            flush_start.elapsed().as_micros() as u64,
+                        );
+                    },
                 );
             }
         }
