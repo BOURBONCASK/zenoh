@@ -147,7 +147,10 @@ impl HatBaseTrait for Hat {
 
         // NOTE(regions): see `new_transport_unicast_face`
 
-        self.disable_all_routes(ctx.tables);
+        self.disable_all_routes(
+            ctx.tables,
+            crate::net::routing::dispatcher::diagnostics::InvalidationSource::PeerInit,
+        );
 
         Ok(())
     }
@@ -166,7 +169,10 @@ impl HatBaseTrait for Hat {
         // 1. The broker hat is never the north hat, thus there are no interests to re-propagate
         // 2. The broker hat doesn't re-propagate entities between clients
 
-        self.disable_all_routes(ctx.tables);
+        self.disable_all_routes(
+            ctx.tables,
+            crate::net::routing::dispatcher::diagnostics::InvalidationSource::PeerInit,
+        );
 
         Ok(())
     }

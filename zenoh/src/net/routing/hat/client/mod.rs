@@ -158,7 +158,10 @@ impl HatBaseTrait for Hat {
         self.repropagate_subscribers(ctx.reborrow(), &other_hats);
         self.repropagate_queryables(ctx.reborrow(), &other_hats);
         self.repropagate_tokens(ctx.reborrow(), &other_hats);
-        self.disable_all_routes(ctx.tables);
+        self.disable_all_routes(
+            ctx.tables,
+            crate::net::routing::dispatcher::diagnostics::InvalidationSource::PeerInit,
+        );
         Ok(())
     }
 

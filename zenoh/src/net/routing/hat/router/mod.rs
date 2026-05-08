@@ -203,7 +203,10 @@ impl Hat {
         self.pubsub_tree_change(tables, &new_children);
         self.queries_tree_change(tables, &new_children);
         self.token_tree_change(tables, &new_children);
-        self.disable_all_routes(tables);
+        self.disable_all_routes(
+            tables,
+            crate::net::routing::dispatcher::diagnostics::InvalidationSource::Other,
+        );
     }
 
     fn get_router(&self, face: &FaceState, nodeid: NodeId) -> Option<ZenohIdProto> {

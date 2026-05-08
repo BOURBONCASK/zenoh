@@ -218,8 +218,18 @@ impl Gateway {
     }
 
     pub(crate) fn new_session(&self, primitives: Arc<dyn EPrimitives + Send + Sync>) -> Arc<Face> {
+        let cl_pre = std::time::Instant::now();
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        let mut _cl_timer = crate::net::routing::dispatcher::diagnostics::CtrlLockTimer::new(
+            crate::net::routing::dispatcher::diagnostics::CtrlLockSite::NewSession,
+            cl_pre,
+        );
+        let wt_pre = std::time::Instant::now();
         let mut wtables = zwrite!(self.tables.tables);
+        let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+            crate::net::routing::dispatcher::diagnostics::WTableSite::PeerInit,
+            wt_pre,
+        );
         let tables = &mut *wtables;
 
         let newface = Arc::new(
@@ -255,7 +265,9 @@ impl Gateway {
                 &self.tables,
             )
             .unwrap();
+        _wt_timer.release();
         drop(wtables);
+        _cl_timer.release();
         drop(ctrl_lock);
 
         Arc::new(face)
@@ -267,8 +279,27 @@ impl Gateway {
         region: Region,
         remote_bound: Bound,
     ) -> ZResult<Arc<DeMux>> {
+        struct NtuGuard(std::time::Instant);
+        impl Drop for NtuGuard {
+            fn drop(&mut self) {
+                crate::net::routing::dispatcher::diagnostics::record_new_transport_unicast(
+                    self.0.elapsed().as_micros() as u64,
+                );
+            }
+        }
+        let _ntu_guard = NtuGuard(std::time::Instant::now());
+        let cl_pre = std::time::Instant::now();
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        let mut _cl_timer = crate::net::routing::dispatcher::diagnostics::CtrlLockTimer::new(
+            crate::net::routing::dispatcher::diagnostics::CtrlLockSite::NewTransportUnicast,
+            cl_pre,
+        );
+        let wt_pre = std::time::Instant::now();
         let mut wtables = zwrite!(self.tables.tables);
+        let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+            crate::net::routing::dispatcher::diagnostics::WTableSite::PeerInit,
+            wt_pre,
+        );
         let tables = &mut *wtables;
 
         let whatami = transport.get_whatami()?;
@@ -328,11 +359,24 @@ impl Gateway {
             &transport,
             other_hats.map(|hat| &**hat as &dyn HatTrait),
         )?;
+        _wt_timer.release();
         drop(wtables);
+        _cl_timer.release();
         drop(ctrl_lock);
+        let n_declares = declares.len() as u64;
+        let flush_start = std::time::Instant::now();
         for (p, m) in declares {
+            let t = std::time::Instant::now();
             m.with_mut(|m| p.send_declare(m));
+            crate::net::routing::dispatcher::diagnostics::record_flush_declare(
+                t.elapsed().as_micros() as u64,
+            );
         }
+        crate::net::routing::dispatcher::diagnostics::record_wtables_flush(
+            crate::net::routing::dispatcher::diagnostics::WTableSite::PeerInit,
+            n_declares,
+            flush_start.elapsed().as_micros() as u64,
+        );
 
         Ok(Arc::new(DeMux::new(
             face,
@@ -389,7 +433,10 @@ impl Gateway {
 
         tables.data.hats[region].mcast_groups.push(face);
 
-        tables.hats[region].disable_all_routes(&mut tables.data);
+        tables.hats[region].disable_all_routes(
+            &mut tables.data,
+            crate::net::routing::dispatcher::diagnostics::InvalidationSource::Other,
+        );
 
         Ok(())
     }
@@ -441,7 +488,10 @@ impl Gateway {
 
         tables.data.hats[region].mcast_faces.push(face.clone());
 
-        tables.hats[region].disable_all_routes(&mut tables.data);
+        tables.hats[region].disable_all_routes(
+            &mut tables.data,
+            crate::net::routing::dispatcher::diagnostics::InvalidationSource::Other,
+        );
 
         Ok(Arc::new(DeMux::new(
             Face {

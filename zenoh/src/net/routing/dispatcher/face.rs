@@ -538,10 +538,16 @@ impl Face {
 
 impl Primitives for Face {
     fn send_interest(&self, msg: &mut zenoh_protocol::network::Interest) {
+        let cl_pre = std::time::Instant::now();
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        let mut _cl_timer = crate::net::routing::dispatcher::diagnostics::CtrlLockTimer::new(
+            crate::net::routing::dispatcher::diagnostics::CtrlLockSite::SendInterest,
+            cl_pre,
+        );
         if msg.mode != InterestMode::Final {
             let mut declares = vec![];
             self.interest(msg, &mut |p, m| declares.push((p.clone(), m)));
+            _cl_timer.release();
             drop(ctrl_lock);
             for (p, m) in declares {
                 m.with_mut(|m| p.send_declare(m));
@@ -552,7 +558,12 @@ impl Primitives for Face {
     }
 
     fn send_declare(&self, msg: &mut zenoh_protocol::network::Declare) {
+        let cl_pre = std::time::Instant::now();
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        let mut _cl_timer = crate::net::routing::dispatcher::diagnostics::CtrlLockTimer::new(
+            crate::net::routing::dispatcher::diagnostics::CtrlLockSite::SendDeclare,
+            cl_pre,
+        );
         match &mut msg.body {
             zenoh_protocol::network::DeclareBody::DeclareKeyExpr(m) => {
                 register_expr(&self.tables, &mut self.state.clone(), m.id, &m.wire_expr);
@@ -569,6 +580,7 @@ impl Primitives for Face {
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
+                _cl_timer.release();
                 drop(ctrl_lock);
                 for (p, m) in declares {
                     m.with_mut(|m| p.send_declare(m));
@@ -582,6 +594,7 @@ impl Primitives for Face {
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
+                _cl_timer.release();
                 drop(ctrl_lock);
                 for (p, m) in declares {
                     m.with_mut(|m| p.send_declare(m));
@@ -596,6 +609,7 @@ impl Primitives for Face {
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
+                _cl_timer.release();
                 drop(ctrl_lock);
                 for (p, m) in declares {
                     m.with_mut(|m| p.send_declare(m));
@@ -609,6 +623,7 @@ impl Primitives for Face {
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
+                _cl_timer.release();
                 drop(ctrl_lock);
                 for (p, m) in declares {
                     m.with_mut(|m| p.send_declare(m));
@@ -623,6 +638,7 @@ impl Primitives for Face {
                     msg.interest_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
+                _cl_timer.release();
                 drop(ctrl_lock);
                 for (p, m) in declares {
                     m.with_mut(|m| p.send_declare(m));
@@ -636,6 +652,7 @@ impl Primitives for Face {
                     msg.ext_nodeid.node_id,
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
+                _cl_timer.release();
                 drop(ctrl_lock);
                 for (p, m) in declares {
                     m.with_mut(|m| p.send_declare(m));
@@ -647,17 +664,31 @@ impl Primitives for Face {
                     return;
                 };
 
+                let wt_pre = std::time::Instant::now();
                 let mut wtables = zwrite!(self.tables.tables);
+                let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+                    crate::net::routing::dispatcher::diagnostics::WTableSite::DeclareFinal,
+                    wt_pre,
+                );
                 let mut declares = vec![];
                 self.declare_final(&mut wtables, id, msg.ext_nodeid.node_id, &mut |p, m| {
                     declares.push((p.clone(), m))
                 });
 
+                _wt_timer.release();
                 drop(wtables);
+                _cl_timer.release();
                 drop(ctrl_lock);
+                let n_declares = declares.len() as u64;
+                let flush_start = std::time::Instant::now();
                 for (p, m) in declares {
                     m.with_mut(|m| p.send_declare(m));
                 }
+                crate::net::routing::dispatcher::diagnostics::record_wtables_flush(
+                    crate::net::routing::dispatcher::diagnostics::WTableSite::DeclareFinal,
+                    n_declares,
+                    flush_start.elapsed().as_micros() as u64,
+                );
             }
         }
     }
@@ -698,15 +729,45 @@ impl Primitives for Face {
 
     #[tracing::instrument(level = "debug", skip(self), fields(src = %self), ret)]
     fn send_close(&self) {
+        use std::time::Instant;
+        let mut diag_phases =
+            crate::net::routing::dispatcher::diagnostics::CloseFacePhases::default();
+        let diag_face_id = self.state.id;
+
         let mut state = self.state.clone();
+        let t0 = Instant::now();
         state.task_controller.terminate_all(Duration::from_secs(10));
+        diag_phases.terminate_us = t0.elapsed().as_micros() as u64;
+
+        let t1 = Instant::now();
         finalize_pending_queries(&self.tables, &mut state);
+        diag_phases.finalize_pending_queries_us = t1.elapsed().as_micros() as u64;
+
         let mut declares = vec![];
+
+        let t2 = Instant::now();
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        let mut _cl_timer = crate::net::routing::dispatcher::diagnostics::CtrlLockTimer::new(
+            crate::net::routing::dispatcher::diagnostics::CtrlLockSite::SendClose,
+            t2,
+        );
+        diag_phases.ctrl_lock_acquire_us = t2.elapsed().as_micros() as u64;
+
+        let t3 = Instant::now();
         finalize_pending_interests(&self.tables, &mut state, &mut |p, m| {
             declares.push((p.clone(), m))
         });
+        diag_phases.finalize_pending_interests_us = t3.elapsed().as_micros() as u64;
+
+        let t4 = Instant::now();
         let mut wtables = zwrite!(self.tables.tables);
+        let mut _wt_timer = crate::net::routing::dispatcher::diagnostics::WTableTimer::new(
+            crate::net::routing::dispatcher::diagnostics::WTableSite::SendClose,
+            t4,
+        );
+        diag_phases.wtables_acquire_us = t4.elapsed().as_micros() as u64;
+
+        let close_body_start = Instant::now();
         let tables = &mut *wtables;
 
         let mut ctx = DispatcherContext {
@@ -813,11 +874,25 @@ impl Primitives for Face {
 
         tables.data.faces.remove(&src_fid);
 
+        diag_phases.close_face_body_us = close_body_start.elapsed().as_micros() as u64;
+
+        let t5 = Instant::now();
+        _wt_timer.release();
         drop(wtables);
+        _cl_timer.release();
         drop(ctrl_lock);
+        let n_declares = declares.len() as u64;
         for (p, m) in declares {
             m.with_mut(|m| p.send_declare(m));
         }
+        diag_phases.send_declares_us = t5.elapsed().as_micros() as u64;
+        crate::net::routing::dispatcher::diagnostics::record_wtables_flush(
+            crate::net::routing::dispatcher::diagnostics::WTableSite::SendClose,
+            n_declares,
+            t5.elapsed().as_micros() as u64,
+        );
+
+        diag_phases.emit(diag_face_id as u64);
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -307,11 +307,49 @@ impl HatBaseTrait for Hat {
             );
         }
 
-        self.repropagate_interests(ctx.reborrow(), &other_hats);
-        self.repropagate_subscribers(ctx.reborrow(), &other_hats);
-        self.repropagate_queryables(ctx.reborrow(), &other_hats);
-        self.repropagate_tokens(ctx.reborrow(), &other_hats);
-        self.disable_all_routes(ctx.tables);
+        {
+            let t = std::time::Instant::now();
+            self.repropagate_interests(ctx.reborrow(), &other_hats);
+            crate::net::routing::dispatcher::diagnostics::record_repropagate(
+                crate::net::routing::dispatcher::diagnostics::RepropagateKind::Interests,
+                t.elapsed().as_micros() as u64,
+            );
+        }
+        {
+            let t = std::time::Instant::now();
+            self.repropagate_subscribers(ctx.reborrow(), &other_hats);
+            crate::net::routing::dispatcher::diagnostics::record_repropagate(
+                crate::net::routing::dispatcher::diagnostics::RepropagateKind::Subscribers,
+                t.elapsed().as_micros() as u64,
+            );
+        }
+        {
+            let t = std::time::Instant::now();
+            self.repropagate_queryables(ctx.reborrow(), &other_hats);
+            crate::net::routing::dispatcher::diagnostics::record_repropagate(
+                crate::net::routing::dispatcher::diagnostics::RepropagateKind::Queryables,
+                t.elapsed().as_micros() as u64,
+            );
+        }
+        {
+            let t = std::time::Instant::now();
+            self.repropagate_tokens(ctx.reborrow(), &other_hats);
+            crate::net::routing::dispatcher::diagnostics::record_repropagate(
+                crate::net::routing::dispatcher::diagnostics::RepropagateKind::Tokens,
+                t.elapsed().as_micros() as u64,
+            );
+        }
+        {
+            let t = std::time::Instant::now();
+            self.disable_all_routes(
+                ctx.tables,
+                crate::net::routing::dispatcher::diagnostics::InvalidationSource::PeerInit,
+            );
+            crate::net::routing::dispatcher::diagnostics::record_repropagate(
+                crate::net::routing::dispatcher::diagnostics::RepropagateKind::DisableAllRoutes,
+                t.elapsed().as_micros() as u64,
+            );
+        }
 
         if do_initial_interest {
             tracing::debug!(dst = %ctx.src_face);
