@@ -24,6 +24,7 @@ use zenoh_config::{
 };
 use zenoh_protocol::core::{Bound, Region, WhatAmI, ZenohIdProto};
 use zenoh_result::ZResult;
+use zenoh_runtime::ZRuntime;
 use zenoh_transport::{multicast::TransportMulticast, unicast::TransportUnicast, TransportPeer};
 
 pub use super::dispatcher::{pubsub::*, resource::*};
@@ -363,19 +364,36 @@ impl Gateway {
         drop(wtables);
         _cl_timer.release();
         drop(ctrl_lock);
+
+        // PR 1: spawn the deferred-declare flush off the calling thread of
+        // `TransportEventHandler::new_unicast`. The synchronous version of
+        // this loop was the dominant cause of `peer_init` cumulative wait
+        // (v4 `flush_declare_diag max_us=5,005,714`,
+        // `ctrl_lock_diag acquire_wait_max_us=14,878,351`). Spawning on the
+        // face's `task_controller` ties the task lifetime to the face: on
+        // close, `task_controller.terminate_all` cancels in-flight work
+        // (between iterations — see `tokio::task::yield_now().await` below).
         let n_declares = declares.len() as u64;
-        let flush_start = std::time::Instant::now();
-        for (p, m) in declares {
-            let t = std::time::Instant::now();
-            m.with_mut(|m| p.send_declare(m));
-            crate::net::routing::dispatcher::diagnostics::record_flush_declare(
-                t.elapsed().as_micros() as u64,
-            );
-        }
-        crate::net::routing::dispatcher::diagnostics::record_wtables_flush(
-            crate::net::routing::dispatcher::diagnostics::WTableSite::PeerInit,
-            n_declares,
-            flush_start.elapsed().as_micros() as u64,
+        face.state.task_controller.spawn_abortable_with_rt(
+            ZRuntime::Net,
+            async move {
+                let flush_start = std::time::Instant::now();
+                for (p, mut m) in declares {
+                    let t = std::time::Instant::now();
+                    m.with_mut(|m| p.send_declare(m));
+                    crate::net::routing::dispatcher::diagnostics::record_flush_declare(
+                        t.elapsed().as_micros() as u64,
+                    );
+                    // Yield between iterations so face close can interrupt
+                    // the loop without waiting for the entire flush.
+                    tokio::task::yield_now().await;
+                }
+                crate::net::routing::dispatcher::diagnostics::record_wtables_flush(
+                    crate::net::routing::dispatcher::diagnostics::WTableSite::PeerInit,
+                    n_declares,
+                    flush_start.elapsed().as_micros() as u64,
+                );
+            },
         );
 
         Ok(Arc::new(DeMux::new(

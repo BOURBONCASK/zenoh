@@ -662,6 +662,36 @@ impl Resource {
 
     #[inline]
     pub fn decl_key(res: &Arc<Resource>, face: &mut Arc<FaceState>) -> WireExpr<'static> {
+        Self::decl_key_inner(res, face, None)
+    }
+
+    /// Like [`Resource::decl_key`], but if a new wire-expr id has to be
+    /// allocated, the resulting `DeclareKeyExpr` is pushed onto
+    /// `send_declare` instead of being sent synchronously through
+    /// `face.primitives.send_declare`.
+    ///
+    /// This is the PR 2 fix for the in-`wtables` bottleneck: the original
+    /// `decl_key` did synchronous I/O while a routing write lock was held,
+    /// blocking up to ~378 ms per call under transport pipeline backpressure
+    /// (v4 `repropagate_subs_step_diag step=decl_key_and_send max_us=756,140`
+    /// with 2 updates). Callers that already collect deferred declares
+    /// (e.g. `repropagate_subscribers` via `ctx.send_declare`) should use
+    /// this variant so the `DeclareKeyExpr` joins the same flush queue.
+    #[inline]
+    pub(crate) fn decl_key_deferred(
+        res: &Arc<Resource>,
+        face: &mut Arc<FaceState>,
+        send_declare: &mut crate::net::routing::hat::SendDeclare<'_>,
+    ) -> WireExpr<'static> {
+        Self::decl_key_inner(res, face, Some(send_declare))
+    }
+
+    #[inline]
+    fn decl_key_inner(
+        res: &Arc<Resource>,
+        face: &mut Arc<FaceState>,
+        mut send_declare: Option<&mut crate::net::routing::hat::SendDeclare<'_>>,
+    ) -> WireExpr<'static> {
         if face.is_local {
             return res.expr().to_string().into();
         }
@@ -704,19 +734,32 @@ impl Resource {
                     get_mut_unchecked(face)
                         .local_mappings
                         .insert(expr_id, nonwild_prefix.clone());
-                    face.primitives.send_declare(RoutingContext::with_expr(
-                        &mut Declare {
-                            interest_id: None,
-                            ext_qos: declare::ext::QoSType::DECLARE,
-                            ext_tstamp: None,
-                            ext_nodeid: declare::ext::NodeIdType::DEFAULT,
-                            body: DeclareBody::DeclareKeyExpr(DeclareKeyExpr {
-                                id: expr_id,
-                                wire_expr: nonwild_prefix.expr().to_string().into(),
-                            }),
-                        },
-                        nonwild_prefix.expr().to_string(),
-                    ));
+
+                    let nonwild_expr = nonwild_prefix.expr().to_string();
+                    let declare_msg = Declare {
+                        interest_id: None,
+                        ext_qos: declare::ext::QoSType::DECLARE,
+                        ext_tstamp: None,
+                        ext_nodeid: declare::ext::NodeIdType::DEFAULT,
+                        body: DeclareBody::DeclareKeyExpr(DeclareKeyExpr {
+                            id: expr_id,
+                            wire_expr: nonwild_expr.clone().into(),
+                        }),
+                    };
+                    if let Some(send_declare) = send_declare.as_mut() {
+                        send_declare(
+                            &face.primitives,
+                            RoutingContext::with_expr(declare_msg, nonwild_expr),
+                        );
+                    } else {
+                        // Legacy synchronous path. Kept for callers that
+                        // have not been migrated to the deferred pattern.
+                        let mut declare_msg = declare_msg;
+                        face.primitives.send_declare(RoutingContext::with_expr(
+                            &mut declare_msg,
+                            nonwild_expr,
+                        ));
+                    }
                     face.update_interceptors_caches(&mut nonwild_prefix);
                     WireExpr {
                         scope: expr_id,

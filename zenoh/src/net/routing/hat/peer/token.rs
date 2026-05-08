@@ -79,7 +79,8 @@ impl Hat {
             self.face_hat_mut(dst_face)
                 .local_tokens
                 .insert(res.clone(), id);
-            let key_expr = Resource::decl_key(res, dst_face);
+            // PR 2: defer the legacy synchronous DeclareKeyExpr send.
+            let key_expr = Resource::decl_key_deferred(res, dst_face, send_declare);
             tracing::debug!(dst = %dst_face);
             send_declare(
                 &dst_face.primitives,

@@ -126,7 +126,8 @@ impl Hat {
 
         for update in qabls_to_notify {
             tracing::debug!(dst = %dst_face);
-            let key_expr = Resource::decl_key(&update.resource, dst_face);
+            // PR 2: defer the legacy synchronous DeclareKeyExpr send.
+            let key_expr = Resource::decl_key_deferred(&update.resource, dst_face, send_declare);
             send_declare(
                 &dst_face.primitives,
                 RoutingContext::with_expr(
@@ -161,7 +162,9 @@ impl Hat {
             match update.update {
                 Some(new_qabl_info) => {
                     tracing::debug!(dst = %face, update = true);
-                    let key_expr = Resource::decl_key(&update.resource, face);
+                    // PR 2: defer the legacy synchronous DeclareKeyExpr send.
+                    let key_expr =
+                        Resource::decl_key_deferred(&update.resource, face, send_declare);
                     send_declare(
                         &face.primitives,
                         RoutingContext::with_expr(

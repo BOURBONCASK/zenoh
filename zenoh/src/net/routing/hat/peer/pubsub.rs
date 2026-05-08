@@ -144,7 +144,12 @@ impl Hat {
         let t_d = std::time::Instant::now();
         for update in subs_to_notify {
             tracing::debug!(dst = %dst_face);
-            let key_expr = Resource::decl_key(&update.resource, dst_face);
+            // PR 2: use decl_key_deferred so the synchronous
+            // primitives.send_declare(DeclareKeyExpr) inside the legacy
+            // decl_key is replaced by a callback push. This removes the
+            // wtables-held in-lock I/O that v4 measured as 756ms tail at
+            // `repropagate_subs_step_diag step=decl_key_and_send max_us`.
+            let key_expr = Resource::decl_key_deferred(&update.resource, dst_face, send_declare);
             send_declare(
                 &dst_face.primitives,
                 RoutingContext::with_expr(
