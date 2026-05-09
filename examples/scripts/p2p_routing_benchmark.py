@@ -162,7 +162,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run p2p routing stress benchmarks and generate a GitHub issue comment."
     )
-    parser.add_argument("--preset", choices=["quick", "issue", "topology"], default="quick")
+    parser.add_argument(
+        "--preset",
+        choices=["quick", "issue", "topology", "restart-sweep"],
+        default="quick",
+    )
     parser.add_argument("--runs", type=int)
     parser.add_argument("--duration-secs", type=int)
     parser.add_argument("--include-200", action="store_true")
@@ -216,6 +220,34 @@ def scenario_matrix(preset: str, include_200: bool) -> list[Scenario]:
             Scenario("p2p_20_churn", "peer", "peer", 20, 5, 4),
             Scenario("client_20_churn", "router", "client", 20, 5, 4),
         ]
+    elif preset == "restart-sweep":
+        # Steady-state with small individual peer restart events.
+        # Same 100-session 1pub/20sub topology as topology preset, but
+        # vary restart_count over {0, 1, 3, 5, 6} to isolate the impact
+        # of small-N restart events on never-restarted peers' rx tail
+        # latency. Expected reading: blast-radius severity scales
+        # sub-linearly with restart count; the 1-restart case is the
+        # most realistic "rolling update" event.
+        scenarios = []
+        for k in (0, 1, 3, 5, 6):
+            tag = "steady" if k == 0 else f"restart{k}"
+            scenarios.append(
+                Scenario(
+                    f"100_p2p_1pub_20sub_{tag}", "peer", "peer", 79, 20, 0,
+                    publishers=1, topics=1,
+                    restart_at_secs=0 if k == 0 else 15,
+                    restart_count=k,
+                )
+            )
+            scenarios.append(
+                Scenario(
+                    f"100_cli_1pub_20sub_{tag}", "router", "client", 79, 20, 0,
+                    publishers=1, topics=1,
+                    restart_at_secs=0 if k == 0 else 15,
+                    restart_count=k,
+                )
+            )
+        return scenarios
     elif preset == "topology":
         # Topology comparison: client/peer × pub-count × restart variants.
         # idle_peers field becomes the "filler" sessions to push the total
