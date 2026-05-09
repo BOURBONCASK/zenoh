@@ -119,10 +119,41 @@ struct SupervisorArgs {
     churn_hold_ms: u64,
     #[arg(long, default_value_t = 20)]
     churn_idle_ms: u64,
+    /// Number of distinct topics. When > 1, publisher_i uses key
+    /// `{key}/{i % topics}` and subscribers use the wildcard key `{key}/**`.
+    /// Default 1: all publishers and subscribers share the exact `--key`.
+    #[arg(long, default_value_t = 1)]
+    topics: usize,
+    /// Restart subscribers at this elapsed time (seconds, after startup).
+    /// 0 disables. The restart kills `restart_count` random subscribers and
+    /// respawns them; this is a one-shot event distinct from continuous
+    /// `--churners`. Useful for measuring the cost of mid-stream session
+    /// resurrection vs steady state.
+    #[arg(long, default_value_t = 0)]
+    restart_at_secs: u64,
+    /// Number of subscribers to restart at `restart_at_secs`.
+    #[arg(long, default_value_t = 0)]
+    restart_count: usize,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     wait_declares: bool,
     #[arg(long)]
     cfg: Vec<String>,
+}
+
+fn topic_key(base: &str, topics: usize, idx: usize) -> String {
+    if topics <= 1 {
+        base.to_string()
+    } else {
+        format!("{}/{}", base, idx % topics)
+    }
+}
+
+fn subscriber_key(base: &str, topics: usize) -> String {
+    if topics <= 1 {
+        base.to_string()
+    } else {
+        format!("{}/**", base)
+    }
 }
 
 fn main() {
@@ -395,6 +426,7 @@ fn run_supervisor(args: SupervisorArgs) {
     }
 
     for idx in 0..args.publishers {
+        let pub_key = topic_key(&args.key, args.topics, idx);
         children.push(spawn(
             "publisher",
             idx,
@@ -409,7 +441,7 @@ fn run_supervisor(args: SupervisorArgs) {
                 "--index",
                 &idx.to_string(),
                 "--key",
-                &args.key,
+                &pub_key,
                 "--payload-size",
                 &args.payload_size.to_string(),
                 "--put-period-ms",
@@ -423,7 +455,10 @@ fn run_supervisor(args: SupervisorArgs) {
 
     thread::sleep(Duration::from_millis(args.startup_delay_ms));
 
+    let sub_key = subscriber_key(&args.key, args.topics);
+    let mut subscriber_slots: Vec<Option<usize>> = (0..args.subscribers).map(Some).collect();
     for idx in 0..args.subscribers {
+        let slot_idx = children.len();
         children.push(spawn(
             "subscriber",
             idx,
@@ -438,12 +473,16 @@ fn run_supervisor(args: SupervisorArgs) {
                 "--index",
                 &idx.to_string(),
                 "--key",
-                &args.key,
+                &sub_key,
                 "--wait-declares",
                 &args.wait_declares.to_string(),
             ],
             &args.cfg,
         ));
+        // Track slot index in `children` for restart bookkeeping.
+        if let Some(slot) = subscriber_slots.get_mut(idx) {
+            *slot = Some(slot_idx);
+        }
     }
 
     for idx in 0..args.churners {
@@ -473,8 +512,67 @@ fn run_supervisor(args: SupervisorArgs) {
         ));
     }
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs + args.grace_secs);
+    let test_start = Instant::now();
+    let deadline = test_start + Duration::from_secs(args.duration_secs + args.grace_secs);
+    let mut restart_done = args.restart_at_secs == 0 || args.restart_count == 0;
     loop {
+        // Mid-stream subscriber restart: at restart_at_secs after test start,
+        // kill the first restart_count subscribers and respawn them with the
+        // same role/index. Distinct from continuous churn — the restart is
+        // a single event and the new sessions live for the rest of the run.
+        if !restart_done && test_start.elapsed().as_secs() >= args.restart_at_secs {
+            let n = args.restart_count.min(args.subscribers);
+            println!(
+                "metric role=restart_event count={n} elapsed_ms={}",
+                test_start.elapsed().as_millis()
+            );
+            let mut new_slots: Vec<(usize, usize)> = Vec::new();
+            for sub_idx in 0..n {
+                if let Some(Some(slot)) = subscriber_slots.get(sub_idx) {
+                    let slot = *slot;
+                    if let Some(child) = children.get_mut(slot) {
+                        if !child.finished {
+                            let _ = child.child.kill();
+                            let _ = child.child.wait();
+                            child.finished = true;
+                            println!(
+                                "metric role=restart_killed target_role=subscriber index={sub_idx}"
+                            );
+                        }
+                    }
+                    let remaining = args.duration_secs.saturating_sub(args.restart_at_secs).max(1);
+                    let new_slot = spawn(
+                        "subscriber",
+                        sub_idx,
+                        &[
+                            "subscriber",
+                            "--mode",
+                            &args.leaf_mode,
+                            "--connect",
+                            &args.endpoint,
+                            "--duration-secs",
+                            &remaining.to_string(),
+                            "--index",
+                            &sub_idx.to_string(),
+                            "--key",
+                            &sub_key,
+                            "--wait-declares",
+                            &args.wait_declares.to_string(),
+                        ],
+                        &args.cfg,
+                    );
+                    new_slots.push((sub_idx, children.len()));
+                    children.push(new_slot);
+                }
+            }
+            for (sub_idx, slot) in new_slots {
+                if let Some(s) = subscriber_slots.get_mut(sub_idx) {
+                    *s = Some(slot);
+                }
+            }
+            restart_done = true;
+        }
+
         let mut running = 0usize;
         for child in &mut children {
             if child.finished {

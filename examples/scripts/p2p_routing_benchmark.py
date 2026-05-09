@@ -37,6 +37,10 @@ class Scenario:
     idle_peers: int
     subscribers: int
     churners: int
+    publishers: int = 1
+    topics: int = 1
+    restart_at_secs: int = 0
+    restart_count: int = 0
 
 
 @dataclass
@@ -158,7 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run p2p routing stress benchmarks and generate a GitHub issue comment."
     )
-    parser.add_argument("--preset", choices=["quick", "issue"], default="quick")
+    parser.add_argument("--preset", choices=["quick", "issue", "topology"], default="quick")
     parser.add_argument("--runs", type=int)
     parser.add_argument("--duration-secs", type=int)
     parser.add_argument("--include-200", action="store_true")
@@ -212,6 +216,41 @@ def scenario_matrix(preset: str, include_200: bool) -> list[Scenario]:
             Scenario("p2p_20_churn", "peer", "peer", 20, 5, 4),
             Scenario("client_20_churn", "router", "client", 20, 5, 4),
         ]
+    elif preset == "topology":
+        # Topology comparison: client/peer × pub-count × restart variants.
+        # idle_peers field becomes the "filler" sessions to push the total
+        # session count to the target, on top of pub + sub + hub.
+        # 100-session scenarios. total = 1 hub + N pub + M sub + idle.
+        # Restart fires at 15s into a 30s run (mid-run), restarts 30% of subs.
+        scenarios = [
+            # 100 sessions, single publisher, shared topic — baseline shape
+            Scenario("100_p2p_1pub_20sub", "peer", "peer", 79, 20, 0, publishers=1, topics=1),
+            Scenario("100_cli_1pub_20sub", "router", "client", 79, 20, 0, publishers=1, topics=1),
+            # 100 sessions, 5 publishers, 5 distinct topics, 30 subs (sub uses wildcard)
+            Scenario("100_p2p_5pub_30sub_5tpc", "peer", "peer", 64, 30, 0, publishers=5, topics=5),
+            Scenario("100_cli_5pub_30sub_5tpc", "router", "client", 64, 30, 0, publishers=5, topics=5),
+            # Restart variants: same topology, restart 30% of subs at t=15s
+            Scenario("100_p2p_1pub_20sub_restart", "peer", "peer", 79, 20, 0,
+                     publishers=1, topics=1, restart_at_secs=15, restart_count=6),
+            Scenario("100_cli_1pub_20sub_restart", "router", "client", 79, 20, 0,
+                     publishers=1, topics=1, restart_at_secs=15, restart_count=6),
+            Scenario("100_p2p_5pub_30sub_5tpc_restart", "peer", "peer", 64, 30, 0,
+                     publishers=5, topics=5, restart_at_secs=15, restart_count=10),
+            Scenario("100_cli_5pub_30sub_5tpc_restart", "router", "client", 64, 30, 0,
+                     publishers=5, topics=5, restart_at_secs=15, restart_count=10),
+        ]
+        if include_200:
+            scenarios += [
+                Scenario("200_p2p_5pub_60sub_5tpc", "peer", "peer", 134, 60, 0,
+                         publishers=5, topics=5),
+                Scenario("200_cli_5pub_60sub_5tpc", "router", "client", 134, 60, 0,
+                         publishers=5, topics=5),
+                Scenario("200_p2p_5pub_60sub_5tpc_restart", "peer", "peer", 134, 60, 0,
+                         publishers=5, topics=5, restart_at_secs=15, restart_count=20),
+                Scenario("200_cli_5pub_60sub_5tpc_restart", "router", "client", 134, 60, 0,
+                         publishers=5, topics=5, restart_at_secs=15, restart_count=20),
+            ]
+        return scenarios
     else:
         scenarios = [
             Scenario("baseline_peer", "peer", "peer", 0, 1, 0),
@@ -263,11 +302,17 @@ def supervisor_command(
         "--idle-peers",
         str(scenario.idle_peers),
         "--publishers",
-        "1",
+        str(scenario.publishers),
         "--subscribers",
         str(scenario.subscribers),
         "--churners",
         str(scenario.churners),
+        "--topics",
+        str(scenario.topics),
+        "--restart-at-secs",
+        str(scenario.restart_at_secs),
+        "--restart-count",
+        str(scenario.restart_count),
         "--payload-size",
         str(payload_size),
         "--put-period-ms",
