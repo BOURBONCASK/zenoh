@@ -178,7 +178,91 @@ def main() -> int:
             f"{m['decl_key_and_send_max']:>10}"
             f"{m['wtables_flush_peer_init_max']:>10}"
         )
+
+    print()
+    print("=" * 100)
+    print("Blast-radius analysis: rx_p99 per 5-s bucket for restart scenarios")
+    print("=" * 100)
+    print(
+        "For each `*_restart` scenario, separates subscribers into "
+        "'restarted' (idx < restart_count) and 'normal' (idx >= "
+        "restart_count) and prints the rx_p99 per 5-second bucket."
+    )
+    print()
+    blast_radius_report(out_dir, summary)
     return 0
+
+
+def blast_radius_report(out_dir: Path, summary: dict) -> None:
+    """For every `*_restart` scenario, bucket per-sub rx p99 by 5-s window
+    and split by restarted vs not. Prints a table per scenario.
+    """
+    import re
+    from collections import defaultdict
+
+    # Pull restart_count per scenario from summary.json command lines.
+    restart_count = {}
+    for r in summary["results"]:
+        name = r["scenario"]["name"]
+        cmd = r.get("command", [])
+        if "--restart-count" in cmd:
+            i = cmd.index("--restart-count")
+            try:
+                restart_count[name] = int(cmd[i + 1])
+            except (IndexError, ValueError):
+                pass
+
+    BUCKET_MS = 5000
+    for name, k in sorted(restart_count.items()):
+        if k == 0:
+            continue
+        # Aggregate by (group, bucket) -> [p99 samples]
+        buckets_restart = defaultdict(list)
+        buckets_normal = defaultdict(list)
+        for run in (1, 2, 3):
+            log = out_dir / f"{name}_run{run}.log"
+            if not log.exists():
+                continue
+            for line in log.read_text(errors="ignore").splitlines():
+                m = re.search(
+                    r"name=subscriber_latency index=(\d+) elapsed_ms=(\d+).*?p99_us=(\d+)",
+                    line,
+                )
+                if not m:
+                    continue
+                idx = int(m.group(1))
+                t = int(m.group(2))
+                p99 = int(m.group(3))
+                bucket = (t // BUCKET_MS) * BUCKET_MS
+                if idx < k:
+                    buckets_restart[bucket].append(p99)
+                else:
+                    buckets_normal[bucket].append(p99)
+        if not (buckets_restart or buckets_normal):
+            continue
+        print(f"\n  {name} (restart {k} subs):")
+        print(
+            f"    {'bucket (s)':>12}  "
+            f"{'restarted_p99 (ms)':>20}  "
+            f"{'normal_p99 (ms)':>20}"
+        )
+        all_buckets = sorted(set(buckets_restart) | set(buckets_normal))
+        for b in all_buckets:
+            r_vals = buckets_restart.get(b, [])
+            n_vals = buckets_normal.get(b, [])
+            if not r_vals and not n_vals:
+                continue
+            r_p99 = (
+                sorted(r_vals)[len(r_vals) * 99 // 100] / 1000.0 if r_vals else 0.0
+            )
+            n_p99 = (
+                sorted(n_vals)[len(n_vals) * 99 // 100] / 1000.0 if n_vals else 0.0
+            )
+            print(
+                f"    {b // 1000:>12}  "
+                f"{r_p99:>20.1f}  "
+                f"{n_p99:>20.1f}"
+            )
 
 
 if __name__ == "__main__":
