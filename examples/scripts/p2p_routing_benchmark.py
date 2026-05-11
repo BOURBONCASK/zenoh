@@ -267,14 +267,14 @@ def scenario_matrix(preset: str, include_200: bool) -> list[Scenario]:
                 )
         return scenarios
     elif preset == "duration-sweep":
-        # Phase 2 / Q4: does the 30-s "working" state at N=100 hold
-        # for longer durations? Single scenario each at increasing
-        # durations. Caller picks the actual duration via the
-        # --duration-secs argument when invoking the script; scenario
-        # only varies in suffix for output dir tidiness.
+        # Phase 2 / Q4: does the 30-s "working" state hold for longer
+        # durations? Single scenario; caller picks duration via the
+        # --duration-secs argument. Working point is (N=75, K=5) since
+        # the k-sweep showed (N=100, K=5) is already past the cliff,
+        # whereas (N=75, K=5) is clean at 30 s.
         scenarios = [
             Scenario(
-                "n100_k05_p2p_long", "peer", "peer", 75, 20, 0,
+                "n075_k05_p2p_long", "peer", "peer", 50, 20, 0,
                 publishers=5, topics=5,
             ),
         ]
