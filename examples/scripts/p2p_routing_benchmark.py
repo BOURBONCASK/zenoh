@@ -170,7 +170,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--preset",
-        choices=["quick", "issue", "topology", "restart-sweep", "n-sweep"],
+        choices=[
+            "quick",
+            "issue",
+            "topology",
+            "restart-sweep",
+            "n-sweep",
+            "k-sweep",
+            "duration-sweep",
+        ],
         default="quick",
     )
     parser.add_argument("--runs", type=int)
@@ -232,6 +240,45 @@ def scenario_matrix(preset: str, include_200: bool) -> list[Scenario]:
             Scenario("p2p_20_churn", "peer", "peer", 20, 5, 4),
             Scenario("client_20_churn", "router", "client", 20, 5, 4),
         ]
+    elif preset == "k-sweep":
+        # Phase 2 / Q3: does K (topics per peer) shift the cliff?
+        # Fix two N values — N=75 inside the working range, and N=100
+        # on the working-range edge — and sweep K through {1, 5, 10,
+        # 25, 50}. Subscribers use wildcards so increasing K is purely
+        # a declare-fanout dimension change; publishers scale to K so
+        # there is always one publisher per topic.
+        scenarios = []
+        for n in (75, 100):
+            for k in (1, 5, 10, 25, 50):
+                idle = n - k - 20
+                if idle < 0:
+                    continue
+                scenarios.append(
+                    Scenario(
+                        f"n{n:03d}_k{k:02d}_p2p", "peer", "peer", idle, 20, 0,
+                        publishers=k, topics=k,
+                    )
+                )
+                scenarios.append(
+                    Scenario(
+                        f"n{n:03d}_k{k:02d}_cli", "router", "client", idle, 20, 0,
+                        publishers=k, topics=k,
+                    )
+                )
+        return scenarios
+    elif preset == "duration-sweep":
+        # Phase 2 / Q4: does the 30-s "working" state at N=100 hold
+        # for longer durations? Single scenario each at increasing
+        # durations. Caller picks the actual duration via the
+        # --duration-secs argument when invoking the script; scenario
+        # only varies in suffix for output dir tidiness.
+        scenarios = [
+            Scenario(
+                "n100_k05_p2p_long", "peer", "peer", 75, 20, 0,
+                publishers=5, topics=5,
+            ),
+        ]
+        return scenarios
     elif preset == "n-sweep":
         # Phase 1 of the optimization roadmap: characterize the cliff.
         # Sweep total session count N across {50, 75, 100, 125, 150, 175,
