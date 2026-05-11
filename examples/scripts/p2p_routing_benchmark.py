@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
 import os
@@ -20,6 +21,8 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
@@ -101,6 +104,7 @@ def main() -> int:
                 args.cfg,
             )
             print(f"[bench] running {scenario.name} run {run_idx + 1}/{runs} on port {port}")
+            sample_path = out_dir / f"{scenario.name}_run{run_idx + 1}.proc.csv"
             completed = run_benchmark(
                 command,
                 repo,
@@ -112,6 +116,8 @@ def main() -> int:
                     + 2 * args.startup_delay_ms / 1000
                     + 20
                 ),
+                sample_path=sample_path,
+                sample_interval_s=args.sample_interval_s,
             )
             metrics = parse_metrics(raw_log.read_text(errors="replace").splitlines())
             summary = summarize_run(metrics, scenario, args.startup_window_ms)
@@ -164,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--preset",
-        choices=["quick", "issue", "topology", "restart-sweep"],
+        choices=["quick", "issue", "topology", "restart-sweep", "n-sweep"],
         default="quick",
     )
     parser.add_argument("--runs", type=int)
@@ -189,6 +195,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rust-log", default="off")
     parser.add_argument("--cfg", action="append", default=[])
+    parser.add_argument(
+        "--sample-interval-s",
+        type=float,
+        default=1.0,
+        help="Sampling cadence for the per-run process-tree RSS/CPU CSV.",
+    )
     return parser.parse_args()
 
 
@@ -220,6 +232,31 @@ def scenario_matrix(preset: str, include_200: bool) -> list[Scenario]:
             Scenario("p2p_20_churn", "peer", "peer", 20, 5, 4),
             Scenario("client_20_churn", "router", "client", 20, 5, 4),
         ]
+    elif preset == "n-sweep":
+        # Phase 1 of the optimization roadmap: characterize the cliff.
+        # Sweep total session count N across {50, 75, 100, 125, 150, 175,
+        # 200, 250} for both peer and client modes, with a fixed
+        # 1pub/20sub workload. idle_peers is N - publishers - subscribers,
+        # so the harness ends up with N session-bearing processes
+        # (excluding the supervisor itself).
+        scenarios = []
+        for n in (50, 75, 100, 125, 150, 175, 200, 250):
+            idle = n - 1 - 20
+            if idle < 0:
+                continue
+            scenarios.append(
+                Scenario(
+                    f"n{n:03d}_p2p_1pub_20sub", "peer", "peer", idle, 20, 0,
+                    publishers=1, topics=1,
+                )
+            )
+            scenarios.append(
+                Scenario(
+                    f"n{n:03d}_cli_1pub_20sub", "router", "client", idle, 20, 0,
+                    publishers=1, topics=1,
+                )
+            )
+        return scenarios
     elif preset == "restart-sweep":
         # Steady-state with small individual peer restart events.
         # Same 100-session 1pub/20sub topology as topology preset, but
@@ -389,24 +426,151 @@ def run_benchmark(
     env: dict[str, str],
     log_path: Path,
     timeout_secs: float,
+    sample_path: Path | None = None,
+    sample_interval_s: float = 1.0,
 ) -> Completed:
+    """Runs the supervisor as a child process while a background thread
+    samples the resulting process tree at ``sample_interval_s`` cadence.
+
+    When ``sample_path`` is provided, the samples are written as CSV with
+    one row per tick. The CSV schema is documented in
+    ``sample_proc_tree``.
+    """
     with log_path.open("w", encoding="utf-8") as log:
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=timeout_secs,
-                check=False,
+        proc = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        stop_event = threading.Event()
+        sampler_thread = None
+        if sample_path is not None:
+            sampler_thread = threading.Thread(
+                target=_sample_loop,
+                args=(proc.pid, sample_path, sample_interval_s, stop_event),
+                daemon=True,
             )
-            return Completed(completed.returncode, False)
-        except subprocess.TimeoutExpired:
-            log.write(f"\nmetric role=runner_timeout timeout_secs={timeout_secs:.1f}\n")
-            cleanup_orphans()
-            return Completed(None, True)
+            sampler_thread.start()
+        try:
+            try:
+                proc.wait(timeout=timeout_secs)
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                log.write(
+                    f"\nmetric role=runner_timeout timeout_secs={timeout_secs:.1f}\n"
+                )
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                cleanup_orphans()
+                timed_out = True
+        finally:
+            stop_event.set()
+            if sampler_thread is not None:
+                sampler_thread.join(timeout=5)
+        returncode = None if timed_out else proc.returncode
+        return Completed(returncode, timed_out)
+
+
+def _sample_loop(
+    supervisor_pid: int,
+    csv_path: Path,
+    interval_s: float,
+    stop_event: threading.Event,
+) -> None:
+    """Polls the process tree every ``interval_s`` seconds until ``stop_event``
+    is set or the supervisor exits. Writes one CSV row per tick.
+    """
+    start = time.monotonic()
+    fields = [
+        "t_ms",
+        "child_count",
+        "supervisor_rss_kb",
+        "supervisor_cpu_pct",
+        "tree_total_rss_kb",
+        "tree_max_rss_kb",
+        "tree_total_cpu_pct",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        while not stop_event.is_set():
+            sample = sample_proc_tree(supervisor_pid)
+            if sample is None:
+                # supervisor exited; stop sampling
+                return
+            t_ms = int((time.monotonic() - start) * 1000)
+            writer.writerow(
+                {
+                    "t_ms": t_ms,
+                    "child_count": sample["child_count"],
+                    "supervisor_rss_kb": sample["supervisor_rss_kb"],
+                    "supervisor_cpu_pct": f"{sample['supervisor_cpu_pct']:.2f}",
+                    "tree_total_rss_kb": sample["total_rss_kb"],
+                    "tree_max_rss_kb": sample["max_rss_kb"],
+                    "tree_total_cpu_pct": f"{sample['total_cpu_pct']:.2f}",
+                }
+            )
+            f.flush()
+            stop_event.wait(timeout=interval_s)
+
+
+def sample_proc_tree(supervisor_pid: int) -> dict[str, Any] | None:
+    """Samples the whole process tree rooted at ``supervisor_pid`` using
+    ``ps``. Returns aggregate RSS (KB), aggregate CPU %, and child count,
+    or ``None`` if the supervisor is no longer alive.
+
+    RSS comes from ``ps -o rss`` (KB on Linux and macOS); CPU is the
+    instantaneous ``%CPU`` value reported by ``ps`` (which on Linux is a
+    cumulative average over the process lifetime, and on macOS is an
+    instantaneous sample — caveat lector when comparing across OSes).
+    """
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,rss=,pcpu="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    procs: dict[int, tuple[int, int, float]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            rss = int(parts[2])
+            cpu = float(parts[3])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, rss, cpu)
+    if supervisor_pid not in procs:
+        return None
+    descendants = {supervisor_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _, _) in procs.items():
+            if ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    rss_values = [procs[p][1] for p in descendants]
+    cpu_values = [procs[p][2] for p in descendants]
+    return {
+        "child_count": len(descendants),
+        "supervisor_rss_kb": procs[supervisor_pid][1],
+        "supervisor_cpu_pct": procs[supervisor_pid][2],
+        "total_rss_kb": sum(rss_values),
+        "max_rss_kb": max(rss_values, default=0),
+        "total_cpu_pct": sum(cpu_values),
+    }
 
 
 def cleanup_orphans() -> None:
