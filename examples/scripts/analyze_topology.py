@@ -200,17 +200,31 @@ def main() -> int:
     # n-sweep / scaling curve: triggers automatically if any scenario
     # name matches the `n\d+_(p2p|cli)_` pattern emitted by the n-sweep
     # preset. When --compare-dir is provided, render side-by-side.
+    compare_dir = Path(args.compare_dir) if args.compare_dir else None
     if any(SCALING_NAME_RE.match(name) for name in by_scenario):
         print()
         print("=" * 100)
         print("Scaling curve (n-sweep): per-N, per-mode aggregated metrics")
         print("=" * 100)
-        compare_dir = Path(args.compare_dir) if args.compare_dir else None
         scaling_curve_report(out_dir, compare_dir)
+    if any(KSWEEP_NAME_RE.match(name) for name in by_scenario):
+        print()
+        print("=" * 100)
+        print("K-sweep: per-(N, K, mode) aggregated metrics")
+        print("=" * 100)
+        k_sweep_report(out_dir, compare_dir)
+    if any(DURATION_NAME_RE.match(name) for name in by_scenario):
+        print()
+        print("=" * 100)
+        print("Duration trend: per-bucket rx/wt/RSS over the run")
+        print("=" * 100)
+        duration_trend_report(out_dir)
     return 0
 
 
 SCALING_NAME_RE = re.compile(r"^n(\d+)_(p2p|cli)_")
+KSWEEP_NAME_RE = re.compile(r"^n(\d+)_k(\d+)_(p2p|cli)$")
+DURATION_NAME_RE = re.compile(r"^n(\d+)_k(\d+)_p2p_long$")
 
 
 def collect_scaling_metrics(out_dir: Path, scenario_name: str) -> dict:
@@ -442,6 +456,197 @@ def _gather_scaling(out_dir: Path | None) -> dict[tuple[int, str], dict]:
         mode = "peer" if m.group(2) == "p2p" else "client"
         rows[(n, mode)] = collect_scaling_metrics(out_dir, name)
     return rows
+
+
+def k_sweep_report(out_dir: Path, compare_dir: Path | None) -> None:
+    """Renders the per-(N, K, mode) table. Reuses ``collect_scaling_metrics``
+    since the per-scenario metric set is identical to the n-sweep.
+    """
+    primary = _gather_k(out_dir)
+    secondary = _gather_k(compare_dir) if compare_dir else {}
+    if not primary:
+        print("(no k-sweep scenarios found)")
+        return
+
+    print()
+    label_primary = out_dir.name or "primary"
+    label_secondary = compare_dir.name if compare_dir else None
+    primary_short = label_primary[:9]
+    secondary_short = (label_secondary[:9]) if label_secondary else "-"
+
+    hdr = (
+        f"{'N':>5} {'K':>4} {'mode':<6} {'src':<10} "
+        f"{'rx_p99':>8} {'fst_p99':>10} {'miss/zero':>11} {'samples':>10} "
+        f"{'wt_pi_p99us':>13} {'wt_pi_max_us':>14} "
+        f"{'rt_w_p99us':>11} {'ntu_wcl_us':>11} "
+        f"{'cpu%':>7} {'tree_rss_mb':>12} {'TO':>3}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    keys = sorted(set(primary) | set(secondary))
+    for n, k, mode in keys:
+        for src_short, dataset in (
+            (primary_short, primary),
+            (secondary_short, secondary),
+        ):
+            row = dataset.get((n, k, mode))
+            if not row:
+                continue
+            print(
+                f"{n:>5} {k:>4} {mode:<6} {src_short:<10} "
+                f"{fmt(row['rx_p99_ms']):>8} {fmt(row['first_p99_ms']):>10} "
+                f"{row['miss']:>5}/{row['zero']:<5} "
+                f"{row['total_samples']:>10} "
+                f"{row['wt_pi_acq_p99_us']:>13} "
+                f"{row['wt_pi_acq_max_us']:>14} "
+                f"{row['rt_wait_p99_us']:>11} "
+                f"{row['ntu_wallclock_max_us']:>11} "
+                f"{row['max_total_cpu_pct']:>7.1f} "
+                f"{row['max_tree_rss_kb'] / 1024:>12.1f} "
+                f"{row['timed_out_runs']:>3}"
+            )
+    if compare_dir:
+        print()
+        print(
+            "(src column: "
+            f"'{primary_short}' = {out_dir}; '{secondary_short}' = {compare_dir})"
+        )
+
+
+def _gather_k(out_dir: Path | None) -> dict[tuple[int, int, str], dict]:
+    if out_dir is None or not out_dir.exists():
+        return {}
+    sj_path = out_dir / "summary.json"
+    if not sj_path.exists():
+        return {}
+    sj = json.loads(sj_path.read_text())
+    seen: set[str] = set()
+    rows: dict[tuple[int, int, str], dict] = {}
+    for r in sj.get("results", []):
+        name = r.get("scenario", {}).get("name", "")
+        if name in seen:
+            continue
+        m = KSWEEP_NAME_RE.match(name)
+        if not m:
+            continue
+        seen.add(name)
+        n = int(m.group(1))
+        k = int(m.group(2))
+        mode = "peer" if m.group(3) == "p2p" else "client"
+        rows[(n, k, mode)] = collect_scaling_metrics(out_dir, name)
+    return rows
+
+
+def duration_trend_report(out_dir: Path) -> None:
+    """For each duration-sweep scenario, walk through per-second metric
+    lines and bucket them into time windows. Prints rx_p99 and wt_pi p99
+    trend per bucket plus tree-total RSS / CPU% per minute from the
+    proc.csv.
+
+    Bucket size is the run duration / 30 (so we always get ~30 rows for
+    any duration). For a 4 h run that's 8-minute buckets; for a 5 min run
+    it's 10-second buckets.
+    """
+    sj_path = out_dir / "summary.json"
+    if not sj_path.exists():
+        print("(no summary.json)")
+        return
+    sj = json.loads(sj_path.read_text())
+    for r in sj.get("results", []):
+        name = r.get("scenario", {}).get("name", "")
+        if not DURATION_NAME_RE.match(name):
+            continue
+        run_idx = r.get("run_index", 1)
+        log = out_dir / f"{name}_run{run_idx}.log"
+        if not log.exists():
+            print(f"(missing log: {log})")
+            continue
+        duration_secs = sj.get("parameters", {}).get("duration_secs", 30)
+        bucket_secs = max(1, duration_secs // 30)
+        bucket_ms = bucket_secs * 1000
+
+        # Bucket per-subscriber rx_p99 by time bucket
+        rx_buckets: dict[int, list[int]] = {}
+        wt_buckets: dict[int, list[int]] = {}
+        rt_buckets: dict[int, list[int]] = {}
+        for line in log.read_text(errors="ignore").splitlines():
+            t_m = re.search(r"elapsed_ms=(\d+)", line)
+            if not t_m:
+                continue
+            t = int(t_m.group(1))
+            b = (t // bucket_ms) * bucket_secs
+            if "name=subscriber_latency" in line:
+                p99_m = re.search(r"p99_us=(\d+)", line)
+                if p99_m:
+                    rx_buckets.setdefault(b, []).append(int(p99_m.group(1)))
+            elif "name=wtables_diag" in line and "site=peer_init" in line:
+                p99_m = re.search(r"acquire_wait_p99_us=(\d+)", line)
+                if p99_m:
+                    wt_buckets.setdefault(b, []).append(int(p99_m.group(1)))
+            elif "name=rtables_diag" in line:
+                p99_m = re.search(r"wait_p99_us=(\d+)", line)
+                if p99_m:
+                    rt_buckets.setdefault(b, []).append(int(p99_m.group(1)))
+
+        # Bucket proc.csv into time buckets
+        csv_path = out_dir / f"{name}_run{run_idx}.proc.csv"
+        cpu_buckets: dict[int, list[float]] = {}
+        rss_buckets: dict[int, list[int]] = {}
+        if csv_path.exists():
+            try:
+                with csv_path.open() as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        try:
+                            t = int(row["t_ms"])
+                            cpu = float(row["tree_total_cpu_pct"])
+                            rss = int(row["tree_total_rss_kb"])
+                        except (KeyError, ValueError):
+                            continue
+                        b = (t // bucket_ms) * bucket_secs
+                        cpu_buckets.setdefault(b, []).append(cpu)
+                        rss_buckets.setdefault(b, []).append(rss)
+            except OSError:
+                pass
+
+        all_buckets = sorted(
+            set(rx_buckets)
+            | set(wt_buckets)
+            | set(rt_buckets)
+            | set(cpu_buckets)
+            | set(rss_buckets)
+        )
+        print(
+            f"\n  {name} (run {run_idx}, duration {duration_secs}s, "
+            f"bucket {bucket_secs}s):"
+        )
+        hdr = (
+            f"    {'t (s)':>8} "
+            f"{'rx_p99_ms':>11} {'wt_pi_p99us':>13} {'rt_w_p99us':>11} "
+            f"{'cpu%':>7} {'tree_rss_mb':>12}"
+        )
+        print(hdr)
+        print("    " + "-" * (len(hdr) - 4))
+        for b in all_buckets:
+            rx_p99 = _max_or_none(rx_buckets.get(b, []))
+            wt_p99 = _max_or_none(wt_buckets.get(b, []))
+            rt_p99 = _max_or_none(rt_buckets.get(b, []))
+            cpu_pct = _max_or_none(cpu_buckets.get(b, []))
+            rss_kb = _max_or_none(rss_buckets.get(b, []))
+            print(
+                f"    {b:>8} "
+                f"{(rx_p99 / 1000.0 if rx_p99 is not None else 'n/a'):>11} "
+                f"{(wt_p99 if wt_p99 is not None else 'n/a'):>13} "
+                f"{(rt_p99 if rt_p99 is not None else 'n/a'):>11} "
+                f"{(cpu_pct if cpu_pct is not None else 'n/a'):>7} "
+                f"{(rss_kb / 1024.0 if rss_kb is not None else 'n/a'):>12}"
+            )
+
+
+def _max_or_none(values: list) -> int | float | None:
+    if not values:
+        return None
+    return max(values)
 
 
 def blast_radius_report(out_dir: Path, summary: dict) -> None:
