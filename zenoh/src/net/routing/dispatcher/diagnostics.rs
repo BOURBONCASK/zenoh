@@ -52,9 +52,75 @@ macro_rules! atomics {
         [const { AtomicU64::new(0) }; $n]
     };
 }
+
+// Histogram bucket count for acquire_wait timings. Each bucket i covers the
+// range `[2^(i-1), 2^i)` microseconds, except bucket 0 which captures 0 µs.
+// With 25 buckets the last range is `[2^23, 2^24)` µs ≈ `[8.4 s, 16.8 s)`,
+// which comfortably covers `wait_before_close = 5 s` outliers.
+const HIST_BUCKETS: usize = 25;
+
+macro_rules! hist_atomics_2d {
+    ($rows:expr) => {
+        [const { [const { AtomicU64::new(0) }; HIST_BUCKETS] }; $rows]
+    };
+}
+
+#[inline]
+fn hist_bucket_for(v_us: u64) -> usize {
+    if v_us == 0 {
+        return 0;
+    }
+    let bit = (64 - v_us.leading_zeros()) as usize;
+    bit.min(HIST_BUCKETS - 1)
+}
+
+#[inline]
+fn hist_record(buckets: &[AtomicU64; HIST_BUCKETS], v_us: u64) {
+    buckets[hist_bucket_for(v_us)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drain a histogram into a local snapshot and emit p50/p90/p99/p999.
+/// Returns the (snapshot, total) for the caller to use.
+#[inline]
+fn hist_drain(buckets: &[AtomicU64; HIST_BUCKETS]) -> ([u64; HIST_BUCKETS], u64) {
+    let mut snap = [0u64; HIST_BUCKETS];
+    let mut total = 0u64;
+    for (i, b) in buckets.iter().enumerate() {
+        let v = b.swap(0, Ordering::Relaxed);
+        snap[i] = v;
+        total += v;
+    }
+    (snap, total)
+}
+
+/// Linear-interpolate inside the picked bucket for a percentile value (µs).
+fn hist_percentile(snap: &[u64; HIST_BUCKETS], total: u64, p: f64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let target = ((total as f64) * p).ceil().max(1.0) as u64;
+    let mut cum: u64 = 0;
+    for (i, &count) in snap.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let new_cum = cum + count;
+        if new_cum >= target {
+            let lo: u64 = if i == 0 { 0 } else { 1u64 << (i - 1) };
+            let hi: u64 = if i == 0 { 1 } else { 1u64 << i };
+            let span = hi - lo;
+            let pos_in_bucket = (target - cum) as f64 / count as f64;
+            return lo + (span as f64 * pos_in_bucket) as u64;
+        }
+        cum = new_cum;
+    }
+    1u64 << (HIST_BUCKETS - 1)
+}
 pub(crate) static WT_COUNT: [AtomicU64; WT_SITE_COUNT] = atomics!(WT_SITE_COUNT);
 pub(crate) static WT_ACQUIRE_WAIT_TOTAL_US: [AtomicU64; WT_SITE_COUNT] = atomics!(WT_SITE_COUNT);
 pub(crate) static WT_ACQUIRE_WAIT_MAX_US: [AtomicU64; WT_SITE_COUNT] = atomics!(WT_SITE_COUNT);
+pub(crate) static WT_ACQUIRE_WAIT_HIST: [[AtomicU64; HIST_BUCKETS]; WT_SITE_COUNT] =
+    hist_atomics_2d!(WT_SITE_COUNT);
 pub(crate) static WT_HOLD_TOTAL_US: [AtomicU64; WT_SITE_COUNT] = atomics!(WT_SITE_COUNT);
 pub(crate) static WT_HOLD_MAX_US: [AtomicU64; WT_SITE_COUNT] = atomics!(WT_SITE_COUNT);
 
@@ -79,6 +145,8 @@ const CL_SITE_NAMES: [&str; CL_SITE_COUNT] = [
 pub(crate) static CL_COUNT: [AtomicU64; CL_SITE_COUNT] = atomics!(CL_SITE_COUNT);
 pub(crate) static CL_ACQUIRE_WAIT_TOTAL_US: [AtomicU64; CL_SITE_COUNT] = atomics!(CL_SITE_COUNT);
 pub(crate) static CL_ACQUIRE_WAIT_MAX_US: [AtomicU64; CL_SITE_COUNT] = atomics!(CL_SITE_COUNT);
+pub(crate) static CL_ACQUIRE_WAIT_HIST: [[AtomicU64; HIST_BUCKETS]; CL_SITE_COUNT] =
+    hist_atomics_2d!(CL_SITE_COUNT);
 pub(crate) static CL_HOLD_TOTAL_US: [AtomicU64; CL_SITE_COUNT] = atomics!(CL_SITE_COUNT);
 pub(crate) static CL_HOLD_MAX_US: [AtomicU64; CL_SITE_COUNT] = atomics!(CL_SITE_COUNT);
 
@@ -126,6 +194,8 @@ pub(crate) static NTU_WALLCLOCK_MAX_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RT_WAIT_COUNT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RT_WAIT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RT_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RT_WAIT_HIST: [AtomicU64; HIST_BUCKETS] =
+    [const { AtomicU64::new(0) }; HIST_BUCKETS];
 pub(crate) static RT_HOLD_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RT_HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
 
@@ -243,6 +313,11 @@ fn ensure_dumper_started() {
                     }
                     let aw_total = WT_ACQUIRE_WAIT_TOTAL_US[i].swap(0, Ordering::Relaxed);
                     let aw_max = WT_ACQUIRE_WAIT_MAX_US[i].swap(0, Ordering::Relaxed);
+                    let (aw_hist, aw_hist_total) = hist_drain(&WT_ACQUIRE_WAIT_HIST[i]);
+                    let aw_p50 = hist_percentile(&aw_hist, aw_hist_total, 0.50);
+                    let aw_p90 = hist_percentile(&aw_hist, aw_hist_total, 0.90);
+                    let aw_p99 = hist_percentile(&aw_hist, aw_hist_total, 0.99);
+                    let aw_p999 = hist_percentile(&aw_hist, aw_hist_total, 0.999);
                     let h_total = WT_HOLD_TOTAL_US[i].swap(0, Ordering::Relaxed);
                     let h_max = WT_HOLD_MAX_US[i].swap(0, Ordering::Relaxed);
                     let aw_avg = aw_total / count;
@@ -251,6 +326,8 @@ fn ensure_dumper_started() {
                         "metric name=wtables_diag pid={pid} elapsed_ms={elapsed_ms} \
                          site={} count={count} \
                          acquire_wait_avg_us={aw_avg} acquire_wait_max_us={aw_max} \
+                         acquire_wait_p50_us={aw_p50} acquire_wait_p90_us={aw_p90} \
+                         acquire_wait_p99_us={aw_p99} acquire_wait_p999_us={aw_p999} \
                          hold_avg_us={h_avg} hold_max_us={h_max}",
                         WT_SITE_NAMES[i]
                     );
@@ -279,6 +356,11 @@ fn ensure_dumper_started() {
                     }
                     let aw_total = CL_ACQUIRE_WAIT_TOTAL_US[i].swap(0, Ordering::Relaxed);
                     let aw_max = CL_ACQUIRE_WAIT_MAX_US[i].swap(0, Ordering::Relaxed);
+                    let (aw_hist, aw_hist_total) = hist_drain(&CL_ACQUIRE_WAIT_HIST[i]);
+                    let aw_p50 = hist_percentile(&aw_hist, aw_hist_total, 0.50);
+                    let aw_p90 = hist_percentile(&aw_hist, aw_hist_total, 0.90);
+                    let aw_p99 = hist_percentile(&aw_hist, aw_hist_total, 0.99);
+                    let aw_p999 = hist_percentile(&aw_hist, aw_hist_total, 0.999);
                     let h_total = CL_HOLD_TOTAL_US[i].swap(0, Ordering::Relaxed);
                     let h_max = CL_HOLD_MAX_US[i].swap(0, Ordering::Relaxed);
                     let aw_avg = aw_total / count;
@@ -287,6 +369,8 @@ fn ensure_dumper_started() {
                         "metric name=ctrl_lock_diag pid={pid} elapsed_ms={elapsed_ms} \
                          site={} count={count} \
                          acquire_wait_avg_us={aw_avg} acquire_wait_max_us={aw_max} \
+                         acquire_wait_p50_us={aw_p50} acquire_wait_p90_us={aw_p90} \
+                         acquire_wait_p99_us={aw_p99} acquire_wait_p999_us={aw_p999} \
                          hold_avg_us={h_avg} hold_max_us={h_max}",
                         CL_SITE_NAMES[i]
                     );
@@ -347,15 +431,22 @@ fn ensure_dumper_started() {
                 let rt_count = RT_WAIT_COUNT.swap(0, Ordering::Relaxed);
                 let rt_wait_total = RT_WAIT_TOTAL_US.swap(0, Ordering::Relaxed);
                 let rt_wait_max = RT_WAIT_MAX_US.swap(0, Ordering::Relaxed);
+                let (rt_hist, rt_hist_total) = hist_drain(&RT_WAIT_HIST);
                 let rt_hold_total = RT_HOLD_TOTAL_US.swap(0, Ordering::Relaxed);
                 let rt_hold_max = RT_HOLD_MAX_US.swap(0, Ordering::Relaxed);
                 if rt_count > 0 {
                     let wait_avg = rt_wait_total / rt_count;
                     let hold_avg = rt_hold_total / rt_count;
+                    let wait_p50 = hist_percentile(&rt_hist, rt_hist_total, 0.50);
+                    let wait_p90 = hist_percentile(&rt_hist, rt_hist_total, 0.90);
+                    let wait_p99 = hist_percentile(&rt_hist, rt_hist_total, 0.99);
+                    let wait_p999 = hist_percentile(&rt_hist, rt_hist_total, 0.999);
                     println!(
                         "metric name=rtables_diag pid={pid} elapsed_ms={elapsed_ms} \
                          count={rt_count} \
                          wait_avg_us={wait_avg} wait_max_us={rt_wait_max} \
+                         wait_p50_us={wait_p50} wait_p90_us={wait_p90} \
+                         wait_p99_us={wait_p99} wait_p999_us={wait_p999} \
                          hold_avg_us={hold_avg} hold_max_us={rt_hold_max}"
                     );
                 }
@@ -504,6 +595,7 @@ impl WTableTimer {
         WT_COUNT[i].fetch_add(1, Ordering::Relaxed);
         WT_ACQUIRE_WAIT_TOTAL_US[i].fetch_add(wait_us, Ordering::Relaxed);
         record_max(&WT_ACQUIRE_WAIT_MAX_US[i], wait_us);
+        hist_record(&WT_ACQUIRE_WAIT_HIST[i], wait_us);
         Self {
             site,
             acquired_at: now,
@@ -549,6 +641,7 @@ impl CtrlLockTimer {
         CL_COUNT[i].fetch_add(1, Ordering::Relaxed);
         CL_ACQUIRE_WAIT_TOTAL_US[i].fetch_add(wait_us, Ordering::Relaxed);
         record_max(&CL_ACQUIRE_WAIT_MAX_US[i], wait_us);
+        hist_record(&CL_ACQUIRE_WAIT_HIST[i], wait_us);
         Self {
             site,
             acquired_at: now,
@@ -625,6 +718,7 @@ impl RTableTimer {
         RT_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
         RT_WAIT_TOTAL_US.fetch_add(wait, Ordering::Relaxed);
         record_max(&RT_WAIT_MAX_US, wait);
+        hist_record(&RT_WAIT_HIST, wait);
         self.acquired_at = Some(now);
     }
 }
