@@ -29,7 +29,7 @@ use zenoh_protocol::{
     core::Priority,
     transport::{KeepAlive, TransportMessage},
 };
-use zenoh_result::{bail, zerror, ZResult};
+use zenoh_result::{bail, ZResult};
 use zenoh_sync::RecyclingObjectPool;
 #[cfg(feature = "unstable")]
 use zenoh_sync::{event, Notifier, Waiter};
@@ -325,25 +325,58 @@ async fn write_loop(
         result?;
     }
 
-    // Drain the transmission pipeline and write remaining bytes on the wire
-    let mut batches = pipeline.drain();
-    for (mut b, _) in batches.drain(..) {
-        tokio::time::timeout(
-            keep_alive_tracker.timeout(),
-            link.send_batch(&mut b, write_priority),
-        )
-        .await
-        .map_err(|_| {
-            zerror!(
-                "{link}: flush failed after {} ms",
-                keep_alive_tracker.timeout().as_millis()
-            )
-        })??;
-
-        #[cfg(feature = "stats")]
-        {
-            stats.inc_bytes(zenoh_stats::Tx, b.len() as u64);
-            stats.inc_transport_message(zenoh_stats::Tx, b.stats.t_msgs as u64);
+    // Drain whatever batches we can within DRAIN_BUDGET and ABANDON the
+    // rest. This is best-effort post-cancel cleanup, NOT a graceful
+    // flush guarantee — callers that need every batch on the wire must
+    // not rely on this path.
+    //
+    // Phase C1 (issue #2581 symptom #4): bound the WHOLE drain by a
+    // single budget instead of giving each batch the full
+    // `keep_alive_tracker.timeout()` (== lease/keep_alive ≈ 2.5 s by
+    // default). The previous implementation could spend
+    // batches × 2.5 s on a slow link, producing the 10 s ceiling
+    // observed in p2p_50_churn (`phase_B_profile_results.md`). On
+    // timeout or send error we log at debug and return Ok(()) so the
+    // outer del_link path can complete promptly; drain failures
+    // therefore don't surface to the caller of the link close.
+    const DRAIN_BUDGET: Duration = Duration::from_millis(500);
+    let drain_deadline = Instant::now() + DRAIN_BUDGET;
+    let batches = pipeline.drain();
+    let total_batches = batches.len();
+    let mut sent = 0usize;
+    for (mut b, _) in batches.into_iter() {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::debug!(
+                "{link}: drain budget ({} ms) exhausted; dropping {} of {} batch(es)",
+                DRAIN_BUDGET.as_millis(),
+                total_batches - sent,
+                total_batches,
+            );
+            break;
+        }
+        let send_res = tokio::time::timeout(remaining, link.send_batch(&mut b, write_priority))
+            .await;
+        match send_res {
+            Ok(Ok(())) => {
+                sent += 1;
+                #[cfg(feature = "stats")]
+                {
+                    stats.inc_bytes(zenoh_stats::Tx, b.len() as u64);
+                    stats.inc_transport_message(zenoh_stats::Tx, b.stats.t_msgs as u64);
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("{link}: drain send error: {e}");
+                break;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "{link}: drain budget ({} ms) exceeded mid-batch; abandoning rest",
+                    DRAIN_BUDGET.as_millis(),
+                );
+                break;
+            }
         }
     }
 

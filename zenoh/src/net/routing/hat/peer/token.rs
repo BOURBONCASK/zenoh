@@ -79,7 +79,9 @@ impl Hat {
             self.face_hat_mut(dst_face)
                 .local_tokens
                 .insert(res.clone(), id);
-            let key_expr = Resource::decl_key(res, dst_face);
+            // PR 3 (Phase 5): pure-read `decl_key_simple` — same
+            // rationale as `pubsub.rs::maybe_propagate_subscriber`.
+            let key_expr = Resource::decl_key_simple(res);
             tracing::debug!(dst = %dst_face);
             send_declare(
                 &dst_face.primitives,

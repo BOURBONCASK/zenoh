@@ -13,7 +13,7 @@
 //
 use std::{
     str::FromStr,
-    sync::{atomic::Ordering, Arc, Mutex, RwLock},
+    sync::{atomic::Ordering, Arc, RwLock},
 };
 
 use arc_swap::ArcSwapOption;
@@ -24,6 +24,7 @@ use zenoh_config::{
 };
 use zenoh_protocol::core::{Bound, Region, WhatAmI, ZenohIdProto};
 use zenoh_result::ZResult;
+use zenoh_runtime::ZRuntime;
 use zenoh_transport::{multicast::TransportMulticast, unicast::TransportUnicast, TransportPeer};
 
 pub use super::dispatcher::{pubsub::*, resource::*};
@@ -190,8 +191,12 @@ impl<'conf> GatewayBuilder<'conf> {
 
         Ok(Gateway {
             tables: Arc::new(TablesLock {
-                tables: RwLock::new(Tables { data, hats }),
-                ctrl_lock: Mutex::new(()),
+                // Phase 7.1: parking_lot-backed (via PlRwLock /
+                // PlMutex compat wrappers) for lower acquire-wait p99
+                // on contended workloads. See
+                // `dispatcher/lock_compat.rs`.
+                tables: super::dispatcher::lock_compat::PlRwLock::new(Tables { data, hats }),
+                ctrl_lock: super::dispatcher::lock_compat::PlMutex::new(()),
                 queries_lock: RwLock::new(()),
             }),
         })
@@ -267,6 +272,12 @@ impl Gateway {
         region: Region,
         remote_bound: Bound,
     ) -> ZResult<Arc<DeMux>> {
+        struct NtuGuard(std::time::Instant);
+        impl Drop for NtuGuard {
+            fn drop(&mut self) {
+            }
+        }
+        let _ntu_guard = NtuGuard(std::time::Instant::now());
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
         let mut wtables = zwrite!(self.tables.tables);
         let tables = &mut *wtables;
@@ -330,9 +341,26 @@ impl Gateway {
         )?;
         drop(wtables);
         drop(ctrl_lock);
-        for (p, m) in declares {
-            m.with_mut(|m| p.send_declare(m));
-        }
+
+        // PR 1: spawn the deferred-declare flush off the calling thread of
+        // `TransportEventHandler::new_unicast`. The synchronous version of
+        // this loop was the dominant cause of `peer_init` cumulative wait
+        // (v4 `flush_declare_diag max_us=5,005,714`,
+        // `ctrl_lock_diag acquire_wait_max_us=14,878,351`). Spawning on the
+        // face's `task_controller` ties the task lifetime to the face: on
+        // close, `task_controller.terminate_all` cancels in-flight work
+        // (between iterations — see `tokio::task::yield_now().await` below).
+        face.state.task_controller.spawn_abortable_with_rt(
+            ZRuntime::Net,
+            async move {
+                for (p, mut m) in declares {
+                    m.with_mut(|m| p.send_declare(m));
+                    // Yield between iterations so face close can interrupt
+                    // the loop without waiting for the entire flush.
+                    tokio::task::yield_now().await;
+                }
+            },
+        );
 
         Ok(Arc::new(DeMux::new(
             face,

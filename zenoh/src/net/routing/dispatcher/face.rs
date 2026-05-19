@@ -32,6 +32,7 @@ use zenoh_protocol::{
     },
     zenoh::RequestBody,
 };
+use zenoh_runtime::ZRuntime;
 use zenoh_sync::get_mut_unchecked;
 use zenoh_task::TaskController;
 use zenoh_transport::multicast::TransportMulticast;
@@ -56,6 +57,7 @@ use crate::net::{
             EgressInterceptor, IngressInterceptor, InterceptorFactory, InterceptorTrait,
             InterceptorsChain,
         },
+        RoutingContext,
     },
 };
 
@@ -119,6 +121,16 @@ pub struct FaceState {
     pub(crate) region: Region,
     pub(crate) remote_bound: Bound,
     pub(crate) primitives: Arc<dyn crate::net::primitives::EPrimitives + Send + Sync>,
+    /// Per-face serialization for the deferred `spawn_declare_flush` tasks.
+    /// Without this, two `spawn_declare_flush` calls scheduled in close
+    /// succession (e.g. a `DeclareKeyExpr` event followed by a declare
+    /// that uses the freshly-registered scoped expr) could be drained out
+    /// of order by the tokio runtime's worker threads, letting a peer
+    /// observe a scoped `WireExpr` before the corresponding `DeclareKeyExpr`
+    /// has been announced. By acquiring this mutex inside each spawned
+    /// flush task, all flush tasks for one face run serially while
+    /// different faces remain fully parallel.
+    pub(crate) flush_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) local_interests: HashMap<InterestId, InterestState>,
     pub(crate) remote_key_interests: HashMap<InterestId, Option<Arc<Resource>>>,
     pub(crate) pending_current_interests: HashMap<InterestId, PendingCurrentInterest>,
@@ -160,6 +172,7 @@ impl FaceStateBuilder {
             region,
             remote_bound,
             primitives,
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
             local_interests: HashMap::new(),
             remote_key_interests: HashMap::new(),
             pending_current_interests: HashMap::new(),
@@ -536,6 +549,41 @@ impl Face {
     }
 }
 
+/// Spawn the post-`drop(ctrl_lock)` flush of deferred declares on the given
+/// face's `task_controller`, so the calling thread does not block on
+/// transport pipeline backpressure. The task is bound to the face's
+/// lifetime: closing the face aborts in-flight flushes via the face's
+/// `Face::send_close` -> `state.task_controller.terminate_all(10 s)` path.
+/// `tokio::task::yield_now().await` between iterations gives the runtime
+/// an opportunity to abort the loop without having to wait for a slow
+/// `send_declare` to return.
+///
+/// The `flush_lock` argument serializes all spawned flush tasks for the
+/// same face. Without serialization, two flushes scheduled in close
+/// succession (e.g. a `DeclareKeyExpr` registration followed by a
+/// declare that uses the freshly-registered scoped expr) could be drained
+/// out of order by tokio worker threads, letting a peer observe a scoped
+/// `WireExpr` before the corresponding `DeclareKeyExpr` arrives. The
+/// mutex is acquired inside the spawned task — calls do not block in
+/// `spawn_declare_flush` itself, and different faces remain fully
+/// parallel.
+fn spawn_declare_flush(
+    task_controller: &TaskController,
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
+    declares: Vec<(
+        Arc<dyn EPrimitives + Send + Sync>,
+        RoutingContext<zenoh_protocol::network::Declare>,
+    )>,
+) {
+    task_controller.spawn_abortable_with_rt(ZRuntime::Net, async move {
+        let _guard = flush_lock.lock().await;
+        for (p, mut m) in declares {
+            m.with_mut(|m| p.send_declare(m));
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
 impl Primitives for Face {
     fn send_interest(&self, msg: &mut zenoh_protocol::network::Interest) {
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
@@ -543,9 +591,7 @@ impl Primitives for Face {
             let mut declares = vec![];
             self.interest(msg, &mut |p, m| declares.push((p.clone(), m)));
             drop(ctrl_lock);
-            for (p, m) in declares {
-                m.with_mut(|m| p.send_declare(m));
-            }
+            spawn_declare_flush(&self.state.task_controller, self.state.flush_lock.clone(), declares);
         } else {
             self.interest_final(msg);
         }
@@ -570,9 +616,7 @@ impl Primitives for Face {
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, self.state.flush_lock.clone(), declares);
             }
             zenoh_protocol::network::DeclareBody::UndeclareSubscriber(m) => {
                 let mut declares = vec![];
@@ -583,9 +627,7 @@ impl Primitives for Face {
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, self.state.flush_lock.clone(), declares);
             }
             zenoh_protocol::network::DeclareBody::DeclareQueryable(m) => {
                 let mut declares = vec![];
@@ -597,9 +639,7 @@ impl Primitives for Face {
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, self.state.flush_lock.clone(), declares);
             }
             zenoh_protocol::network::DeclareBody::UndeclareQueryable(m) => {
                 let mut declares = vec![];
@@ -610,9 +650,7 @@ impl Primitives for Face {
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, self.state.flush_lock.clone(), declares);
             }
             zenoh_protocol::network::DeclareBody::DeclareToken(m) => {
                 let mut declares = vec![];
@@ -624,9 +662,7 @@ impl Primitives for Face {
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, self.state.flush_lock.clone(), declares);
             }
             zenoh_protocol::network::DeclareBody::UndeclareToken(m) => {
                 let mut declares = vec![];
@@ -637,9 +673,7 @@ impl Primitives for Face {
                     &mut |p, m| declares.push((p.clone(), m)),
                 );
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                spawn_declare_flush(&self.state.task_controller, self.state.flush_lock.clone(), declares);
             }
             zenoh_protocol::network::DeclareBody::DeclareFinal(_) => {
                 let Some(id) = msg.interest_id else {
@@ -655,9 +689,22 @@ impl Primitives for Face {
 
                 drop(wtables);
                 drop(ctrl_lock);
-                for (p, m) in declares {
-                    m.with_mut(|m| p.send_declare(m));
-                }
+                // Use the same per-face serialization as every other
+                // spawn_declare_flush call site so DeclareFinal cannot
+                // be drained ahead of an earlier in-flight declare
+                // flush. Record the diagnostic by wrapping
+                // `spawn_declare_flush`'s body in a small inline task.
+                let flush_lock = self.state.flush_lock.clone();
+                self.state.task_controller.spawn_abortable_with_rt(
+                    ZRuntime::Net,
+                    async move {
+                        let _guard = flush_lock.lock().await;
+                        for (p, mut m) in declares {
+                            m.with_mut(|m| p.send_declare(m));
+                            tokio::task::yield_now().await;
+                        }
+                    },
+                );
             }
         }
     }
@@ -700,13 +747,19 @@ impl Primitives for Face {
     fn send_close(&self) {
         let mut state = self.state.clone();
         state.task_controller.terminate_all(Duration::from_secs(10));
+
         finalize_pending_queries(&self.tables, &mut state);
+
         let mut declares = vec![];
+
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+
         finalize_pending_interests(&self.tables, &mut state, &mut |p, m| {
             declares.push((p.clone(), m))
         });
+
         let mut wtables = zwrite!(self.tables.tables);
+
         let tables = &mut *wtables;
 
         let mut ctx = DispatcherContext {
@@ -813,11 +866,13 @@ impl Primitives for Face {
 
         tables.data.faces.remove(&src_fid);
 
+
         drop(wtables);
         drop(ctrl_lock);
         for (p, m) in declares {
             m.with_mut(|m| p.send_declare(m));
         }
+
     }
 
     fn as_any(&self) -> &dyn Any {

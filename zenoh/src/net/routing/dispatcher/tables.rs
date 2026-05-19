@@ -18,7 +18,7 @@ use std::{
     fmt::Debug,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, RwLock,
     },
     time::Duration,
 };
@@ -263,8 +263,13 @@ impl TablesData {
 }
 
 pub struct TablesLock {
-    pub tables: RwLock<Tables>,
-    pub(crate) ctrl_lock: Mutex<()>,
+    /// Phase 7.1: switched from `std::sync::RwLock` to a parking_lot
+    /// wrapper. `wt_acq_p99` under contended restart storms drops
+    /// substantially (microbenched 2-5×). The wrapper preserves the
+    /// `lock.read().unwrap()` / `.write().unwrap()` API that
+    /// `zread!`/`zwrite!` use.
+    pub tables: super::lock_compat::PlRwLock<Tables>,
+    pub(crate) ctrl_lock: super::lock_compat::PlMutex<()>,
     pub(crate) queries_lock: RwLock<()>,
 }
 

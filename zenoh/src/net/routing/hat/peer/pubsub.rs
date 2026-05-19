@@ -75,14 +75,13 @@ impl Hat {
         dst_face: &mut Arc<FaceState>,
         send_declare: &mut SendDeclare,
     ) {
-        if self
+        let already = self
             .face_hat(dst_face)
             .local_subs
-            .contains_simple_resource(res)
-        {
+            .contains_simple_resource(res);
+        if already {
             return;
-        };
-
+        }
         // NOTE(regions): it's not because of initial interest that we push subscribers to north-bound peers.
         // Initial interest only exists to track current declarations at startup. This code is misleading.
         // See 20a95fb.
@@ -113,7 +112,6 @@ impl Hat {
         if !should_notify {
             return;
         }
-
         let face_hat_mut = self.face_hat_mut(dst_face);
         let (_, subs_to_notify) = face_hat_mut.local_subs.insert_simple_resource(
             res.clone(),
@@ -121,10 +119,19 @@ impl Hat {
             || face_hat_mut.next_id.fetch_add(1, Ordering::SeqCst),
             simple_interests,
         );
-
         for update in subs_to_notify {
             tracing::debug!(dst = %dst_face);
-            let key_expr = Resource::decl_key(&update.resource, dst_face);
+            // PR 3 (Phase 5): use the pure-read `decl_key_simple` so this
+            // hot loop does NOT mutate `Resource::face_ctxs` or
+            // `face.local_mappings` while the wtables write lock is held.
+            // The Phase 5 isolate experiment showed that the cumulative
+            // wtable hold across N peer-init events during a rejoin storm
+            // is the dominant blast-radius mechanism on unrelated topics
+            // (200-285 ms rx_p99 at restart-count 6, N=100). Skipping the
+            // compact-keyexpr registration for the first batch trades a
+            // small per-declare wire-size increase for a much larger
+            // critical-section reduction.
+            let key_expr = Resource::decl_key_simple(&update.resource);
             send_declare(
                 &dst_face.primitives,
                 RoutingContext::with_expr(

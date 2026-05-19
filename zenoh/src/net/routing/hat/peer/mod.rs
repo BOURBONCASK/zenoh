@@ -307,11 +307,21 @@ impl HatBaseTrait for Hat {
             );
         }
 
-        self.repropagate_interests(ctx.reborrow(), &other_hats);
-        self.repropagate_subscribers(ctx.reborrow(), &other_hats);
-        self.repropagate_queryables(ctx.reborrow(), &other_hats);
-        self.repropagate_tokens(ctx.reborrow(), &other_hats);
-        self.disable_all_routes(ctx.tables);
+        {
+            self.repropagate_interests(ctx.reborrow(), &other_hats);
+        }
+        {
+            self.repropagate_subscribers(ctx.reborrow(), &other_hats);
+        }
+        {
+            self.repropagate_queryables(ctx.reborrow(), &other_hats);
+        }
+        {
+            self.repropagate_tokens(ctx.reborrow(), &other_hats);
+        }
+        {
+            self.disable_all_routes(ctx.tables);
+        }
 
         if do_initial_interest {
             tracing::debug!(dst = %ctx.src_face);

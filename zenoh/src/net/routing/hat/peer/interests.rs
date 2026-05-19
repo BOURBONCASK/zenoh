@@ -71,9 +71,17 @@ impl Hat {
             get_mut_unchecked(ctx.src_face)
                 .local_interests
                 .insert(id, InterestState::new(face_id, options, res.clone(), false));
-            let wire_expr = res
-                .as_ref()
-                .map(|res| Resource::decl_key(res, ctx.src_face));
+            // PR 3 (Phase 5): pure-read `decl_key_simple` instead of
+            // the legacy mutating `decl_key`. The legacy path mutated
+            // `Resource::face_ctxs` AND did a synchronous
+            // `face.primitives.send_declare(DeclareKeyExpr)` inside the
+            // wtables write lock — both of which contribute to peer-init
+            // critical-section time during a rejoin storm. The trailing
+            // `send_interest` call below is still synchronous (no
+            // SendDeclare-style callback exists for interests yet);
+            // that's a separate followup if measurement shows it
+            // matters.
+            let wire_expr = res.as_ref().map(|res| Resource::decl_key_simple(res));
             ctx.src_face
                 .primitives
                 .send_interest(RoutingContext::with_expr(
@@ -280,17 +288,31 @@ impl HatInterestTrait for Hat {
                 return Noop;
             }
 
-            zenoh_runtime::ZRuntime::Net.block_in_place(async move {
-                if let Some(runtime) = &ctx.tables.runtime {
-                    if let Some(runtime) = runtime.upgrade() {
+            // Terminate the peer connector asynchronously. The previous
+            // implementation blocked the calling thread (`block_in_place`)
+            // while `wtables` and `ctrl_lock` were held by `declare_final`.
+            // The connector termination does not need to be observed by
+            // the caller, so spawn it on the source face's
+            // `task_controller`: face close cancels it via
+            // `terminate_all_async()`.
+            let runtime = ctx
+                .tables
+                .runtime
+                .as_ref()
+                .and_then(|rt| rt.upgrade());
+            let zid = ctx.src_face.zid;
+            ctx.src_face.task_controller.spawn_abortable_with_rt(
+                zenoh_runtime::ZRuntime::Net,
+                async move {
+                    if let Some(runtime) = runtime {
                         tracing::debug!("Terminating peer connector");
                         runtime
                             .start_conditions()
-                            .terminate_peer_connector_zid(ctx.src_face.zid)
-                            .await
+                            .terminate_peer_connector_zid(zid)
+                            .await;
                     }
-                }
-            });
+                },
+            );
 
             Noop
         } else {

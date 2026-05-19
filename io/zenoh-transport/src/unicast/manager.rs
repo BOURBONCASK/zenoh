@@ -366,13 +366,21 @@ impl TransportManager {
             }
         }
 
-        let mut tu_guard = zasynclock!(self.state.unicast.transports)
+        let tu_guard = zasynclock!(self.state.unicast.transports)
             .drain()
             .map(|(_, v)| v)
             .collect::<Vec<Arc<dyn TransportUnicastTrait>>>();
-        for tu in tu_guard.drain(..) {
-            let _ = tu.close(close::reason::GENERIC).await;
-        }
+        // Close all transports in parallel. Each `tu.close()` has its
+        // own internal serialization on the wtable / per-link state, so
+        // this doesn't change the per-transport cost — only the
+        // wall-clock from N × cost to approximately max(cost) across
+        // the cohort. Under N-peer churn the serial loop made
+        // `manager.close()` (and thus `session.close()`) take ~N ×
+        // per-transport-close time. Phase C3 of issue #2581 symptom #4.
+        let close_futs = tu_guard
+            .into_iter()
+            .map(|tu| async move { tu.close(close::reason::GENERIC).await });
+        let _ = futures::future::join_all(close_futs).await;
     }
 
     /*************************************/
