@@ -558,6 +558,85 @@ impl Primitives for ClientPrimitives {
     }
 }
 
+/// `SlowPrimitives` is a deterministic stand-in for a back-pressured peer.
+/// Every call to `send_push` sleeps for a configurable duration before
+/// returning, simulating a `pipeline.push_network_message` that is waiting
+/// out the configured `wait_before_close` for the peer's transmission
+/// pipeline to drain. Combined with several fast destinations in the same
+/// fan-out, this reproduces — deterministically and host-state-independent —
+/// the worst-case publisher fan-out latency that issue #2581 surfaces in
+/// the 50-peer p2p churn workload.
+pub struct SlowPrimitives {
+    delay: std::time::Duration,
+    saw_push: std::sync::atomic::AtomicUsize,
+}
+
+impl SlowPrimitives {
+    pub fn new(delay: std::time::Duration) -> Self {
+        Self {
+            delay,
+            saw_push: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn push_count(&self) -> usize {
+        self.saw_push.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Primitives for SlowPrimitives {
+    fn send_interest(&self, _msg: &mut zenoh_protocol::network::Interest) {}
+    fn send_declare(&self, _msg: &mut zenoh_protocol::network::Declare) {}
+    fn send_push_consume(
+        &self,
+        _msg: &mut zenoh_protocol::network::Push,
+        _reliability: Reliability,
+        _consume: bool,
+    ) {
+        std::thread::sleep(self.delay);
+        self.saw_push
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn send_request(&self, _msg: &mut zenoh_protocol::network::Request) {}
+    fn send_response(&self, _msg: &mut zenoh_protocol::network::Response) {}
+    fn send_response_final(&self, _msg: &mut zenoh_protocol::network::ResponseFinal) {}
+    fn send_close(&self) {}
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl EPrimitives for SlowPrimitives {
+    fn send_interest(&self, _ctx: RoutingContext<&mut zenoh_protocol::network::Interest>) -> bool {
+        false
+    }
+    fn send_declare(&self, _ctx: RoutingContext<&mut zenoh_protocol::network::Declare>) -> bool {
+        false
+    }
+    fn send_push(
+        &self,
+        _msg: &mut zenoh_protocol::network::Push,
+        _reliability: Reliability,
+    ) -> bool {
+        std::thread::sleep(self.delay);
+        self.saw_push
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        false
+    }
+    fn send_request(&self, _msg: &mut zenoh_protocol::network::Request) -> bool {
+        false
+    }
+    fn send_response(&self, _msg: &mut zenoh_protocol::network::Response) -> bool {
+        false
+    }
+    fn send_response_final(&self, _msg: &mut zenoh_protocol::network::ResponseFinal) -> bool {
+        false
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl EPrimitives for ClientPrimitives {
     fn send_interest(&self, _ctx: RoutingContext<&mut zenoh_protocol::network::Interest>) -> bool {
         false
@@ -1050,4 +1129,142 @@ fn big_key_expr() {
     root.get_best_key(&key_expr, face.state.id);
     res.get_best_key("/a", face.state.id + 1);
     Resource::get_matches(&face.tables.tables.read().unwrap().data, &key_expr);
+}
+
+/// Deterministic microbench for the publisher fan-out path.
+///
+/// Builds N=24 destination faces — K=6 of them use `SlowPrimitives` with a
+/// 200 ms artificial delay in `send_push` (simulating a back-pressured
+/// peer's pipeline). Calls `route_data` once and measures wall time.
+///
+///   - With the upstream serial fan-out: 6 × 200 ms ≈ 1.2 s
+///   - With concurrent fan-out (#9):    ≈ 200 ms (max across destinations)
+///
+/// This reproduces the architectural issue behind issue #2581's 30-second
+/// `publisher.put().wait()` outliers without needing a live transport or
+/// a specific host state. Marked `#[ignore]` because the slow path takes
+/// >1 s; run with `cargo test --release route_data_parallel_fanout_microbench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn route_data_parallel_fanout_microbench() {
+    use std::time::{Duration, Instant};
+
+    let router = new_router();
+    let tables_lock = router.tables.clone();
+    let sub_info = SubscriberInfo;
+
+    // Sender face — single fast publisher.
+    let primitives_src = Arc::new(ClientPrimitives::new());
+    let face_src = router.new_session(primitives_src.clone());
+    register_expr(
+        &tables_lock,
+        &mut face_src.state.clone(),
+        11,
+        &"microbench".into(),
+    );
+    Primitives::send_declare(
+        primitives_src.as_ref(),
+        &mut Declare {
+            interest_id: None,
+            ext_qos: ext::QoSType::DECLARE,
+            ext_tstamp: None,
+            ext_nodeid: ext::NodeIdType::DEFAULT,
+            body: DeclareBody::DeclareKeyExpr(DeclareKeyExpr {
+                id: 11,
+                wire_expr: "microbench".into(),
+            }),
+        },
+    );
+
+    const N_TOTAL: usize = 24;
+    const N_SLOW: usize = 6;
+    const SLOW_DELAY: Duration = Duration::from_millis(200);
+    let mut slow_handles: Vec<Arc<SlowPrimitives>> = Vec::with_capacity(N_SLOW);
+    let mut fast_handles: Vec<Arc<ClientPrimitives>> = Vec::with_capacity(N_TOTAL - N_SLOW);
+
+    for i in 0..N_TOTAL {
+        if i < N_SLOW {
+            let p = Arc::new(SlowPrimitives::new(SLOW_DELAY));
+            let face = router.new_session(p.clone());
+            face.declare_subscriber(
+                0,
+                &"microbench/**".into(),
+                &sub_info,
+                NodeId::default(),
+                &mut |p, m| {
+                    m.with_mut(|m| {
+                        p.send_declare(m);
+                    })
+                },
+            );
+            slow_handles.push(p);
+        } else {
+            let p = Arc::new(ClientPrimitives::new());
+            let face = router.new_session(p.clone());
+            face.declare_subscriber(
+                0,
+                &"microbench/**".into(),
+                &sub_info,
+                NodeId::default(),
+                &mut |p, m| {
+                    m.with_mut(|m| {
+                        p.send_declare(m);
+                    })
+                },
+            );
+            fast_handles.push(p);
+        }
+    }
+
+    // Warm up: prime data routes so the first put doesn't pay the
+    // route-cache-miss cost. Use a separate key so the warm-up doesn't
+    // hit our slow destinations.
+    route_data(
+        &tables_lock,
+        &face_src.state.clone(),
+        &mut Push {
+            wire_expr: "microbench/warmup".into(),
+            ..Put::default().into()
+        },
+        Reliability::Reliable,
+        true,
+    );
+
+    // Actual measurement.
+    let start = Instant::now();
+    route_data(
+        &tables_lock,
+        &face_src.state.clone(),
+        &mut Push {
+            wire_expr: "microbench/x".into(),
+            ..Put::default().into()
+        },
+        Reliability::Reliable,
+        true,
+    );
+    let elapsed = start.elapsed();
+
+    let serial_lower_bound = SLOW_DELAY * (N_SLOW as u32);
+    let parallel_lower_bound = SLOW_DELAY;
+
+    println!(
+        "route_data fan-out to {N_TOTAL} dests ({N_SLOW} slow @ {SLOW_DELAY:?}): elapsed {elapsed:?}"
+    );
+    println!("  serial lower bound:   {serial_lower_bound:?}");
+    println!("  parallel lower bound: {parallel_lower_bound:?}");
+    println!(
+        "  slow destinations actually received: {}",
+        slow_handles
+            .iter()
+            .map(|p| p.push_count())
+            .sum::<usize>()
+    );
+
+    // Either path should deliver to every slow destination at least once.
+    for (i, slow) in slow_handles.iter().enumerate() {
+        assert!(
+            slow.push_count() >= 1,
+            "slow destination {i} did not receive any push"
+        );
+    }
 }
