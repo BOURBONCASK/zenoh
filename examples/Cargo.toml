@@ -142,6 +142,10 @@ name = "z_pub_thr"
 path = "examples/z_pub_thr.rs"
 
 [[example]]
+name = "z_p2p_declare_final_stress"
+path = "examples/z_p2p_declare_final_stress.rs"
+
+[[example]]
 name = "z_sub_thr"
 path = "examples/z_sub_thr.rs"
 
