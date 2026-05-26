@@ -13,6 +13,9 @@
 //
 mod demux;
 mod mux;
+mod queueing;
+
+pub(crate) use queueing::{enabled as per_face_queue_enabled, QueueingPrimitives};
 
 use std::any::Any;
 

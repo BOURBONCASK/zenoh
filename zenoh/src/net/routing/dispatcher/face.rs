@@ -153,6 +153,17 @@ impl FaceStateBuilder {
         primitives: Arc<dyn EPrimitives + Send + Sync>,
         hats: RegionMap<Box<dyn Any + Send + Sync>>,
     ) -> Self {
+        // If `ZENOH_PER_FACE_QUEUE` is enabled, wrap the destination
+        // primitives in a per-face queue + worker so that a slow consumer
+        // does not stall this face's dispatch and (transitively) all other
+        // faces' deliveries during the same `route_data` call. See
+        // `zenoh/src/net/primitives/queueing.rs` for the rationale.
+        let primitives: Arc<dyn EPrimitives + Send + Sync> =
+            if crate::net::primitives::per_face_queue_enabled() {
+                Arc::new(crate::net::primitives::QueueingPrimitives::new(primitives))
+            } else {
+                primitives
+            };
         FaceStateBuilder(FaceState {
             id,
             zid,
