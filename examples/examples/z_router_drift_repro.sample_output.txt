@@ -1,0 +1,79 @@
+[setup] router_a listen=tcp/127.0.0.1:17447  router_b listen=tcp/127.0.0.1:17448 connect=tcp/127.0.0.1:17447
+[setup] N=1000  M_pub=10@50Hz  probe=4Hz
+[setup] router_a zid=1c9b0d894f69ede88f90e5924b0bc2df
+[setup] router_b zid=9acad27817a3df19feeede4bcc3e062b
+[setup] client_pub zid=3e2077d07b28d7f61ca9e09cf6badaaf
+[setup] client_sub zid=25700dae2608c50031e7c8d72697cb93
+[setup] client_pub declaring 1000 queryables + 1000 liveliness tokens
+[setup] client_sub declaring 10 data subscribers
+[setup] 10 publishers started, total nominal data rate = 500 samples/s
+[setup] waiting 3s for linkstate to propagate
+...
+[steady-state samples, abridged]
+[flap 07:51:58.963] tick=121 dropping router_b session for 3000 ms (flap #1)
+[flap 07:52:01.983] tick=133 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 07:52:32.204] tick=252 dropping router_b session for 3000 ms (flap #2)
+[flap 07:52:35.226] tick=264 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 07:53:05.436] tick=383 dropping router_b session for 3000 ms (flap #3)
+[flap 07:53:08.458] tick=395 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 07:53:38.702] tick=514 dropping router_b session for 3000 ms (flap #4)
+[flap 07:53:41.723] tick=526 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 07:54:11.935] tick=645 dropping router_b session for 3000 ms (flap #5)
+[flap 07:54:14.955] tick=657 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 07:54:45.160] tick=776 dropping router_b session for 3000 ms (flap #6)
+[flap 07:54:48.181] tick=788 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 07:55:18.396] tick=907 dropping router_b session for 3000 ms (flap #7)
+[flap 07:55:21.416] tick=919 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+...
+[mid-experiment around flap #2]
+[flap 07:52:32.204] tick=252 dropping router_b session for 3000 ms (flap #2)
+[2m2026-05-26T07:52:32.205034Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0m8384d849dbf4ee647b7c972f9d3516ae
+[2m2026-05-26T07:52:32.206740Z[0m [31mERROR[0m main ThreadId(01) [2mzenoh::api::admin[0m[2m:[0m Unable to publish transport event: session closed
+[2m2026-05-26T07:52:32.228670Z[0m [31mERROR[0m main ThreadId(01) [2mzenoh::api::admin[0m[2m:[0m Unable to publish transport event: session closed
+[07:52:32.235] t=  252 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=   442 miss/s=    0  FLAP
+[07:52:32.468] t=  253 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:32.713] t=  254 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:32.967] t=  255 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:33.219] t=  256 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:33.470] t=  257 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:33.723] t=  258 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:33.975] t=  259 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:34.227] t=  260 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:34.473] t=  261 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:34.729] t=  262 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[07:52:34.982] t=  263 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[flap 07:52:35.226] tick=264 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[2m2026-05-26T07:52:35.226198Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::net::runtime[0m[2m:[0m Using ZID: b5d46099fd14bbbe9af12e420f0b307c
+[2m2026-05-26T07:52:35.226621Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::net::runtime::orchestrator[0m[2m:[0m Zenoh can be reached at: tcp/127.0.0.1:17448
+[07:52:35.733] t=  264 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:35.739] t=  265 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:35.993] t=  266 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:36.242] t=  267 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:36.494] t=  268 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:36.748] t=  269 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:36.999] t=  270 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:37.249] t=  271 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:37.503] t=  272 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:37.751] t=  273 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:38.006] t=  274 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:38.258] t=  275 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:38.507] t=  276 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:38.762] t=  277 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:39.013] t=  278 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[07:52:39.309] t=  279 N= 1000 ok=1000 to=   0 p50=   32ms p99=   46ms  pub_recv/s=   169 miss/s=11833  STEADY
+...
+[end of run]
+========== SUMMARY ==========
+duration:                         240 s
+N (queryables + tokens):         1000
+M (publishers/subscribers):        10  @ 50 Hz
+flaps triggered:                    7
+probes ok:                     773000
+probes timeout:                174000
+probe timeout rate:            18.37%
+queryable callbacks served:    773000
+data samples received:          98988
+data samples missed (gap):      22620
+data loss:                     18.60%
+longest continuous outage:       6.81 s
+===============================

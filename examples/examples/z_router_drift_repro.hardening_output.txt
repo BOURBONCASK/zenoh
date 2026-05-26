@@ -1,0 +1,79 @@
+[setup] router_a listen=tcp/127.0.0.1:17447  router_b listen=tcp/127.0.0.1:17448 connect=tcp/127.0.0.1:17447
+[setup] N=1000  M_pub=10@50Hz  probe=4Hz
+[setup] router_a zid=2eb4a6a3f2d7038e2a0e4211515b31d
+[setup] router_b zid=f29e40fb31d872701ccf2ab8a23df967
+[setup] client_pub zid=ae9485c4549678eb2509d964c76cc933
+[setup] client_sub zid=8cd858ec532a90ab09a60394fc6e7940
+[setup] client_pub declaring 1000 queryables + 1000 liveliness tokens
+[setup] client_sub declaring 10 data subscribers
+[setup] 10 publishers started, total nominal data rate = 500 samples/s
+[setup] waiting 3s for linkstate to propagate
+...
+[flap markers]
+[flap 08:07:56.770] tick=121 dropping router_b session for 3000 ms (flap #1)
+[flap 08:07:59.793] tick=133 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 08:08:30.005] tick=252 dropping router_b session for 3000 ms (flap #2)
+[flap 08:08:33.027] tick=264 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 08:09:03.239] tick=383 dropping router_b session for 3000 ms (flap #3)
+[flap 08:09:06.260] tick=395 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 08:09:36.476] tick=514 dropping router_b session for 3000 ms (flap #4)
+[flap 08:09:39.497] tick=526 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 08:10:09.703] tick=645 dropping router_b session for 3000 ms (flap #5)
+[flap 08:10:12.723] tick=657 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 08:10:42.936] tick=776 dropping router_b session for 3000 ms (flap #6)
+[flap 08:10:45.956] tick=788 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+[flap 08:11:16.171] tick=907 dropping router_b session for 3000 ms (flap #7)
+[flap 08:11:19.192] tick=919 re-opening router_b — will trigger new_transport_unicast_face → schedule_compute_trees on both sides
+...
+[mid-experiment around flap #2]
+[08:08:30.028] t=  252 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=   472 miss/s=    0  FLAP
+[08:08:30.263] t=  253 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:30.514] t=  254 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:30.768] t=  255 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:31.020] t=  256 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:31.269] t=  257 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:31.524] t=  258 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:31.772] t=  259 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:32.024] t=  260 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:32.276] t=  261 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:32.531] t=  262 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:32.781] t=  263 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  FLAP
+[08:08:33.536] t=  264 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:33.541] t=  265 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:33.794] t=  266 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:34.047] t=  267 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:34.299] t=  268 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:34.551] t=  269 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:34.800] t=  270 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:35.052] t=  271 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:35.305] t=  272 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:35.557] t=  273 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:35.805] t=  274 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:36.059] t=  275 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:36.311] t=  276 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:36.561] t=  277 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:36.815] t=  278 N= 1000 ok=   0 to=1000 p50=    0ms p99=    0ms  pub_recv/s=     0 miss/s=    0  RECOVER
+[08:08:37.102] t=  279 N= 1000 ok=1000 to=   0 p50=   23ms p99=   36ms  pub_recv/s=   139 miss/s=12172  STEADY
+[08:08:37.354] t=  280 N= 1000 ok=1000 to=   0 p50=   19ms p99=   33ms  pub_recv/s=   517 miss/s=    0  STEADY
+[08:08:37.600] t=  281 N= 1000 ok=1000 to=   0 p50=   20ms p99=   28ms  pub_recv/s=   487 miss/s=    0  STEADY
+[08:08:37.865] t=  282 N= 1000 ok=1000 to=   0 p50=   28ms p99=   42ms  pub_recv/s=   527 miss/s=    0  STEADY
+[08:08:38.103] t=  283 N= 1000 ok=1000 to=   0 p50=   16ms p99=   28ms  pub_recv/s=   500 miss/s=    0  STEADY
+[08:08:38.360] t=  284 N= 1000 ok=1000 to=   0 p50=   23ms p99=   35ms  pub_recv/s=   470 miss/s=    0  STEADY
+[08:08:38.611] t=  285 N= 1000 ok=1000 to=   0 p50=   18ms p99=   31ms  pub_recv/s=   517 miss/s=    0  STEADY
+[08:08:38.868] t=  286 N= 1000 ok=1000 to=   0 p50=   25ms p99=   39ms  pub_recv/s=   505 miss/s=    0  STEADY
+...
+[end of run]
+========== SUMMARY ==========
+duration:                         240 s
+N (queryables + tokens):         1000
+M (publishers/subscribers):        10  @ 50 Hz
+flaps triggered:                    7
+probes ok:                     758000
+probes timeout:                189000
+probe timeout rate:            19.96%
+queryable callbacks served:    758000
+data samples received:          97030
+data samples missed (gap):      24570
+data loss:                     20.21%
+longest continuous outage:       6.80 s
+===============================

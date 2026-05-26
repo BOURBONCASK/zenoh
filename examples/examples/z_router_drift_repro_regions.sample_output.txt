@@ -1,0 +1,107 @@
+====================================================================
+Regions A/B: flap_which=cloud (surgical drop of cloud router)
+  Tests whether QUIC-side jitter leaks into ROS path on s100.
+====================================================================
+
+----- regions OFF (auto preset on all routers; 1.9 default) -----
+========== SUMMARY ==========
+use_regions:                       false
+duration:                         130 s
+flap_which:                     cloud
+flaps triggered:                    4
+---- ROS axis (ros_probe → ros_pub, in-region on s100) ----
+ros probes ok:                 256500
+ros probes timeout:                 0
+ros probe timeout rate:          0.00%
+longest ROS outage:               0.00 s
+---- Aorta axis (aorta_pub on cloud → aorta_sub on s100) ----
+aorta samples received:         53380
+aorta samples missed (gap):     14230
+aorta data loss:                21.05%
+longest aorta outage:             7.07 s
+---- Cross-axis spillover (the regions test) ----
+ticks with ros outage only:         0
+ticks with aorta outage only:     108
+ticks with both outage:             0
+===============================
+[2m2026-05-26T09:08:12.529611Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0mb73519db91726afda3b48f16d814e632
+[2m2026-05-26T09:08:12.529932Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0mcce3d8197734feab902d296adcc93cd4
+
+----- regions ON (explicit region_name + gateway.south on x5) -----
+========== SUMMARY ==========
+use_regions:                       true
+duration:                         130 s
+flap_which:                     cloud
+flaps triggered:                    4
+---- ROS axis (ros_probe → ros_pub, in-region on s100) ----
+ros probes ok:                 256500
+ros probes timeout:                 0
+ros probe timeout rate:          0.00%
+longest ROS outage:               0.00 s
+---- Aorta axis (aorta_pub on cloud → aorta_sub on s100) ----
+aorta samples received:         53380
+aorta samples missed (gap):     14220
+aorta data loss:                21.04%
+longest aorta outage:             7.07 s
+---- Cross-axis spillover (the regions test) ----
+ticks with ros outage only:         0
+ticks with aorta outage only:     108
+ticks with both outage:             0
+===============================
+[2m2026-05-26T09:11:19.653332Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0m4d604051a74d326fe1eab712de08ed25
+[2m2026-05-26T09:11:19.653913Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0mc9eee3709bff968d97f0509e074588df
+
+====================================================================
+Regions A/B: flap_which=s100 (drop the local-mesh router itself)
+  Note: this also kills ROS clients (they attach to s100), so the
+  outage here is *client reconnect*, not router-router SPF storm.
+  Don't read regions effect from this case.
+====================================================================
+
+----- regions OFF -----
+========== SUMMARY ==========
+use_regions:                       false
+duration:                         130 s
+flap_which:                     s100
+flaps triggered:                    4
+---- ROS axis (ros_probe → ros_pub, in-region on s100) ----
+ros probes ok:                 202500
+ros probes timeout:             54000
+ros probe timeout rate:         21.05%
+longest ROS outage:               7.05 s
+---- Aorta axis (aorta_pub on cloud → aorta_sub on s100) ----
+aorta samples received:         16015
+aorta samples missed (gap):      4260
+aorta data loss:                21.01%
+longest aorta outage:             7.05 s
+---- Cross-axis spillover (the regions test) ----
+ticks with ros outage only:         4
+ticks with aorta outage only:       4
+ticks with both outage:           104
+===============================
+[2m2026-05-26T08:52:57.180902Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0m11fbdec2f25982500ec211db998d02d6
+[2m2026-05-26T08:52:57.181399Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0mda9445ad1531a40014d7ad287066937d
+
+----- regions ON -----
+========== SUMMARY ==========
+use_regions:                       true
+duration:                         130 s
+flap_which:                     s100
+flaps triggered:                    4
+---- ROS axis (ros_probe → ros_pub, in-region on s100) ----
+ros probes ok:                 202500
+ros probes timeout:             54000
+ros probe timeout rate:         21.05%
+longest ROS outage:               7.05 s
+---- Aorta axis (aorta_pub on cloud → aorta_sub on s100) ----
+aorta samples received:         15997
+aorta samples missed (gap):      4273
+aorta data loss:                21.08%
+longest aorta outage:             7.05 s
+---- Cross-axis spillover (the regions test) ----
+ticks with ros outage only:         4
+ticks with aorta outage only:       4
+ticks with both outage:           104
+===============================
+[2m2026-05-26T08:56:17.904887Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0m9312587759a9e4b5027088367a1746cd
+[2m2026-05-26T08:56:17.905214Z[0m [32m INFO[0m main ThreadId(01) [2mzenoh::api::session[0m[2m:[0m close session [3mzid[0m[2m=[0m7105fadcfd756de66cde6d78a408d06
