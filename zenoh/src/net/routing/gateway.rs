@@ -13,7 +13,7 @@
 //
 use std::{
     str::FromStr,
-    sync::{atomic::Ordering, Arc, Mutex, RwLock},
+    sync::{atomic::Ordering, Arc, RwLock},
 };
 
 use arc_swap::ArcSwapOption;
@@ -190,8 +190,11 @@ impl<'conf> GatewayBuilder<'conf> {
 
         Ok(Gateway {
             tables: Arc::new(TablesLock {
-                tables: RwLock::new(Tables { data, hats }),
-                ctrl_lock: Mutex::new(()),
+                tables: crate::net::routing::dispatcher::lock_compat::PlRwLock::new(Tables {
+                    data,
+                    hats,
+                }),
+                ctrl_lock: crate::net::routing::dispatcher::lock_compat::PlMutex::new(()),
                 queries_lock: RwLock::new(()),
             }),
         })

@@ -98,6 +98,7 @@ json5 = { workspace = true }
 lazy_static = { workspace = true }
 nonempty-collections = { workspace = true }
 once_cell = { workspace = true }
+parking_lot = { workspace = true }
 petgraph = { workspace = true }
 phf = { workspace = true }
 rand = { workspace = true, features = ["default"] }

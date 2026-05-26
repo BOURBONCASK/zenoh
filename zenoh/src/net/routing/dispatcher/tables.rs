@@ -18,11 +18,12 @@ use std::{
     fmt::Debug,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, RwLock,
     },
     time::Duration,
 };
 
+use super::lock_compat::{PlMutex, PlRwLock};
 use uhlc::HLC;
 use zenoh_config::{unwrap_or_default, Config};
 use zenoh_keyexpr::keyexpr;
@@ -263,8 +264,14 @@ impl TablesData {
 }
 
 pub struct TablesLock {
-    pub tables: RwLock<Tables>,
-    pub(crate) ctrl_lock: Mutex<()>,
+    /// Routing tables lock. Backed by `parking_lot::RwLock` (via the
+    /// `PlRwLock` wrapper) to avoid the writer-priority starvation observed
+    /// in `std::sync::RwLock` under sustained p2p churn (issue #2581). The
+    /// wrapper preserves the std-style `LockResult` API so existing
+    /// `zread!` / `zwrite!` macros keep compiling. See `lock_compat` for
+    /// the semantic differences vs. `std::sync`.
+    pub tables: PlRwLock<Tables>,
+    pub(crate) ctrl_lock: PlMutex<()>,
     pub(crate) queries_lock: RwLock<()>,
 }
 

@@ -20,6 +20,7 @@
 pub mod face;
 pub mod interests;
 pub mod local_resources;
+pub mod lock_compat;
 pub mod pubsub;
 pub mod queries;
 pub mod region;
