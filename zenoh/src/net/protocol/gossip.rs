@@ -409,11 +409,18 @@ impl Gossip {
             }
         }
         if (!self.wait_declares) || src_whatami != WhatAmI::Peer {
-            zenoh_runtime::ZRuntime::Net.block_in_place(
-                strong_runtime
+            // Terminate off the routing critical section: this runs inside handle_oam with
+            // ctrl_lock + tables WRITE held, so block_in_place (donating the worker while
+            // holding the write lock) convoys every route_data/route_query reader behind it.
+            // Fire-and-forget on the runtime, matching the autoconnect branch above and the
+            // interests.rs fix. (Parity with the earlier two-site fix in 53192428a.)
+            let runtime = strong_runtime.clone();
+            strong_runtime.spawn(async move {
+                runtime
                     .start_conditions()
-                    .terminate_peer_connector_zid(src),
-            );
+                    .terminate_peer_connector_zid(src)
+                    .await;
+            });
         }
     }
 
