@@ -126,10 +126,12 @@ pub enum ZRuntime {
     #[param(worker_threads = 1)]
     Net,
 
-    /// Recovery pool for transport teardown (UNRESPONSIVE close / del_link), isolated from the
-    /// RX/Net pools it is meant to free so recovery never competes with routing. Default: 2.
+    /// Recovery pool for the UNRESPONSIVE transport close spawned from the TX congestion path,
+    /// isolated from the RX/Net pools it is meant to free so recovery never competes with
+    /// routing. Note: each close drains links serially, so size for the worst-case concurrent
+    /// condemn fan-out during a reconnect herd. Default: 4.
     #[serde(rename = "reaper")]
-    #[param(worker_threads = 2)]
+    #[param(worker_threads = 4)]
     Reaper,
 }
 
