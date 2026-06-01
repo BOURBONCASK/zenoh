@@ -694,6 +694,7 @@ impl TransmissionPipeline {
     ) -> (TransmissionPipelineProducer, TransmissionPipelineConsumer) {
         let status = Arc::new(TransmissionPipelineStatus {
             disabled: AtomicBool::new(false),
+            condemned: AtomicBool::new(false),
             congested: AtomicU8::new(0),
             pending: AtomicU8::new(0),
             waits: Waits {
@@ -808,6 +809,10 @@ impl TransmissionPipeline {
 struct TransmissionPipelineStatus {
     // The whole pipeline is enabled or disabled
     disabled: AtomicBool,
+    // The link has been condemned (UNRESPONSIVE): a non-droppable push exhausted its full
+    // wait_before_close and the transport is being torn down. Sticky (never auto-reset); the
+    // pipeline is recreated per-link, so a reconnected link gets a fresh (false) flag.
+    condemned: AtomicBool,
     // Bitflags to indicate the given priority queue is congested
     congested: AtomicU8,
     // Bitflags to indicate the given priority queue has messages waiting to be sent
@@ -824,6 +829,16 @@ impl TransmissionPipelineStatus {
 
     fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Relaxed)
+    }
+
+    // Returns true exactly once, for the false->true transition (so the caller can
+    // spawn the close + wake parked producers exactly once).
+    fn condemn(&self) -> bool {
+        !self.condemned.swap(true, Ordering::SeqCst)
+    }
+
+    fn is_condemned(&self) -> bool {
+        self.condemned.load(Ordering::Relaxed)
     }
 
     fn set_congested(&self, priority: Priority, status: bool) {
@@ -867,6 +882,16 @@ pub(crate) struct TransmissionPipelineProducer {
 }
 
 impl TransmissionPipelineProducer {
+    // Condemn this link (UNRESPONSIVE): returns true exactly once (false->true transition).
+    // Subsequent `push_network_message` calls fast-fail via the check in `internal_schedule`.
+    pub(crate) fn condemn(&self) -> bool {
+        self.status.condemn()
+    }
+
+    pub(crate) fn is_condemned(&self) -> bool {
+        self.status.is_condemned()
+    }
+
     #[inline]
     pub(crate) fn push_network_message(
         &self,
@@ -1424,6 +1449,73 @@ mod tests {
             timeout(TIMEOUT, h2).await??;
         }
 
+        Ok(())
+    }
+
+    // condemn() is a one-shot latch (false->true exactly once); internal_schedule reads it to
+    // fast-fail new pushes to a transport already being torn down (UNRESPONSIVE), so they never
+    // build a fresh Deadline / re-pay wait_before_close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn condemn_is_one_shot_latch() -> ZResult<()> {
+        let tct = TransportPriorityTx::make(Bits::from(TransportSn::MAX))?;
+        let priorities = vec![tct];
+        let (producer, _consumer) =
+            TransmissionPipeline::make(CONFIG_NOT_STREAMED, priorities.as_slice(), false);
+        assert!(!producer.is_condemned());
+        assert!(producer.condemn(), "first condemn should transition false->true");
+        assert!(!producer.condemn(), "second condemn should be a no-op");
+        assert!(producer.is_condemned());
+        Ok(())
+    }
+
+    // #1855 preserved: when NOT condemned, a Block (non-droppable) push on a full queue must still
+    // wait its full `wait_before_close` budget before being dropped — the condemned fast-path must
+    // be gated strictly on the condemned flag and must not fast-fail steady-state Block traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn block_push_keeps_full_budget_when_not_condemned() -> ZResult<()> {
+        const WBC: Duration = Duration::from_millis(300);
+        const CONFIG: TransmissionPipelineConf = TransmissionPipelineConf {
+            batch: BatchConfig {
+                mtu: BatchSize::MAX,
+                is_streamed: false,
+                #[cfg(feature = "transport_compression")]
+                is_compression: false,
+            },
+            queue_size: [1; Priority::NUM],
+            batching_enabled: true,
+            wait_before_drop: Duration::from_millis(1),
+            max_wait_before_drop_fragments: Duration::from_millis(1024),
+            wait_before_close: WBC,
+            batching_time_limit: Duration::from_micros(1),
+            queue_alloc: QueueAllocConf {
+                mode: QueueAllocMode::Init,
+            },
+        };
+        let tct = TransportPriorityTx::make(Bits::from(TransportSn::MAX))?;
+        let priorities = vec![tct];
+        let (producer, _consumer) =
+            TransmissionPipeline::make(CONFIG, priorities.as_slice(), false);
+
+        let h = task::spawn_blocking(move || {
+            let payload_size = (CONFIG.batch.mtu / 2) as usize;
+            let message = NetworkMessage::from(Push {
+                wire_expr: "test".into(),
+                ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, false),
+                ..Push::from(vec![0_u8; payload_size])
+            });
+            producer.push_network_message(message.as_ref()).unwrap();
+            let start = Instant::now();
+            let r = producer.push_network_message(message.as_ref());
+            (r, start.elapsed())
+        });
+
+        // Never condemn.
+        let (r, elapsed) = timeout(Duration::from_secs(5), h).await??;
+        assert!(matches!(r, Ok(false)), "expected Ok(false) after budget, got {r:?}");
+        assert!(
+            elapsed >= WBC / 2,
+            "Block push should wait ~wait_before_close ({WBC:?}) when not condemned, waited {elapsed:?}"
+        );
         Ok(())
     }
 
