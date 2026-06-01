@@ -831,8 +831,9 @@ impl TransmissionPipelineStatus {
         self.disabled.load(Ordering::Relaxed)
     }
 
-    // Returns true exactly once, for the false->true transition (so the caller can
-    // spawn the close + wake parked producers exactly once).
+    // Returns true exactly once, for the false->true transition (so the caller spawns the
+    // UNRESPONSIVE close exactly once). New pushes then fast-fail in internal_schedule; a
+    // producer already parked at condemn time drains within wait_before_close.
     fn condemn(&self) -> bool {
         !self.condemned.swap(true, Ordering::SeqCst)
     }
