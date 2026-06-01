@@ -22,6 +22,7 @@ use zenoh_protocol::{
 use zenoh_result::ZResult;
 
 use super::transport::TransportUnicastUniversal;
+use crate::common::pipeline::TransmissionPipelineProducer;
 #[cfg(feature = "shared-memory")]
 use crate::shm::map_zmsg_to_partner;
 use crate::unicast::transport_unicast_inner::TransportUnicastTrait;
@@ -74,27 +75,35 @@ impl TransportUnicastUniversal {
 
     fn handle_push_result(
         &self,
+        pipeline: &TransmissionPipelineProducer,
         msg: NetworkMessageRef,
         pushed: bool,
         #[cfg(feature = "stats")] stats: zenoh_stats::LinkStats,
     ) {
         if !pushed && !msg.is_droppable() {
-            tracing::error!(
-                "Unable to push non droppable network message to {}. Closing transport!",
-                self.config.zid
-            );
-            zenoh_runtime::ZRuntime::RX.spawn({
-                let transport = self.clone();
-                async move {
-                    if let Err(e) = transport.close(close::reason::UNRESPONSIVE).await {
-                        tracing::error!(
-                            "Error closing transport with {}: {}",
-                            transport.config.zid,
-                            e
-                        );
+            // Condemn this link exactly once. Subsequent pushes then fast-fail in
+            // `internal_schedule` (the continuous churn) instead of each re-paying
+            // wait_before_close. Producers already parked at condemn time (at most one per
+            // priority) drain naturally within wait_before_close. The close runs on the
+            // dedicated Reaper pool so recovery never competes with the RX routing pool.
+            if pipeline.condemn() {
+                tracing::error!(
+                    "Unable to push non droppable network message to {}. Condemning and closing transport!",
+                    self.config.zid
+                );
+                zenoh_runtime::ZRuntime::Reaper.spawn({
+                    let transport = self.clone();
+                    async move {
+                        if let Err(e) = transport.close(close::reason::UNRESPONSIVE).await {
+                            tracing::error!(
+                                "Error closing transport with {}: {}",
+                                transport.config.zid,
+                                e
+                            );
+                        }
                     }
-                }
-            });
+                });
+            }
         }
         #[cfg(feature = "stats")]
         if pushed {
@@ -157,6 +166,15 @@ impl TransportUnicastUniversal {
         #[cfg(feature = "stats")]
         let stats = transport_link.stats.clone();
 
+        // Fast-fail on a condemned link: do not build a fresh Deadline / re-pay wait_before_close
+        // for a transport already being torn down (UNRESPONSIVE). Applies to droppable and
+        // non-droppable alike, and covers the BlockFirst path below.
+        if pipeline.is_condemned() {
+            #[cfg(feature = "stats")]
+            stats.tx_observe_congestion(msg);
+            return Ok(false);
+        }
+
         #[cfg(feature = "unstable")]
         if msg.congestion_control() == CongestionControl::BlockFirst {
             let priority = msg.priority();
@@ -176,6 +194,7 @@ impl TransportUnicastUniversal {
                 let msg = msg.as_ref();
                 if let Ok(pushed) = pipeline.push_network_message(msg) {
                     transport.handle_push_result(
+                        &pipeline,
                         msg,
                         pushed,
                         #[cfg(feature = "stats")]
@@ -195,6 +214,7 @@ impl TransportUnicastUniversal {
 
         let pushed = pipeline.push_network_message(msg)?;
         self.handle_push_result(
+            &pipeline,
             msg,
             pushed,
             #[cfg(feature = "stats")]
