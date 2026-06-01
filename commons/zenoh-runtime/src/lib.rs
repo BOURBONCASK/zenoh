@@ -125,6 +125,12 @@ pub enum ZRuntime {
     #[serde(rename = "net")]
     #[param(worker_threads = 1)]
     Net,
+
+    /// Recovery pool for transport teardown (UNRESPONSIVE close / del_link), isolated from the
+    /// RX/Net pools it is meant to free so recovery never competes with routing. Default: 2.
+    #[serde(rename = "reaper")]
+    #[param(worker_threads = 2)]
+    Reaper,
 }
 
 impl ZRuntime {
