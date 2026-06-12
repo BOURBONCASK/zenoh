@@ -27,10 +27,10 @@ use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     EndpointConfig,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use tokio_util::sync::CancellationToken;
 use zenoh_config::{EndPoint, Locator};
-use zenoh_core::zerror;
+use zenoh_core::{zconfigurable, zerror};
 use zenoh_protocol::core::{Metadata, Priority};
 use zenoh_result::ZResult;
 
@@ -45,6 +45,29 @@ use crate::{
     },
     LinkUnicast, NewLinkChannelSender,
 };
+
+zconfigurable! {
+    // Cap on quinn's pending (un-accepted) incoming connections. Each pending
+    // Incoming holds 4 rustls initial_keys boxes + the buffered first Initial;
+    // quinn's default (65536) lets a slow/overwhelmed accept loop accumulate
+    // hundreds of MB that are reclaimed only lazily. Excess Initials beyond this
+    // cap are cheaply refused by quinn before any key derivation or buffering.
+    static ref QUIC_MAX_INCOMING: usize = 1024;
+    // Byte cap for datagrams buffered on behalf of pending incoming connections
+    // (mostly client Initial retransmits). quinn default: 100 MiB.
+    static ref QUIC_INCOMING_BUFFER_TOTAL_BYTES: u64 = 33554432;
+    // Upper bound on the post-handshake admission steps (first bi-stream accept,
+    // ALPN read, link build). Without it a single client that completes the QUIC
+    // handshake but never opens its stream wedges the whole serial accept loop.
+    static ref QUIC_ACCEPT_CONNECTION_TIMEOUT_MS: u64 = 10000;
+    // Upper bound on concurrently-running handshakes per listener. Handshakes are
+    // await-bound (CPU stays idle on this path), so this bounds the peak state of
+    // in-flight admissions, NOT CPU. The new-link channel to the transport manager
+    // is unbounded (flume), so this is the only admission backpressure; it must
+    // stay <= transport unicast accept_pending so shedding happens here (cheap
+    // pre-handshake ignore()) rather than in the manager (post-handshake close).
+    static ref QUIC_MAX_INFLIGHT_HANDSHAKES: usize = 512;
+}
 
 #[derive(Clone)]
 pub struct QuicConnection {
@@ -348,6 +371,8 @@ impl<F: AcceptorCallback> QuicServer<F> {
                 .configure_max_concurrent_streams(streams_conf.as_ref())
                 .configure_mtu(&QuicMtuConfig::try_from(&epconf)?);
         }
+        server_config.max_incoming(*QUIC_MAX_INCOMING);
+        server_config.incoming_buffer_size_total(*QUIC_INCOMING_BUFFER_TOTAL_BYTES);
         // Initialize the Endpoint
         let quic_endpoint = async {
             let socket = QuicSocketConfig::new(&epconf)
@@ -576,59 +601,81 @@ pub struct QuicAcceptor<F: AcceptorCallback> {
 
 impl<F: AcceptorCallback> QuicAcceptor<F> {
     pub async fn accept_task(self) -> ZResult<()> {
-        async fn accept_connection(acceptor: quinn::Accept<'_>) -> ZResult<quinn::Connection> {
-            let qc = acceptor
-                .await
-                .ok_or_else(|| zerror!("Can not accept QUIC connections: acceptor closed"))?;
-
-            let conn = qc
-                .await
-                .map_err(|e| zerror!("QUIC acceptor failed: {:?}", e))?;
-
-            Ok(conn)
-        }
-
         let src_addr = self
             .quic_endpoint
             .local_addr()
             .map_err(|e| zerror!("Cannot start QUIC acceptor: {:?}", e))?;
 
+        // `make_link` is only `Fn + Send + Sync` (not `Clone`), so the whole
+        // acceptor is shared across per-connection tasks behind an `Arc`.
+        let this = Arc::new(self);
+        // The new-link channel to the transport manager is unbounded (flume), so
+        // this semaphore is the only admission backpressure: it bounds concurrent
+        // in-flight handshakes and the per-connection state they hold.
+        let permits = Arc::new(Semaphore::new(*QUIC_MAX_INFLIGHT_HANDSHAKES));
+
         tracing::trace!("Ready to accept QUIC connections on: {:?}", src_addr);
 
         loop {
             tokio::select! {
-                _ = self.inner.token.cancelled() => break,
+                _ = this.inner.token.cancelled() => break,
 
-                res = accept_connection(self.quic_endpoint.accept()) => {
-                    match res {
-                        Ok(quic_conn) => {
-                            let link = match self.handle_accepted_connection(quic_conn, &src_addr).await {
-                                Ok(link) => link,
-                                Err(e) => {
-                                    tracing::error!("Cannot accept QUIC connection: {e:?}");
-                                    continue;
+                incoming = this.quic_endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        // The endpoint (or its driver) is gone: no connection can
+                        // ever be accepted again on this listener.
+                        tracing::error!("QUIC acceptor closed on {src_addr:?}: listener terminated");
+                        break;
+                    };
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        // Admission overload: actively ignore() so quinn frees the
+                        // pending state (keys + buffered datagrams) at the source
+                        // instead of queueing it. ignore() and refuse() free the
+                        // same state; ignore() additionally avoids sending an
+                        // encrypted CONNECTION_REFUSED on this overload-only path.
+                        incoming.ignore();
+                        continue;
+                    };
+                    let task = this.clone();
+                    zenoh_runtime::ZRuntime::Acceptor.spawn(async move {
+                        let _permit = permit;
+                        tokio::select! {
+                            _ = task.inner.token.cancelled() => {}
+                            res = task.drive_handshake(incoming, src_addr) => {
+                                if let Err(e) = res {
+                                    tracing::debug!("QUIC connection admission failed: {e:?}");
                                 }
-                            };
-                            // Communicate the new link to the initial transport manager
-                            if let Err(e) = self.inner.manager.send_async(link).await {
-                                tracing::error!("{}-{}: {}", file!(), line!(), e)
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("{} Hint: increase the system open file limit.", e);
-                            // Throttle the accept loop upon an error
-                            // NOTE: This might be due to various factors. However, the most common case is that
-                            //       the process has reached the maximum number of open files in the system. On
-                            //       Linux systems this limit can be changed by using the "ulimit" command line
-                            //       tool. In case of systemd-based systems, this can be changed by using the
-                            //       "sysctl" command line tool.
-                            tokio::time::sleep(self.inner.throttle_time).await;
-                        }
-                    }
+                    });
                 }
             }
         }
         Ok(())
+    }
+
+    /// Drives one incoming connection end-to-end: QUIC+TLS handshake, first
+    /// stream/ALPN, link construction, and hand-off to the transport manager.
+    async fn drive_handshake(&self, incoming: quinn::Incoming, src_addr: SocketAddr) -> ZResult<()> {
+        let admission = tokio::time::timeout(
+            std::time::Duration::from_millis(*QUIC_ACCEPT_CONNECTION_TIMEOUT_MS),
+            async {
+                let quic_conn = incoming
+                    .await
+                    .map_err(|e| zerror!("QUIC handshake failed: {e:?}"))?;
+                self.handle_accepted_connection(quic_conn, &src_addr).await
+            },
+        );
+        let link = match admission.await {
+            Ok(Ok(link)) => link,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(zerror!("QUIC connection admission timed out").into()),
+        };
+        self.inner
+            .manager
+            .send_async(link)
+            .await
+            .map_err(|e| zerror!("{}-{}: {}", file!(), line!(), e).into())
     }
 
     /// Handles an accepted [`quinn::Connection`], returning a link made by the provided callback.
