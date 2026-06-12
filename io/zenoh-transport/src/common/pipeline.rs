@@ -459,6 +459,81 @@ impl StageIn {
     }
 
     #[inline]
+    fn push_transport_message_deadline(
+        &mut self,
+        msg: TransportMessage,
+        deadline: &mut Deadline,
+    ) -> bool {
+        // Deadline-bounded variant of `push_transport_message`: never blocks past
+        // `deadline`. Used for best-effort control messages (e.g. Close) so that
+        // tearing down a transport whose tx_task is stuck cannot hang forever.
+        let mut c_guard = zlock!(self.mutex.current);
+        c_guard.notify_pending();
+
+        macro_rules! zgetbatch_rets_deadline {
+            () => {
+                loop {
+                    match c_guard.batch.take() {
+                        Some(batch) => break batch,
+                        None => match self.s_ref.pull() {
+                            Some(mut batch) => {
+                                batch.clear();
+                                self.s_out.atomic_backoff.first_write.store(
+                                    LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
+                                    Ordering::Relaxed,
+                                );
+                                break batch;
+                            }
+                            None => {
+                                if !deadline.wait(&self.s_ref).unwrap_or(false) {
+                                    return false;
+                                }
+                            }
+                        },
+                    }
+                }
+            };
+        }
+
+        let mut batch = zgetbatch_rets_deadline!();
+        match batch.encode(&msg) {
+            Ok(_) => {
+                if !self.batching {
+                    self.s_out.move_batch(batch);
+                    return true;
+                } else {
+                    let bytes = batch.len();
+                    c_guard.batch = Some(batch);
+                    drop(c_guard);
+                    self.s_out.notify(bytes);
+                    return true;
+                }
+            }
+            Err(_) => {
+                if !batch.is_empty() {
+                    self.s_out.move_batch(batch);
+                    batch = zgetbatch_rets_deadline!();
+                }
+            }
+        };
+
+        // Unlike the upstream variant, hand the batch over and notify: returning
+        // `true` while dropping the encoded batch would silently lose the message.
+        if batch.encode(&msg).is_ok() {
+            if !self.batching {
+                self.s_out.move_batch(batch);
+            } else {
+                let bytes = batch.len();
+                c_guard.batch = Some(batch);
+                drop(c_guard);
+                self.s_out.notify(bytes);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn push_transport_message(&mut self, msg: TransportMessage) -> bool {
         // Lock the current serialization batch.
         let mut c_guard = zlock!(self.mutex.current);
@@ -872,6 +947,11 @@ impl TransmissionPipelineProducer {
         &self,
         msg: NetworkMessageRef,
     ) -> Result<bool, TransportClosed> {
+        // Fail fast on a disabled pipeline: its consumer is gone or going away,
+        // so no batch will ever be refilled for this push to complete.
+        if self.status.is_disabled() {
+            return Err(TransportClosed);
+        }
         // If the queue is not QoS, it means that we only have one priority with index 0.
         let (idx, priority) = if self.stage_in.len() > 1 {
             let priority = msg.priority();
@@ -936,6 +1016,28 @@ impl TransmissionPipelineProducer {
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[priority]);
         queue.push_transport_message(msg)
+    }
+
+    /// Deadline-bounded, fail-fast push for best-effort control messages.
+    /// Returns false immediately if the pipeline is disabled.
+    #[inline]
+    pub(crate) fn try_push_transport_message(
+        &self,
+        msg: TransportMessage,
+        priority: Priority,
+        wait: std::time::Duration,
+    ) -> bool {
+        if self.status.is_disabled() {
+            return false;
+        }
+        let priority = if self.stage_in.len() > 1 {
+            priority as usize
+        } else {
+            0
+        };
+        let mut deadline = Deadline::new(wait, None);
+        let mut queue = zlock!(self.stage_in[priority]);
+        queue.push_transport_message_deadline(msg, &mut deadline)
     }
 
     pub(crate) fn disable(&self) {

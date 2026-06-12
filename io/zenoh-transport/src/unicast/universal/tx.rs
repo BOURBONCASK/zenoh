@@ -79,6 +79,15 @@ impl TransportUnicastUniversal {
         #[cfg(feature = "stats")] stats: zenoh_stats::LinkStats,
     ) {
         if !pushed && !msg.is_droppable() {
+            if self.closing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // Teardown already in flight: don't spawn duplicate close tasks
+                // and don't spam the log on every subsequent failed push.
+                tracing::debug!(
+                    "Unable to push non droppable network message to {} (teardown in flight)",
+                    self.config.zid
+                );
+                return;
+            }
             tracing::error!(
                 "Unable to push non droppable network message to {}. Closing transport!",
                 self.config.zid

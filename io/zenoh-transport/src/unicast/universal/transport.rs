@@ -64,6 +64,9 @@ pub(crate) struct TransportUnicastUniversal {
     pub(super) callback: Arc<RwLock<Option<Arc<dyn TransportPeerEventHandler>>>>,
     // Mutex for notification
     pub(super) status: Arc<AsyncMutex<TransportStatus>>,
+    // Close-once guard: set when teardown is first initiated, so that repeated
+    // push failures cannot spawn an unbounded number of concurrent close tasks.
+    pub(super) closing: Arc<std::sync::atomic::AtomicBool>,
     // Transport statistics
     #[cfg(feature = "stats")]
     pub(super) stats: zenoh_stats::TransportStats,
@@ -107,6 +110,7 @@ impl TransportUnicastUniversal {
             links: Arc::new(RwLock::new(TransportLinks::default())),
             callback: Arc::new(RwLock::new(None)),
             status: Arc::new(AsyncMutex::new(TransportStatus::Uninitialized)),
+            closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "stats")]
             stats,
             #[cfg(feature = "shared-memory")]
@@ -134,8 +138,18 @@ impl TransportUnicastUniversal {
 
         // Close all the links
         let mut links = zwrite!(self.links).take();
+        // Defense in depth: disable every pipeline first, so pushers fail fast on
+        // every teardown path (incl. del_link -> delete) and regardless of whether
+        // the bounded l.close() below completes in time.
+        for l in links.iter() {
+            l.pipeline.disable();
+        }
         for l in links.drain(..) {
-            let _ = l.close().await;
+            // Bound link teardown: a stuck tx_task must not hold the transport
+            // (and every queued concurrent close) hostage forever. On timeout the
+            // tasks were already cancel-signalled and exit on their own; the QUIC
+            // side is reclaimed by its idle timeout.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), l.close()).await;
         }
 
         // Notify the callback that we have closed the transport
@@ -386,7 +400,12 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
             }
             .into();
 
-            p.push_transport_message(msg, Priority::Background);
+            // Best-effort: a transport being closed for unresponsiveness may have a
+            // full pipeline with a stuck consumer; never let the Close push wedge
+            // the teardown. After the attempt, disable the pipeline: future pushers
+            // fail fast, in-flight blocked ones are bounded by their own deadlines.
+            p.try_push_transport_message(msg, Priority::Background, std::time::Duration::from_millis(100));
+            p.disable();
         }
         // Terminate and clean up the transport
         self.delete().await

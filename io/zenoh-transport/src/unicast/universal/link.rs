@@ -142,6 +142,7 @@ impl TransportLinkUnicastUniversal {
         #[cfg(feature = "stats")]
         let stats = self.stats.clone();
         let ct = self.task_controller.get_cancellation_token();
+        let pipeline = self.pipeline.clone();
         let task = async move {
             let res = tx_task(
                 consumer,
@@ -155,6 +156,9 @@ impl TransportLinkUnicastUniversal {
 
             if let Err(e) = res {
                 tracing::debug!("TX task failed: {}", e);
+                // Fail fast: without a consumer the pipeline only accumulates
+                // blocked pushers; disable it before scheduling link deletion.
+                pipeline.disable();
                 // Spawn a task to avoid a deadlock waiting for this same task
                 // to finish in the close() joining its handle
                 // TODO(yuyuan): do more study to check which ZRuntime should be used or refine the
