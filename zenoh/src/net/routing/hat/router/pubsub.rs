@@ -249,11 +249,21 @@ impl Hat {
         &mut self,
         zid: &ZenohIdProto,
     ) -> HashSet<Arc<Resource>> {
+        let declared_routers = self
+            .router_subs
+            .iter()
+            .flat_map(|res| self.res_hat(res).router_subs.iter().copied())
+            .collect_vec();
+
         let removed_routers = self
             .net_mut()
             .remove_link(zid)
             .into_iter()
             .map(|(_, node)| node)
+            .chain(declared_routers.into_iter().filter(|router| {
+                // The node can already be gone when this is called after linkstate cleanup.
+                self.net().get_idx(router).is_none()
+            }))
             .collect::<HashSet<_>>();
 
         let mut resources = HashSet::new();
