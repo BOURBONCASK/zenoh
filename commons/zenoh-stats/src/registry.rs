@@ -28,8 +28,9 @@ use crate::{
     keys::{HistogramPerKey, StatsKeysRegistry},
     labels::{
         BytesLabels, LinkLabels, LocalityLabel, NetworkMessageDroppedPayloadLabels,
-        NetworkMessageLabels, NetworkMessagePayloadLabels, ProtocolLabels, ResourceDeclaredLabels,
-        ResourceLabel, TransportLabels, TransportMessageLabels,
+        NetworkMessageLabels, NetworkMessagePayloadLabels, ProtocolLabels, RejectionReasonLabel,
+        ResourceDeclaredLabels, ResourceLabel, SessionRejectionLabels, TransportLabels,
+        TransportMessageLabels,
     },
     stats::{init_stats, StatsPath},
     Rx, StatsDirection, StatsKeysTree, TransportStats, Tx,
@@ -72,6 +73,20 @@ impl StatsRegistry {
             "Count of resources currently declared",
             resources_declared.clone(),
         );
+        let session_rejections = Family::<SessionRejectionLabels, Counter>::default();
+        registry.register(
+            "session_rejections",
+            "Count of incoming sessions rejected before establishment, by reason",
+            session_rejections.clone(),
+        );
+        // Pre-create the known reasons so they export as 0 from startup (before any
+        // rejection happens), which keeps rate()/alerting well-defined.
+        for reason in [
+            RejectionReasonLabel::MaxSessions,
+            RejectionReasonLabel::AcceptTimeout,
+        ] {
+            let _ = session_rejections.get_or_create(&SessionRejectionLabels { reason });
+        }
         let bytes = array::from_fn(|_dir| TransportFamily::default());
         let transport_message = array::from_fn(|_dir| TransportFamily::default());
         let network_message = array::from_fn(|_dir| TransportFamily::default());
@@ -129,6 +144,7 @@ impl StatsRegistry {
             transports_opened,
             links_opened,
             resources_declared,
+            session_rejections,
             bytes,
             transport_message,
             network_message,
@@ -147,6 +163,24 @@ impl StatsRegistry {
     pub fn dec_resource_declared(&self, resource: ResourceLabel, locality: LocalityLabel) {
         let labels = ResourceDeclaredLabels { resource, locality };
         self.0.resources_declared.get_or_create(&labels).dec();
+    }
+
+    pub fn inc_rejection_max_sessions(&self) {
+        self.0
+            .session_rejections
+            .get_or_create(&SessionRejectionLabels {
+                reason: RejectionReasonLabel::MaxSessions,
+            })
+            .inc();
+    }
+
+    pub fn inc_rejection_accept_timeout(&self) {
+        self.0
+            .session_rejections
+            .get_or_create(&SessionRejectionLabels {
+                reason: RejectionReasonLabel::AcceptTimeout,
+            })
+            .inc();
     }
 
     pub fn encode_metrics(
@@ -288,6 +322,7 @@ struct StatsRegistryInner {
     transports_opened: Gauge,
     links_opened: Family<ProtocolLabels, Gauge>,
     resources_declared: Family<ResourceDeclaredLabels, Gauge>,
+    session_rejections: Family<SessionRejectionLabels, Counter>,
     bytes: [TransportFamily<BytesLabels, Counter>; StatsDirection::NUM],
     transport_message: [TransportFamily<TransportMessageLabels, Counter>; StatsDirection::NUM],
     network_message: [TransportFamily<NetworkMessageLabels, Counter>; StatsDirection::NUM],

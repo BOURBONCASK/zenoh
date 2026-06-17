@@ -586,6 +586,8 @@ impl TransportManager {
                 config.zid
             );
             tracing::trace!("{e}");
+            #[cfg(feature = "stats")]
+            self.stats.inc_rejection_max_sessions();
             let (l, asl) = link.fail();
             return Err(InitTransportError::Link((
                 e.into(),
@@ -901,6 +903,8 @@ impl TransportManager {
                         "Failed to accept link before deadline ({}ms)",
                         c_manager.config.unicast.accept_timeout.as_millis()
                     );
+                    #[cfg(feature = "stats")]
+                    c_manager.stats.inc_rejection_accept_timeout();
                 }
                 incoming_counter.fetch_sub(1, SeqCst);
             });
