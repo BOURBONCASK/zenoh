@@ -170,7 +170,10 @@ impl TransportLinkUnicastUniversal {
     pub(super) fn start_rx(&mut self, transport: TransportUnicastUniversal, lease: Duration) {
         let priorities = self.link.config.priorities.clone();
         let reliability = self.link.config.reliability;
-        let mut rx = self.link.rx();
+        // This reader owns the link's byte stream until the task ends, so it is
+        // allowed to over-read and carry the surplus into the next batch — one
+        // read per batch instead of one per length prefix plus one per body.
+        let mut rx = self.link.rx_buffered();
         let cancellation_token = self.task_controller.get_cancellation_token();
         #[cfg(feature = "stats")]
         let stats = self.stats.clone();

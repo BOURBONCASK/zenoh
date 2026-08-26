@@ -451,6 +451,14 @@ impl RBatch {
         self.buffer.is_empty()
     }
 
+    /// Payload bytes as they stand after [`Self::initialize`]. Test-only: the
+    /// streamed read-fold tests compare what came off the wire byte-for-byte
+    /// without going through the protocol codec.
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.buffer
+    }
+
     // Split (length, header, payload) internal buffer slice
     #[inline(always)]
     fn split<'a>(buffer: &'a [u8], config: &BatchConfig) -> (&'a [u8], &'a [u8], &'a [u8]) {
