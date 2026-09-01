@@ -631,6 +631,11 @@ impl Network {
     }
 
     fn connect_discovered_peer(&self, zid: ZenohIdProto, locators: Vec<Locator>) {
+        // A peer that bound its wildcard listener before it had a routable
+        // address advertises an empty locator list; there is nothing to dial.
+        if locators.is_empty() {
+            return;
+        }
         let runtime = self.runtime.upgrade().unwrap();
         self.runtime.upgrade().unwrap().spawn(async move {
             if runtime

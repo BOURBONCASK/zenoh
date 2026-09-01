@@ -383,8 +383,11 @@ impl Gossip {
             }
 
             if self.autoconnect.should_autoconnect(zid, whatami) {
-                // Connect discovered peers (only if locators are available)
-                if let Some(locators) = locators {
+                // Connect discovered peers (only if locators are available).
+                // An empty list is not "available": the peer advertised itself
+                // before it had a routable address, and dialling nothing would
+                // only burn the start condition below.
+                if let Some(locators) = locators.filter(|l| !l.is_empty()) {
                     let runtime = strong_runtime.clone();
                     let wait_declares = self.wait_declares;
                     strong_runtime.spawn(async move {
@@ -395,9 +398,8 @@ impl Gossip {
                             .is_none()
                         {
                             runtime.start_conditions().add_peer_connector_zid(zid).await;
-                            if runtime.connect_peer(&zid, &locators).await
-                                && ((!wait_declares) || whatami != WhatAmI::Peer)
-                            {
+                            let connected = runtime.connect_peer(&zid, &locators).await;
+                            if !connected || (!wait_declares) || whatami != WhatAmI::Peer {
                                 runtime
                                     .start_conditions()
                                     .terminate_peer_connector_zid(zid)
