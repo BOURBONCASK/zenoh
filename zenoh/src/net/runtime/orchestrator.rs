@@ -1112,10 +1112,19 @@ impl Runtime {
             .collect::<Vec<&Locator>>();
 
         if locators.is_empty() {
-            tracing::debug!(
-                "Already connecting to locators of {} (connect configuration). Ignore.",
-                zid
-            );
+            if scouted_locators.is_empty() {
+                tracing::debug!("No locator advertised for {}. Ignore.", zid);
+            } else {
+                tracing::debug!(
+                    "All locators of {} are already in the connect configuration. Ignore.",
+                    zid
+                );
+            }
+            // Nothing was attempted, so this zid is not pending: leaving the
+            // entry behind would make every later advertisement for it -- in
+            // particular the first one that carries a usable locator -- be
+            // dropped as "Already connecting".
+            self.remove_pending_connection(zid).await;
             return false;
         }
 
