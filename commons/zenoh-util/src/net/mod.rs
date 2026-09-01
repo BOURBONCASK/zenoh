@@ -161,8 +161,15 @@ pub fn get_multicast_interfaces() -> Vec<IpAddr> {
 pub fn get_local_addresses(interface: Option<&str>) -> ZResult<Vec<IpAddr>> {
     #[cfg(unix)]
     {
-        Ok(IFACES
-            .iter()
+        // Deliberately not the cached `IFACES`: addresses are configured at
+        // runtime, and on an embedded board the network service routinely
+        // wins the race against the application only by a few seconds. A
+        // snapshot taken at first use makes every wildcard listener advertise
+        // locators that miss the address for the lifetime of the process.
+        // `IFACES` is kept for the multicast helpers, which enumerate
+        // interfaces rather than addresses.
+        Ok(pnet_datalink::interfaces()
+            .into_iter()
             .filter(|iface| {
                 if let Some(interface) = interface.as_ref() {
                     if iface.name != *interface {
@@ -171,7 +178,7 @@ pub fn get_local_addresses(interface: Option<&str>) -> ZResult<Vec<IpAddr>> {
                 }
                 iface.is_up() && iface.is_running()
             })
-            .flat_map(|iface| iface.ips.clone())
+            .flat_map(|iface| iface.ips)
             .map(|ipnet| ipnet.ip())
             .collect())
     }
