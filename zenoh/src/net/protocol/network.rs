@@ -832,6 +832,22 @@ impl Network {
         }
     }
 
+    /// Re-announce this node's own link state. See `Gossip::readvertise_self`.
+    pub(crate) fn readvertise_self(&mut self) {
+        self.graph[self.idx].sn += 1;
+        self.send_on_links(
+            vec![(
+                self.idx,
+                Details {
+                    zid: false,
+                    locators: true,
+                    links: true,
+                },
+            )],
+            |_| true,
+        );
+    }
+
     pub(crate) fn add_link(&mut self, transport: TransportUnicast) -> LinkId {
         let free_index = {
             let mut i = 0;
