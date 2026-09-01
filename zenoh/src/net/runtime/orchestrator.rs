@@ -49,6 +49,8 @@ use super::{Runtime, RuntimeSession};
 use crate::net::{common::AutoConnect, protocol::linkstate::LinkInfo};
 
 const RCV_BUF_SIZE: usize = u16::MAX as usize;
+/// How often a node with nothing to advertise re-checks its interfaces.
+const LATE_LOCATOR_WATCH_PERIOD: Duration = Duration::from_secs(1);
 const SCOUT_INITIAL_PERIOD: Duration = Duration::from_millis(1_000);
 const SCOUT_MAX_PERIOD: Duration = Duration::from_millis(8_000);
 const SCOUT_PERIOD_INCREASE_FACTOR: u32 = 2;
@@ -277,6 +279,9 @@ impl Runtime {
         {
             tracing::warn!("Scouting delay elapsed before start conditions are met.");
         }
+
+        self.watch_for_late_locators();
+
         Ok(())
     }
 
@@ -1451,6 +1456,57 @@ impl Runtime {
                 let _ = runtime.peer_connector_retry(endpoint).await;
             });
         }
+    }
+
+    /// Re-announce our own link state on every hat that keeps one.
+    ///
+    /// Resolving locators is *not* done here: `print_locators` must have run
+    /// beforehand, off-lock, because it reaches `TransportManager::get_locators`
+    /// and that blocks in place.
+    pub(crate) fn readvertise_locators(&self) {
+        let router = self.router();
+        let _ctrl_lock = zlock!(router.tables.ctrl_lock);
+        let mut wtables = zwrite!(router.tables.tables);
+        for hat in wtables.hats.values_mut() {
+            hat.readvertise_locators();
+        }
+    }
+
+    /// A node that binds a wildcard listener before its interface has a
+    /// routable address advertises an empty locator set, and no transport
+    /// event will ever revisit it: a peer with no locators cannot be dialled,
+    /// and a peer that dials nobody -- the smallest zid under the `greater-zid`
+    /// strategy, say -- never gains a transport of its own either. Watch for
+    /// the address instead, announce it once, and stop.
+    ///
+    /// Nothing is spawned in the ordinary case where an address is already
+    /// configured when the listeners come up, so this costs nothing at rest.
+    fn watch_for_late_locators(&self) {
+        // Two ways to have nothing to advertise. Only one of them is worth
+        // watching: a node bound to a wildcard endpoint still resolves to its
+        // loopback address, so an empty advertisable set next to a non-empty
+        // full set means "listening, but not on anything reachable yet". A
+        // node with no listener at all has an empty full set too, and no
+        // address will ever change that.
+        if !self.get_locators_noloopback().is_empty() || self.get_locators().is_empty() {
+            return;
+        }
+        tracing::debug!(
+            "No locator to advertise yet: will announce one if an address appears later"
+        );
+        let runtime = self.clone();
+        self.spawn_abortable(async move {
+            loop {
+                tokio::time::sleep(LATE_LOCATOR_WATCH_PERIOD).await;
+                // Off-lock by construction: this task holds nothing.
+                runtime.print_locators();
+                if !runtime.get_locators_noloopback().is_empty() {
+                    tracing::info!("Locators became available: re-announcing link state");
+                    runtime.readvertise_locators();
+                    return;
+                }
+            }
+        });
     }
 
     #[allow(dead_code)]

@@ -426,6 +426,24 @@ impl Gossip {
         }
     }
 
+    /// Re-announce this node's own link state, so that a locator set which
+    /// was empty when the links came up gets replaced at the far end. The
+    /// sequence number has to advance or receivers keep what they already have.
+    pub(crate) fn readvertise_self(&mut self) {
+        self.graph[self.idx].sn += 1;
+        self.send_on_links(
+            vec![(
+                self.idx,
+                Details {
+                    zid: false,
+                    locators: true,
+                    links: true,
+                },
+            )],
+            |_| true,
+        );
+    }
+
     #[allow(clippy::incompatible_msrv)]
     pub(crate) fn add_link(&mut self, transport: TransportUnicast, remote_bound: Bound) -> usize {
         let free_index = {
