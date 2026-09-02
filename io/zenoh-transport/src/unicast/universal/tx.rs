@@ -22,8 +22,10 @@ use zenoh_protocol::{
 use zenoh_result::ZResult;
 
 use super::transport::TransportUnicastUniversal;
-use crate::common::pipeline::TransmissionPipelineProducer;
-use crate::unicast::transport_unicast_inner::TransportUnicastTrait;
+use crate::{
+    common::pipeline::TransmissionPipelineProducer,
+    unicast::transport_unicast_inner::TransportUnicastTrait,
+};
 
 impl TransportUnicastUniversal {
     /// Returns the index of the best matching [`Reliability`]-[`PriorityRange`] pair.
