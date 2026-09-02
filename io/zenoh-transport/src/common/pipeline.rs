@@ -1463,7 +1463,10 @@ mod tests {
         let (producer, _consumer) =
             TransmissionPipeline::make(CONFIG_NOT_STREAMED, priorities.as_slice(), false);
         assert!(!producer.is_condemned());
-        assert!(producer.condemn(), "first condemn should transition false->true");
+        assert!(
+            producer.condemn(),
+            "first condemn should transition false->true"
+        );
         assert!(!producer.condemn(), "second condemn should be a no-op");
         assert!(producer.is_condemned());
         Ok(())
@@ -1512,7 +1515,10 @@ mod tests {
 
         // Never condemn.
         let (r, elapsed) = timeout(Duration::from_secs(5), h).await??;
-        assert!(matches!(r, Ok(false)), "expected Ok(false) after budget, got {r:?}");
+        assert!(
+            matches!(r, Ok(false)),
+            "expected Ok(false) after budget, got {r:?}"
+        );
         assert!(
             elapsed >= WBC / 2,
             "Block push should wait ~wait_before_close ({WBC:?}) when not condemned, waited {elapsed:?}"
