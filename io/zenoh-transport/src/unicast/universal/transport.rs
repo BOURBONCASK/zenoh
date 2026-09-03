@@ -310,6 +310,29 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
         let (mut link, consumer) =
             TransportLinkUnicastUniversal::new(self, link, &self.priority_tx);
 
+        // io_uring owns the RX side of this link: drop the READABLE registration
+        // the link keeps with its tokio reactor before any task uses the socket.
+        #[cfg(all(
+            feature = "uring",
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "loongarch64",
+                target_arch = "powerpc64"
+            )
+        ))]
+        if self.manager.state.uring.is_some() && link.link.link.get_fd().is_ok() {
+            if let Err(e) = link.link.link.detach_rx_from_reactor() {
+                tracing::debug!(
+                    "{}: could not detach RX from the tokio reactor: {}",
+                    link.link,
+                    e
+                );
+            }
+        }
+
         // Handle associated link (if mixed-reliability link)
         let al_with_consumer =
             associated_link.map(|l| TransportLinkUnicastUniversal::new(self, l, &self.priority_tx));

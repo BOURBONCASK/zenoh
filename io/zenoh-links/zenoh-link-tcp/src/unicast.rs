@@ -16,6 +16,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::{cell::UnsafeCell, convert::TryInto, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+#[cfg(all(feature = "uring", target_os = "linux"))]
+use tokio::io::{unix::AsyncFd, Interest};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -36,9 +38,63 @@ use crate::{
     TCP_LINGER_TIMEOUT, TCP_LOCATOR_PREFIX,
 };
 
+/// The socket behind a TCP link.
+///
+/// `Tokio` is the regular tokio stream (reads and writes through the tokio
+/// reactor). `WriteOnly` is used once io_uring has taken over the RX side: the
+/// same fd is re-registered with the reactor for WRITABLE interest only, so
+/// incoming data no longer wakes the runtime that accepted/connected the socket.
+enum TcpSocket {
+    Tokio(TcpStream),
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    WriteOnly(AsyncFd<std::net::TcpStream>),
+    /// Transient state while converting `Tokio` -> `WriteOnly`; also what is
+    /// left behind if that conversion fails midway (the link then errors out).
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    Detached,
+}
+
+#[cfg(all(feature = "uring", target_os = "linux"))]
+fn detached_error() -> std::io::Error {
+    std::io::Error::other("socket RX is owned by io_uring")
+}
+
+#[cfg(all(feature = "uring", target_os = "linux"))]
+async fn write_nonblocking(
+    fd: &AsyncFd<std::net::TcpStream>,
+    buffer: &[u8],
+) -> std::io::Result<usize> {
+    use std::io::Write;
+    loop {
+        let mut guard = fd.writable().await?;
+        match guard.try_io(|inner| {
+            let mut stream: &std::net::TcpStream = inner.get_ref();
+            stream.write(buffer)
+        }) {
+            Ok(res) => return res,
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+#[cfg(all(feature = "uring", target_os = "linux"))]
+async fn write_all_nonblocking(
+    fd: &AsyncFd<std::net::TcpStream>,
+    mut buffer: &[u8],
+) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        let n = write_nonblocking(fd, buffer).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        buffer = &buffer[n..];
+    }
+    Ok(())
+}
+
 pub struct LinkUnicastTcp {
     // The underlying socket as returned from the tokio library
-    socket: UnsafeCell<TcpStream>,
+    socket: UnsafeCell<TcpSocket>,
     // The source socket address of this link (address used on the local host)
     src_addr: SocketAddr,
     src_locator: Locator,
@@ -101,7 +157,7 @@ impl LinkUnicastTcp {
 
         // Build the Tcp object
         LinkUnicastTcp {
-            socket: UnsafeCell::new(socket),
+            socket: UnsafeCell::new(TcpSocket::Tokio(socket)),
             src_addr,
             src_locator: Locator::new(TCP_LOCATOR_PREFIX, src_addr.to_string(), "").unwrap(),
             dst_addr,
@@ -111,7 +167,7 @@ impl LinkUnicastTcp {
     }
 
     #[allow(clippy::mut_from_ref)]
-    fn get_mut_socket(&self) -> &mut TcpStream {
+    fn get_mut_socket(&self) -> &mut TcpSocket {
         unsafe { &mut *self.socket.get() }
     }
 }
@@ -121,7 +177,14 @@ impl LinkUnicastTrait for LinkUnicastTcp {
     async fn close(&self) -> ZResult<()> {
         tracing::trace!("Closing TCP link: {}", self);
         // Close the underlying TCP socket
-        self.get_mut_socket().shutdown().await.map_err(|e| {
+        let res = match self.get_mut_socket() {
+            TcpSocket::Tokio(socket) => socket.shutdown().await,
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::WriteOnly(fd) => fd.get_ref().shutdown(std::net::Shutdown::Both),
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::Detached => Ok(()),
+        };
+        res.map_err(|e| {
             let e = zerror!("TCP link shutdown {}: {:?}", self, e);
             tracing::trace!("{}", e);
             e.into()
@@ -129,7 +192,14 @@ impl LinkUnicastTrait for LinkUnicastTcp {
     }
 
     async fn write(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<usize> {
-        self.get_mut_socket().write(buffer).await.map_err(|e| {
+        let res = match self.get_mut_socket() {
+            TcpSocket::Tokio(socket) => socket.write(buffer).await,
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::WriteOnly(fd) => write_nonblocking(fd, buffer).await,
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::Detached => Err(detached_error()),
+        };
+        res.map_err(|e| {
             let e = zerror!("Write error on TCP link {}: {}", self, e);
             tracing::trace!("{}", e);
             e.into()
@@ -137,7 +207,14 @@ impl LinkUnicastTrait for LinkUnicastTcp {
     }
 
     async fn write_all(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<()> {
-        self.get_mut_socket().write_all(buffer).await.map_err(|e| {
+        let res = match self.get_mut_socket() {
+            TcpSocket::Tokio(socket) => socket.write_all(buffer).await,
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::WriteOnly(fd) => write_all_nonblocking(fd, buffer).await,
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::Detached => Err(detached_error()),
+        };
+        res.map_err(|e| {
             let e = zerror!("Write error on TCP link {}: {}", self, e);
             tracing::trace!("{}", e);
             e.into()
@@ -145,7 +222,12 @@ impl LinkUnicastTrait for LinkUnicastTcp {
     }
 
     async fn read(&self, buffer: &mut [u8], _priority: Option<Priority>) -> ZResult<usize> {
-        self.get_mut_socket().read(buffer).await.map_err(|e| {
+        let res = match self.get_mut_socket() {
+            TcpSocket::Tokio(socket) => socket.read(buffer).await,
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::WriteOnly(_) | TcpSocket::Detached => Err(detached_error()),
+        };
+        res.map_err(|e| {
             let e = zerror!("Read error on TCP link {}: {}", self, e);
             tracing::trace!("{}", e);
             e.into()
@@ -153,16 +235,16 @@ impl LinkUnicastTrait for LinkUnicastTcp {
     }
 
     async fn read_exact(&self, buffer: &mut [u8], _priority: Option<Priority>) -> ZResult<()> {
-        let _ = self
-            .get_mut_socket()
-            .read_exact(buffer)
-            .await
-            .map_err(|e| {
-                let e = zerror!("Read error on TCP link {}: {}", self, e);
-                tracing::trace!("{}", e);
-                e
-            })?;
-        Ok(())
+        let res = match self.get_mut_socket() {
+            TcpSocket::Tokio(socket) => socket.read_exact(buffer).await.map(|_| ()),
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            TcpSocket::WriteOnly(_) | TcpSocket::Detached => Err(detached_error()),
+        };
+        res.map_err(|e| {
+            let e = zerror!("Read error on TCP link {}: {}", self, e);
+            tracing::trace!("{}", e);
+            e.into()
+        })
     }
 
     #[inline(always)]
@@ -202,10 +284,37 @@ impl LinkUnicastTrait for LinkUnicastTcp {
 
     #[cfg(all(feature = "uring", target_os = "linux"))]
     fn get_fd(&self) -> ZResult<RawFd> {
-        match unsafe { &*self.socket.get() }.as_raw_fd() {
-            fd if fd < 0 => bail!("FD unavailable"),
-            fd => Ok(fd),
+        let fd = match unsafe { &*self.socket.get() } {
+            TcpSocket::Tokio(socket) => socket.as_raw_fd(),
+            TcpSocket::WriteOnly(fd) => fd.as_raw_fd(),
+            TcpSocket::Detached => -1,
+        };
+        if fd < 0 {
+            bail!("FD unavailable")
         }
+        Ok(fd)
+    }
+
+    #[cfg(all(feature = "uring", target_os = "linux"))]
+    fn detach_rx_from_reactor(&self) -> ZResult<()> {
+        let slot = self.get_mut_socket();
+        if !matches!(slot, TcpSocket::Tokio(_)) {
+            return Ok(());
+        }
+        // The swap is sound only because the transport calls this before it
+        // starts the TX/RX tasks: nothing else is using the socket here.
+        let TcpSocket::Tokio(stream) = std::mem::replace(slot, TcpSocket::Detached) else {
+            unreachable!()
+        };
+        // `into_std` deregisters the fd from the tokio reactor that accepted or
+        // connected it; re-register it for WRITABLE interest only, so incoming
+        // data (now read by io_uring) no longer wakes that reactor.
+        let stream = stream.into_std()?;
+        stream.set_nonblocking(true)?;
+        let fd = AsyncFd::with_interest(stream, Interest::WRITABLE)?;
+        *slot = TcpSocket::WriteOnly(fd);
+        tracing::debug!("TCP link {}: RX detached from the tokio reactor", self);
+        Ok(())
     }
 }
 

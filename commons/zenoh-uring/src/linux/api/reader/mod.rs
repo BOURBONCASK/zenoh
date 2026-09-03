@@ -109,17 +109,32 @@ impl Reader {
         let (join_sender, mut join_receiver) = tokio::sync::watch::channel("".into());
         join_receiver.mark_unchanged();
 
+        // Fail HERE, synchronously, if this process cannot use io_uring: probe a
+        // ring with the exact setup flags the reactor uses (kernel support,
+        // seccomp EPERM, kernel.io_uring_disabled) and pin the RX arena
+        // (RLIMIT_MEMLOCK). Before this, both happened on the reactor thread
+        // after `Reader::new` had already returned Ok: the thread died with a
+        // single error log while the transport kept routing every link's RX
+        // through io_uring, so no data was ever delivered. With the failure
+        // surfaced here the transport's "falling back to tokio RX" path works.
+        let probe: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
+            .setup_submit_all()
+            .setup_defer_taskrun()
+            .setup_single_issuer()
+            .build(4096)?;
+        drop(probe);
+        let arena = BatchArena::new(batch_size, batch_count, BufferCount::MAX)?;
+
         let ring_worker = move || -> ZResult<()> {
             // Create Rx context storage
             let mut context_storage = RxContextStorage::new();
 
-            // io_uring read
+            // io_uring read (created on the reactor thread: SINGLE_ISSUER)
             let ring: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
                 .setup_submit_all()
                 .setup_defer_taskrun()
                 .setup_single_issuer()
                 .build(4096)?;
-            let arena = BatchArena::new(batch_size, batch_count, BufferCount::MAX)?;
             let arena = ReservableArena::new(arena, c_submitter);
             let arena = GroupedArena::new(arena);
 
