@@ -39,6 +39,8 @@ NETNS_TESTS=(
     t4_startup_storm_before_address_converges_after_address
     t5_control_isolated_peer_bound_after_address_is_reachable
     t5_isolated_peer_bound_before_address_becomes_reachable
+    t5_iface_bound_control_after_address_is_reachable
+    t5_iface_bound_before_address_becomes_reachable
 )
 
 if [ -n "$LOGDIR" ]; then
@@ -46,10 +48,10 @@ if [ -n "$LOGDIR" ]; then
 fi
 
 echo "Building $TEST_TARGET (features: $FEATURES)"
-cargo test --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-run \
+cargo test --locked --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-run \
     -p zenoh --test "$TEST_TARGET" --features "$FEATURES" || exit 1
 
-BIN=$(cargo test --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-run \
+BIN=$(cargo test --locked --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-run \
     -p zenoh --test "$TEST_TARGET" --features "$FEATURES" --message-format=json 2>/dev/null |
     sed -n 's/.*"executable":"\([^"]*'"$TEST_TARGET"'[^"]*\)".*/\1/p' | tail -1)
 
