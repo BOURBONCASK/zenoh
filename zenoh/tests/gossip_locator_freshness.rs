@@ -137,13 +137,20 @@ fn add_netns_address() {
 // ---------------------------------------------------------------------------
 
 fn credentials_file() -> String {
-    let path = std::env::temp_dir().join("gossip_locator_freshness_credentials.txt");
-    std::fs::write(&path, "u:p\n").unwrap();
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!(
+        "gossip_locator_freshness_credentials_{}_{}.txt",
+        std::process::id(),
+        ZenohIdProto::rand(),
+    ));
+    let mut file = std::fs::File::create_new(&path).unwrap();
+    file.write_all(b"u:p\n").unwrap();
     path.to_string_lossy().into_owned()
 }
 
 #[cfg(feature = "auth_usrpwd")]
-fn add_usrpwd(config: &mut Config) {
+fn add_usrpwd(config: &mut Config, dictionary: &str) {
     config
         .insert_json5(
             "transport",
@@ -154,16 +161,16 @@ fn add_usrpwd(config: &mut Config) {
         .transport
         .auth
         .usrpwd
-        .set_dictionary_file(Some(credentials_file()))
+        .set_dictionary_file(Some(dictionary.to_owned()))
         .unwrap();
 }
 
 #[cfg(not(feature = "auth_usrpwd"))]
-fn add_usrpwd(_config: &mut Config) {
+fn add_usrpwd(_config: &mut Config, _dictionary: &str) {
     panic!("this test requires the `auth_usrpwd` feature");
 }
 
-fn router_config(port: u16, auth: bool) -> Config {
+fn router_config(port: u16, dictionary: Option<&str>) -> Config {
     let mut config = Config::default();
     config.set_mode(Some(WhatAmI::Router)).unwrap();
     config
@@ -175,8 +182,8 @@ fn router_config(port: u16, auth: bool) -> Config {
         .unwrap();
     config.scouting.multicast.set_enabled(Some(false)).unwrap();
     config.scouting.gossip.set_enabled(Some(true)).unwrap();
-    if auth {
-        add_usrpwd(&mut config);
+    if let Some(dictionary) = dictionary {
+        add_usrpwd(&mut config, dictionary);
     }
     config
 }
@@ -184,7 +191,7 @@ fn router_config(port: u16, auth: bool) -> Config {
 /// A peer shaped like a deployed one: wildcard listener, one configured
 /// connect endpoint (the router), multicast scouting off, gossip fanned out by
 /// the router, peer-to-peer autoconnect with the `greater-zid` strategy.
-fn peer_config(zid: &ZenohId, router_port: u16, auth: bool) -> Config {
+fn peer_config(zid: &ZenohId, router_port: u16, dictionary: Option<&str>) -> Config {
     let mut config = Config::default();
     config.set_mode(Some(WhatAmI::Peer)).unwrap();
     config.set_id(Some(*zid)).unwrap();
@@ -215,8 +222,8 @@ fn peer_config(zid: &ZenohId, router_port: u16, auth: bool) -> Config {
             }"#,
         )
         .unwrap();
-    if auth {
-        add_usrpwd(&mut config);
+    if let Some(dictionary) = dictionary {
+        add_usrpwd(&mut config, dictionary);
     }
     config
 }
@@ -241,7 +248,7 @@ fn ascending_zids(n: usize) -> Vec<ZenohId> {
 
 const ENV_ZID: &str = "ZENOH_REPRO_CHILD_ZID";
 const ENV_ROUTER_PORT: &str = "ZENOH_REPRO_CHILD_ROUTER_PORT";
-const ENV_AUTH: &str = "ZENOH_REPRO_CHILD_AUTH";
+const ENV_DICTIONARY: &str = "ZENOH_REPRO_CHILD_DICTIONARY";
 const ENV_LIFETIME: &str = "ZENOH_REPRO_CHILD_LIFETIME";
 
 /// A peer running in its own process, inside the same network namespace.
@@ -260,7 +267,12 @@ impl Drop for ChildPeer {
 
 /// Starts `child_peer_process` in a new process. Used for every peer that is
 /// supposed to see the interface address that the parent has just added.
-fn spawn_child_peer(name: &str, zid: ZenohId, router_port: u16, auth: bool) -> ChildPeer {
+fn spawn_child_peer(
+    name: &str,
+    zid: ZenohId,
+    router_port: u16,
+    dictionary: Option<&str>,
+) -> ChildPeer {
     let exe = std::env::current_exe().expect("current_exe");
     let child = Command::new(exe)
         .args([
@@ -272,7 +284,7 @@ fn spawn_child_peer(name: &str, zid: ZenohId, router_port: u16, auth: bool) -> C
         ])
         .env(ENV_ZID, zid.to_string())
         .env(ENV_ROUTER_PORT, router_port.to_string())
-        .env(ENV_AUTH, if auth { "1" } else { "0" })
+        .env(ENV_DICTIONARY, dictionary.unwrap_or_default())
         .env(ENV_LIFETIME, CHILD_LIFETIME_SECS.to_string())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -304,7 +316,8 @@ async fn child_peer_process() {
         .expect(ENV_ROUTER_PORT)
         .parse()
         .expect("child router port");
-    let auth = std::env::var(ENV_AUTH).as_deref() == Ok("1");
+    let dictionary = std::env::var(ENV_DICTIONARY).expect(ENV_DICTIONARY);
+    let dictionary = (!dictionary.is_empty()).then_some(dictionary.as_str());
     let lifetime: u64 = std::env::var(ENV_LIFETIME)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -316,7 +329,7 @@ async fn child_peer_process() {
         std::process::id(),
         ip_addr_show()
     );
-    let session = open_session(peer_config(&zid, router_port, auth), "child").await;
+    let session = open_session(peer_config(&zid, router_port, dictionary), "child").await;
     eprintln!("[child {zid}] session open");
     tokio::time::sleep(Duration::from_secs(lifetime)).await;
     let peers: Vec<String> = session
@@ -450,14 +463,14 @@ async fn t2_peer_bound_before_address_becomes_reachable() {
     assert_netns_precondition();
 
     let router_port = get_free_tcp_port();
-    let router = open_session(router_config(router_port, false), "router").await;
+    let router = open_session(router_config(router_port, None), "router").await;
     let router_zid = router.zid();
 
     let zids = ascending_zids(3);
     let (zid_low, zid_early, zid_high) = (zids[0], zids[1], zids[2]);
 
     // `early` binds its wildcard listener while no routable IPv4 exists.
-    let early = open_session(peer_config(&zid_early, router_port, false), "early").await;
+    let early = open_session(peer_config(&zid_early, router_port, None), "early").await;
     assert!(
         wait_until(ROUTER_LINK_TIMEOUT, || sees_router(&early, router_zid)).await,
         "setup: the early peer never connected to the router"
@@ -467,7 +480,7 @@ async fn t2_peer_bound_before_address_becomes_reachable() {
     add_netns_address();
 
     // Control: a fresh process whose zid is smaller, so `early` dials it.
-    let low = spawn_child_peer("low", zid_low, router_port, false);
+    let low = spawn_child_peer("low", zid_low, router_port, None);
     if !wait_until(CONVERGENCE_TIMEOUT, || sees(&early, zid_low)).await {
         dump("T2 control failure", &[("early", &early)], &[&low]).await;
         panic!(
@@ -478,7 +491,7 @@ async fn t2_peer_bound_before_address_becomes_reachable() {
     eprintln!("[parent] control ok: early dialled the low-zid child");
 
     // Subject: a fresh process whose zid is greater, so it must dial `early`.
-    let high = spawn_child_peer("high", zid_high, router_port, false);
+    let high = spawn_child_peer("high", zid_high, router_port, None);
     if !wait_until(CONVERGENCE_TIMEOUT, || sees(&early, zid_high)).await {
         dump("T2 failure", &[("early", &early)], &[&low, &high]).await;
         panic!(
@@ -627,10 +640,10 @@ fn t4_configs_do_not_rewrite_credentials() {
         .unwrap();
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
     let zids = ascending_zids(5);
-    let router = router_config(7447, true);
+    let router = router_config(7447, Some(&path));
     let peers: Vec<_> = zids
         .iter()
-        .map(|zid| peer_config(zid, 7447, true))
+        .map(|zid| peer_config(zid, 7447, Some(&path)))
         .collect();
     for config in std::iter::once(&router).chain(&peers) {
         assert_eq!(
@@ -644,6 +657,7 @@ fn t4_configs_do_not_rewrite_credentials() {
         before,
         "building configs rewrote a dictionary that an earlier open may be reading"
     );
+    std::fs::remove_file(path).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -666,8 +680,9 @@ async fn t4_startup_storm_before_address_converges_after_address() {
 
     const EARLY: usize = 5;
 
+    let path = credentials_file();
     let router_port = get_free_tcp_port();
-    let router = open_session(router_config(router_port, true), "router").await;
+    let router = open_session(router_config(router_port, Some(&path)), "router").await;
     let router_zid = router.zid();
 
     let zids = ascending_zids(EARLY + 1);
@@ -677,7 +692,7 @@ async fn t4_startup_storm_before_address_converges_after_address() {
     // Storm: every early peer opens concurrently, all before any routable IPv4.
     let mut handles = Vec::new();
     for (i, zid) in early_zids.iter().enumerate() {
-        let cfg = peer_config(zid, router_port, true);
+        let cfg = peer_config(zid, router_port, Some(&path));
         handles.push(tokio::spawn(async move {
             match tokio::time::timeout(OPEN_TIMEOUT, zenoh::open(cfg)).await {
                 Ok(res) => res.unwrap_or_else(|e| panic!("zenoh::open failed for early{i}: {e}")),
@@ -701,7 +716,7 @@ async fn t4_startup_storm_before_address_converges_after_address() {
 
     // The late joiner starts afterwards, in its own process, as a service
     // restarted after boot would.
-    let late = spawn_child_peer("late", late_zid, router_port, true);
+    let late = spawn_child_peer("late", late_zid, router_port, Some(&path));
 
     let named: Vec<(String, &Session)> = early
         .iter()
@@ -768,6 +783,7 @@ async fn t4_startup_storm_before_address_converges_after_address() {
         s.close().await.unwrap();
     }
     router.close().await.unwrap();
+    std::fs::remove_file(path).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -792,13 +808,13 @@ async fn run_isolated_peer_case(address_first: bool, bind_iface: bool) {
     }
 
     let router_port = get_free_tcp_port();
-    let router = open_session(router_config(router_port, false), "router").await;
+    let router = open_session(router_config(router_port, None), "router").await;
     let router_zid = router.zid();
 
     let zids = ascending_zids(2);
     let (zid_subject, zid_later) = (zids[0], zids[1]);
 
-    let mut config = peer_config(&zid_subject, router_port, false);
+    let mut config = peer_config(&zid_subject, router_port, None);
     if bind_iface {
         config
             .listen
@@ -832,7 +848,7 @@ async fn run_isolated_peer_case(address_first: bool, bind_iface: bool) {
 
     // The only other peer in the universe. Greater zid, so it is the one that
     // must dial; own process, so its interface view is its own.
-    let later = spawn_child_peer("later", zid_later, router_port, false);
+    let later = spawn_child_peer("later", zid_later, router_port, None);
 
     if !wait_until(CONVERGENCE_TIMEOUT, || sees(&subject, zid_later)).await {
         dump("T5 failure", &[("subject", &subject)], &[&later]).await;
