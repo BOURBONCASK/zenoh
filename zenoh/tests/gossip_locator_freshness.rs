@@ -750,7 +750,7 @@ async fn t4_startup_storm_before_address_converges_after_address() {
 ///
 /// `address_first` selects the control (the address exists before anything
 /// binds) or the subject case (the address arrives after the subject bound).
-async fn run_isolated_peer_case(address_first: bool) {
+async fn run_isolated_peer_case(address_first: bool, bind_iface: bool) {
     assert_netns_precondition();
     if address_first {
         add_netns_address();
@@ -763,7 +763,17 @@ async fn run_isolated_peer_case(address_first: bool) {
     let zids = ascending_zids(2);
     let (zid_subject, zid_later) = (zids[0], zids[1]);
 
-    let subject = open_session(peer_config(&zid_subject, router_port, false), "subject").await;
+    let mut config = peer_config(&zid_subject, router_port, false);
+    if bind_iface {
+        config
+            .listen
+            .endpoints
+            .set(vec![format!("tcp/0.0.0.0:0#iface={NETNS_IFACE}")
+                .parse()
+                .unwrap()])
+            .unwrap();
+    }
+    let subject = open_session(config, "subject").await;
     assert!(
         wait_until(ROUTER_LINK_TIMEOUT, || sees_router(&subject, router_zid)).await,
         "setup: the subject never connected to the router"
@@ -817,7 +827,7 @@ async fn run_isolated_peer_case(address_first: bool) {
 #[ignore = "requires a private network namespace; run via ci/netns-check/run.sh"]
 async fn t5_control_isolated_peer_bound_after_address_is_reachable() {
     zenoh::init_log_from_env_or("error");
-    run_isolated_peer_case(true).await;
+    run_isolated_peer_case(true, false).await;
 }
 
 /// Subject: the same universe, with the address arriving after the subject
@@ -827,5 +837,19 @@ async fn t5_control_isolated_peer_bound_after_address_is_reachable() {
 #[ignore = "requires a private network namespace; run via ci/netns-check/run.sh"]
 async fn t5_isolated_peer_bound_before_address_becomes_reachable() {
     zenoh::init_log_from_env_or("error");
-    run_isolated_peer_case(false).await;
+    run_isolated_peer_case(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a private network namespace; run via ci/netns-check/run.sh"]
+async fn t5_iface_bound_control_after_address_is_reachable() {
+    zenoh::init_log_from_env_or("error");
+    run_isolated_peer_case(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires a private network namespace; run via ci/netns-check/run.sh"]
+async fn t5_iface_bound_before_address_becomes_reachable() {
+    zenoh::init_log_from_env_or("error");
+    run_isolated_peer_case(false, true).await;
 }

@@ -1561,6 +1561,36 @@ mod tests {
         assert!(!runtime.remove_pending_connection(&zid).await);
     }
 
+    #[cfg(feature = "transport_tcp")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_locator_watch_uses_bound_wildcard_with_empty_caches() {
+        use crate::net::runtime::RuntimeBuilder;
+
+        for endpoint in [None, Some("tcp/127.0.0.1:0"), Some("tcp/0.0.0.0:0")] {
+            let mut config = zenoh_config::Config::default();
+            config.set_mode(Some(WhatAmI::Peer)).unwrap();
+            config.listen.endpoints.set(vec![]).unwrap();
+            config.scouting.multicast.set_enabled(Some(false)).unwrap();
+            let runtime = RuntimeBuilder::new(config.into()).build().await.unwrap();
+            if let Some(endpoint) = endpoint {
+                runtime
+                    .manager()
+                    .add_listener(endpoint.parse().unwrap())
+                    .await
+                    .unwrap();
+            }
+            // Model the two empty caches produced by an addressless iface-bound listener.
+            // The listener itself is real; the watcher must query its bound endpoint.
+            assert!(runtime.get_locators().is_empty());
+            assert!(runtime.get_locators_noloopback().is_empty());
+            runtime.watch_for_late_locators();
+            tokio::time::sleep(LATE_LOCATOR_WATCH_PERIOD * 2).await;
+            let refreshed = !runtime.get_locators().is_empty();
+            runtime.close().await.unwrap();
+            assert_eq!(refreshed, endpoint == Some("tcp/0.0.0.0:0"), "{endpoint:?}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn scout_sender_can_multicast_on_loopback() {
         let iface = IpAddr::V4(Ipv4Addr::LOCALHOST);
