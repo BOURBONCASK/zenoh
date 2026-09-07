@@ -83,8 +83,8 @@ impl TransportUnicastUniversal {
         if !pushed && !msg.is_droppable() {
             // Condemn this link exactly once. Subsequent pushes then fast-fail in
             // `internal_schedule` (the continuous churn) instead of each re-paying
-            // wait_before_close. Producers already parked at condemn time (at most one per
-            // priority) drain naturally within wait_before_close. The close runs on the
+            // wait_before_close. Queued producers recheck at the serialization mutex; only
+            // its current holder can still spend its existing budget. The close runs on the
             // dedicated Reaper pool so recovery never competes with the RX routing pool.
             if pipeline.condemn() {
                 tracing::error!(
@@ -176,7 +176,7 @@ impl TransportUnicastUniversal {
 
         // Fast-fail on a condemned link: do not build a fresh Deadline / re-pay wait_before_close
         // for a transport already being torn down (UNRESPONSIVE). Applies to droppable and
-        // non-droppable alike, and covers the BlockFirst path below.
+        // non-droppable alike. The producer rechecks after the BlockFirst dispatch below.
         if pipeline.is_condemned() {
             #[cfg(feature = "stats")]
             stats.tx_observe_congestion(msg);

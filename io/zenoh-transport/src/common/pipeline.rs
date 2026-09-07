@@ -832,8 +832,8 @@ impl TransmissionPipelineStatus {
     }
 
     // Returns true exactly once, for the false->true transition (so the caller spawns the
-    // UNRESPONSIVE close exactly once). New pushes then fast-fail in internal_schedule; a
-    // producer already parked at condemn time drains within wait_before_close.
+    // UNRESPONSIVE close exactly once). Pushes recheck the latch at the queue mutex;
+    // only the current serializer per priority can still consume its existing budget.
     fn condemn(&self) -> bool {
         !self.condemned.swap(true, Ordering::SeqCst)
     }
@@ -884,7 +884,7 @@ pub(crate) struct TransmissionPipelineProducer {
 
 impl TransmissionPipelineProducer {
     // Condemn this link (UNRESPONSIVE): returns true exactly once (false->true transition).
-    // Subsequent `push_network_message` calls fast-fail via the check in `internal_schedule`.
+    // Subsequent network pushes fail at the serialization boundary.
     pub(crate) fn condemn(&self) -> bool {
         self.status.condemn()
     }
@@ -922,6 +922,10 @@ impl TransmissionPipelineProducer {
         let mut deadline = Deadline::new(wait_time, max_wait_time);
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
+        // The TX precheck can become stale while waiting for this mutex or dispatching BlockFirst.
+        if self.status.is_condemned() {
+            return Ok(false);
+        }
         // Check again for congestion in case it happens when blocking on the mutex.
         if msg.is_droppable() && self.status.is_congested(priority) {
             return Ok(false);
@@ -1494,7 +1498,7 @@ mod tests {
         let mut queue = producer.stage_in[0].lock().unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let mut workers = Vec::new();
         for _ in 0..3 {
             let producer = producer.clone();
