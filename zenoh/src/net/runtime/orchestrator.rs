@@ -280,7 +280,7 @@ impl Runtime {
             tracing::warn!("Scouting delay elapsed before start conditions are met.");
         }
 
-        self.watch_for_late_locators();
+        self.watch_for_late_locators().await;
 
         Ok(())
     }
@@ -1477,14 +1477,20 @@ impl Runtime {
     ///
     /// Nothing is spawned in the ordinary case where an address is already
     /// configured when the listeners come up, so this costs nothing at rest.
-    fn watch_for_late_locators(&self) {
-        // Two ways to have nothing to advertise. Only one of them is worth
-        // watching: a node bound to a wildcard endpoint still resolves to its
-        // loopback address, so an empty advertisable set next to a non-empty
-        // full set means "listening, but not on anything reachable yet". A
-        // node with no listener at all has an empty full set too, and no
-        // address will ever change that.
-        if !self.get_locators_noloopback().is_empty() || self.get_locators().is_empty() {
+    async fn watch_for_late_locators(&self) {
+        if !self.get_locators_noloopback().is_empty() {
+            return;
+        }
+        // Address expansion can be empty even with a bound wildcard listener when its
+        // selected interface has no address. Inspect bound endpoints off routing locks.
+        let has_wildcard = self.manager().get_listeners().await.iter().any(|endpoint| {
+            endpoint
+                .address()
+                .as_str()
+                .parse::<SocketAddr>()
+                .is_ok_and(|addr| addr.ip().is_unspecified())
+        });
+        if !has_wildcard {
             return;
         }
         tracing::debug!(
@@ -1583,7 +1589,7 @@ mod tests {
             // The listener itself is real; the watcher must query its bound endpoint.
             assert!(runtime.get_locators().is_empty());
             assert!(runtime.get_locators_noloopback().is_empty());
-            runtime.watch_for_late_locators();
+            runtime.watch_for_late_locators().await;
             tokio::time::sleep(LATE_LOCATOR_WATCH_PERIOD * 2).await;
             let refreshed = !runtime.get_locators().is_empty();
             runtime.close().await.unwrap();
