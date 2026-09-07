@@ -611,6 +611,41 @@ mod connect_bookkeeping {
     }
 }
 
+#[test]
+#[cfg(feature = "auth_usrpwd")]
+fn t4_configs_do_not_rewrite_credentials() {
+    use std::fs::{File, FileTimes};
+    use std::time::SystemTime;
+
+    let path = credentials_file();
+    // A fixed timestamp detects a rewrite without racing a filesystem clock tick.
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let zids = ascending_zids(5);
+    let router = router_config(7447, true);
+    let peers: Vec<_> = zids
+        .iter()
+        .map(|zid| peer_config(zid, 7447, true))
+        .collect();
+    for config in std::iter::once(&router).chain(&peers) {
+        assert_eq!(
+            config.transport.auth.usrpwd.dictionary_file().as_deref(),
+            Some(path.as_str())
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "u:p\n");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before,
+        "building configs rewrote a dictionary that an earlier open may be reading"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T4 -- production-shaped startup storm before the address exists
 // ---------------------------------------------------------------------------
