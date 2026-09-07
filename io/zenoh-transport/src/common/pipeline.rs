@@ -1472,6 +1472,122 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn condemn_rechecks_queued_and_delayed_producers() -> ZResult<()> {
+        use std::sync::mpsc;
+
+        const WBC: Duration = Duration::from_millis(300);
+        let config = TransmissionPipelineConf {
+            wait_before_close: WBC,
+            ..CONFIG_NOT_STREAMED
+        };
+        let priorities = vec![TransportPriorityTx::make(Bits::from(TransportSn::MAX))?];
+        let (producer, _consumer) = TransmissionPipeline::make(config, &priorities, false);
+        let message = NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, false),
+            ..Push::from(vec![0_u8; (CONFIG_NOT_STREAMED.batch.mtu / 2) as usize])
+        });
+        assert!(producer.push_network_message(message.as_ref()).unwrap());
+
+        // Hold the actual serialization mutex while every caller passes the TX precheck.
+        let mut queue = producer.stage_in[0].lock().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..3 {
+            let producer = producer.clone();
+            let message = message.clone();
+            let ready = ready_tx.clone();
+            let done = done_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                assert!(!producer.is_condemned());
+                assert!(producer.stage_in[0].try_lock().is_err());
+                ready.send(()).unwrap();
+                done.send(producer.push_network_message(message.as_ref()))
+                    .unwrap();
+            }));
+        }
+        #[cfg(feature = "unstable")]
+        {
+            let producer = producer.clone();
+            let ready = ready_tx.clone();
+            let done = done_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                assert!(!producer.is_condemned());
+                let message = NetworkMessage::from(Push {
+                    wire_expr: "test".into(),
+                    ext_qos: ext::QoSType::new(
+                        Priority::Control,
+                        CongestionControl::BlockFirst,
+                        false,
+                    ),
+                    ..Push::from(vec![0_u8; (CONFIG_NOT_STREAMED.batch.mtu / 2) as usize])
+                });
+                ready.send(()).unwrap();
+                // The BlockFirst worker reaches the same producer entry after dispatch.
+                release_rx.recv().unwrap();
+                done.send(producer.push_network_message(message.as_ref()))
+                    .unwrap();
+            }));
+        }
+        for _ in 0..workers.len() {
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let mut deadline = Deadline::new(WBC, None);
+        assert!(!queue
+            .push_network_message(message.as_ref(), Priority::DEFAULT, &mut deadline,)
+            .unwrap());
+        assert!(producer.condemn());
+        drop(queue);
+        #[cfg(feature = "unstable")]
+        release_tx.send(()).unwrap();
+        #[cfg(not(feature = "unstable"))]
+        let _ = (release_tx, release_rx);
+
+        let start = Instant::now();
+        for _ in 0..workers.len() {
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Ok(false)
+            ));
+        }
+        let elapsed = start.elapsed();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            elapsed < WBC,
+            "condemned cohort paid fresh budgets: {elapsed:?}"
+        );
+        assert!(!producer.condemn());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn condemn_preserves_transport_close() -> ZResult<()> {
+        let priorities = vec![TransportPriorityTx::make(Bits::from(TransportSn::MAX))?];
+        let (producer, mut consumer) =
+            TransmissionPipeline::make(CONFIG_NOT_STREAMED, &priorities, false);
+        assert!(producer.condemn());
+        assert!(producer.push_transport_message(
+            zenoh_protocol::transport::Close {
+                reason: zenoh_protocol::transport::close::reason::UNRESPONSIVE,
+                session: false,
+            }
+            .into(),
+            Priority::Background,
+        ));
+        let (batch, _) = timeout(Duration::from_secs(5), consumer.pull())
+            .await?
+            .unwrap();
+        let mut reader = batch.buffer.reader();
+        let decoded: TransportMessage = Zenoh080.read(&mut reader).unwrap();
+        assert!(matches!(decoded.body, TransportBody::Close(_)));
+        Ok(())
+    }
+
     // #1855 preserved: when NOT condemned, a Block (non-droppable) push on a full queue must still
     // wait its full `wait_before_close` budget before being dropped — the condemned fast-path must
     // be gated strictly on the condemned flag and must not fast-fail steady-state Block traffic.
