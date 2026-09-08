@@ -144,7 +144,13 @@ fn credentials_file() -> String {
         std::process::id(),
         ZenohIdProto::rand(),
     ));
-    let mut file = std::fs::File::create_new(&path).unwrap();
+    // `OpenOptions` rather than `File::create_new`: the latter is stable only since 1.77,
+    // above the workspace MSRV (1.75).
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
     file.write_all(b"u:p\n").unwrap();
     path.to_string_lossy().into_owned()
 }
