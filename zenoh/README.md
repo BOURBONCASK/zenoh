@@ -86,15 +86,9 @@ async fn main() {
 }
 ```
 
-# Rust 1.75 support
+# Rust version support
 
-The crate `zenoh` can be compiled with Rust 1.75.0, but some of its dependencies may require higher Rust versions.
-To compile `zenoh` with Rust 1.75, add a dependency on the crate [zenoh-pinned-deps-1-75](http://crates.io/crates/zenoh-pinned-deps-1-75) to your `Cargo.toml`:
-
-```toml
-zenoh = "1.5.1"
-zenoh-pinned-deps-1-75 = "1.5.1"
-```
+The crate `zenoh` requires Rust 1.81.0 or newer.
 
 # Documentation and examples
 

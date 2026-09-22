@@ -84,7 +84,7 @@ jobs:
 
   check_rust:
     needs: determine-runner
-    name: Check zenoh using Rust 1.75
+    name: Check zenoh using Rust 1.81
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -95,16 +95,16 @@ jobs:
       - name: Clone this repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Update Rust 1.75.0 toolchain
-        run: rustup update 1.75.0
+      - name: Update Rust 1.81.0 toolchain
+        run: rustup update 1.81.0
 
       - name: Setup rust-cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: false
 
-      - name: Check zenoh with rust 1.75.0
-        run: cargo +1.75.0 check --release --manifest-path ci/zenoh-1-75/Cargo.toml
+      - name: Check zenoh with rust 1.81.0
+        run: cargo +1.81.0 check --release --manifest-path ci/zenoh-1-75/Cargo.toml
 
       - name: Check clippy on stable rust without Cargo.lock to ensure compatibility with latest dependencies
         run: |
