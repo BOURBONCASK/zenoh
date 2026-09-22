@@ -79,7 +79,7 @@ edition = "2021"
 homepage = "http://zenoh.io"
 license = "EPL-2.0 OR Apache-2.0"
 repository = "https://github.com/eclipse-zenoh/zenoh"
-rust-version = "1.75.0"
+rust-version = "1.81.0"
 version = "1.10.1"
 
 # DEFAULT-FEATURES NOTE: Be careful with default-features and additivity!
@@ -134,7 +134,7 @@ libc = "0.2.175"
 libloading = "0.8.9"
 lockfree = "0.5"
 lru = "0.16.2"
-lz4_flex = "0.10.0"
+lz4_flex = "0.11.6"
 mime = "0.3.17"
 nix = { version = "0.29.0", features = ["fs"] }
 nonempty-collections = { version = "0.3.1", features = ["serde"] }
