@@ -631,8 +631,10 @@ mod connect_bookkeeping {
 #[test]
 #[cfg(feature = "auth_usrpwd")]
 fn t4_configs_do_not_rewrite_credentials() {
-    use std::fs::{File, FileTimes};
-    use std::time::SystemTime;
+    use std::{
+        fs::{File, FileTimes},
+        time::SystemTime,
+    };
 
     let path = credentials_file();
     // A fixed timestamp detects a rewrite without racing a filesystem clock tick.
