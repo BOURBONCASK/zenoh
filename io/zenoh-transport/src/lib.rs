@@ -148,3 +148,4 @@ impl TransportPeerEventHandler for DummyTransportPeerEventHandler {
         self
     }
 }
+// CI baseline no-op.
