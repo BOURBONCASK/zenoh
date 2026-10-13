@@ -26,6 +26,7 @@ mod adminspace;
 mod declare;
 mod forwarding;
 mod interest;
+mod nodeidx_reuse;
 mod oam;
 
 use std::{
@@ -732,6 +733,7 @@ pub(crate) struct HarnessBuilder {
     subregions: Vec<Region>,
     start_runtime: bool,
     start_adminspace: bool,
+    async_tree_computation: bool,
 }
 
 impl HarnessBuilder {
@@ -742,6 +744,7 @@ impl HarnessBuilder {
             subregions: Vec::new(),
             start_runtime: true,
             start_adminspace: false,
+            async_tree_computation: false,
         }
     }
 
@@ -780,6 +783,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// Use the production asynchronous (delayed, coalescing) routing-tree computation instead of
+    /// recomputing synchronously on every topology change (default: `false`).
+    pub(crate) fn async_tree_computation(mut self, value: bool) -> Self {
+        self.async_tree_computation = value;
+        self
+    }
+
     /// Consume this builder and produce a [`Harness`].
     pub(crate) fn build(self) -> Harness {
         if self.start_runtime {
@@ -802,7 +812,7 @@ impl HarnessBuilder {
             let runtime = block_on(
                 RuntimeBuilder::new(crate::api::config::Config(config))
                     .subregions(self.subregions)
-                    .disable_async_tree_computation(true)
+                    .disable_async_tree_computation(!self.async_tree_computation)
                     .build(),
             )
             .unwrap();

@@ -1416,4 +1416,121 @@ mod tests {
             "b1's links info in a's graph should be non-empty"
         );
     }
+
+    fn full_net(self_zid: ZenohIdProto) -> Network {
+        Network::new(
+            "[Test]".to_string(),
+            self_zid,
+            minimal_runtime(),
+            /* full_linkstate */ true,
+            /* gossip */ false,
+            /* gossip_multihop */ false,
+            WhatAmIMatcher::empty(),
+            AutoConnect::disabled(),
+            HashMap::new(),
+            Bound::North,
+        )
+    }
+
+    /// Connects `zid` as a router neighbour and feeds its linkstate (which lists `self_zid`)
+    /// so that the edge is established in both directions.
+    fn connect_router(net: &mut Network, self_zid: ZenohIdProto, zid: ZenohIdProto, sn: u64) {
+        use zenoh_transport::unicast::test_helpers::mock_transport_unicast;
+        let (transport, guard) = mock_transport_unicast(zid, WhatAmI::Router, Arc::new(|_| {}));
+        mem::forget(guard);
+        net.add_link(transport);
+        net.link_states(
+            vec![
+                LinkState {
+                    psid: 1,
+                    sn: 0,
+                    zid: Some(self_zid),
+                    whatami: None,
+                    locators: None,
+                    links: vec![],
+                    link_weights: None,
+                    is_gateway: false,
+                },
+                LinkState {
+                    psid: 0,
+                    sn,
+                    zid: Some(zid),
+                    whatami: Some(WhatAmI::Router),
+                    locators: None,
+                    links: vec![1],
+                    link_weights: None,
+                    is_gateway: false,
+                },
+            ],
+            zid,
+        );
+    }
+
+    fn new_children_of_self_tree(net: &mut Network) -> Vec<ZenohIdProto> {
+        let nc = net.compute_trees();
+        nc[net.idx.index()]
+            .iter()
+            .map(|i| net.graph[*i].zid)
+            .collect()
+    }
+
+    /// A different router takes over a just-freed `NodeIndex` before the next `compute_trees`,
+    /// as happens when both topology changes fall in one `TREES_COMPUTATION_DELAY_MS` window.
+    #[test]
+    fn test_compute_trees_new_child_reusing_freed_index_different_zid() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let y = "c2".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+
+        connect_router(&mut net, a, x, 1);
+        let first = new_children_of_self_tree(&mut net);
+        let x_idx = net.get_idx(&x).unwrap();
+        assert_eq!(first, vec![x]);
+
+        // Same coalescing window: x leaves, y joins, no compute in between.
+        net.remove_link(&x);
+        connect_router(&mut net, a, y, 1);
+        let y_idx = net.get_idx(&y).unwrap();
+        let second = new_children_of_self_tree(&mut net);
+        assert_eq!(y_idx, x_idx, "StableGraph should reuse the freed slot");
+        assert_eq!(
+            second,
+            vec![y],
+            "y is a new child of the local node and must be reported as such"
+        );
+    }
+
+    /// The same router drops and reconnects before the next `compute_trees`.
+    #[test]
+    fn test_compute_trees_new_child_reusing_freed_index_same_zid() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+        connect_router(&mut net, a, x, 1);
+        assert_eq!(new_children_of_self_tree(&mut net), vec![x]);
+        net.remove_link(&x);
+        connect_router(&mut net, a, x, 2);
+        let second = new_children_of_self_tree(&mut net);
+        assert_eq!(
+            second,
+            vec![x],
+            "x was reconnected and must be reported as a new child"
+        );
+    }
+
+    /// A `compute_trees` runs between the loss of `x` and the arrival of `y`.
+    #[test]
+    fn test_compute_trees_new_child_after_intermediate_computation() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let y = "c2".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+        connect_router(&mut net, a, x, 1);
+        assert_eq!(new_children_of_self_tree(&mut net), vec![x]);
+        net.remove_link(&x);
+        let _ = new_children_of_self_tree(&mut net);
+        connect_router(&mut net, a, y, 1);
+        assert_eq!(new_children_of_self_tree(&mut net), vec![y]);
+    }
 }
