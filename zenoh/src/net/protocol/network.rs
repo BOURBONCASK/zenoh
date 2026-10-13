@@ -986,6 +986,13 @@ impl Network {
         self.links.retain(|_, link| link.zid != *zid);
         self.graph[self.idx].links.retain(|dest, _| dest != zid);
 
+        // The node may stay in the graph (reachable through another router), but it is no longer
+        // our child through this link. If it reconnects before the next computation it must be
+        // reported as a new child so that existing declarations are replayed on the new face.
+        if let Some(idx) = self.get_idx(zid) {
+            self.forget_tree_child(idx);
+        }
+
         if self.full_linkstate || self.gossip_multihop {
             if let Some((edge, _)) = self
                 .get_idx(zid)
@@ -1057,8 +1064,23 @@ impl Network {
         for (idx, _) in &disconnected {
             tracing::debug!("Remove node {}", &self.graph[*idx].zid);
             self.graph.remove_node(*idx).unwrap();
+            // `graph` is a `StableGraph`: the next node added may reuse `idx` before the trees are
+            // recomputed. Drop the tree state recorded for `idx` so that `compute_trees` does not
+            // mistake the newcomer for the removed node.
+            self.forget_tree_child(*idx);
+            if let Some(tree) = self.trees.get_mut(idx.index()) {
+                tree.children.clear();
+            }
         }
         disconnected
+    }
+
+    /// Removes `idx` from the children recorded by the last [`Network::compute_trees`], so that
+    /// the next computation reports it as a new child if it is one.
+    fn forget_tree_child(&mut self, idx: NodeIndex) {
+        for tree in self.trees.iter_mut() {
+            tree.children.retain(|child| *child != idx);
+        }
     }
 
     pub(crate) fn compute_trees(&mut self) -> Vec<Vec<NodeIndex>> {
