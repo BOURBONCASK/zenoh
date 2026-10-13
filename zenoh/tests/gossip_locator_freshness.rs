@@ -144,6 +144,8 @@ fn credentials_file() -> String {
         std::process::id(),
         ZenohIdProto::rand(),
     ));
+    // `OpenOptions` rather than `File::create_new`: the latter is stable only since 1.77,
+    // above the workspace MSRV (1.75).
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -631,10 +633,8 @@ mod connect_bookkeeping {
 #[test]
 #[cfg(feature = "auth_usrpwd")]
 fn t4_configs_do_not_rewrite_credentials() {
-    use std::{
-        fs::{File, FileTimes},
-        time::SystemTime,
-    };
+    use std::fs::{File, FileTimes};
+    use std::time::SystemTime;
 
     let path = credentials_file();
     // A fixed timestamp detects a rewrite without racing a filesystem clock tick.
