@@ -134,7 +134,12 @@ libc = "0.2.175"
 libloading = "0.8.9"
 lockfree = "0.5"
 lru = "0.16.2"
-lz4_flex = "0.11.6"
+lz4_flex = { version = "0.11.6", default-features = false, features = [
+  "checked-decode",
+  "safe-decode",
+  "safe-encode",
+  "std",
+] }
 mime = "0.3.17"
 nix = { version = "0.29.0", features = ["fs"] }
 nonempty-collections = { version = "0.3.1", features = ["serde"] }
