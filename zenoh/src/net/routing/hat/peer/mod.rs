@@ -74,6 +74,9 @@ mod token;
 
 use crate::net::common::AutoConnect;
 
+// There is one `Hat` per region and it is not moved around: boxing the larger variant
+// would only add an indirection.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Hat {
     /// Uninitialized value.
     Uninit(Region),
