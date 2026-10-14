@@ -34,6 +34,16 @@ serial = { max-threads = 1 }
 filter = 'test(zenoh_querier_matching_status::)'
 test-group = 'serial'
 
+# These tests drive the production asynchronous tree computation (100 ms coalescing delay)
+# and wait for it several times, so they need more than the 2 s budget of the other regions
+# tests. Must come before the generic regions override: the first matching override wins.
+[[profile.default.overrides]]
+filter = """
+package(zenoh) and test(net::tests::regions::nodeidx_reuse::)
+"""
+retries = 0
+slow-timeout = { period = "10s", terminate-after = 1 }
+
 [[profile.default.overrides]]
 filter = """
 package(zenoh) and test(net::tests::regions)
