@@ -1416,4 +1416,233 @@ mod tests {
             "b1's links info in a's graph should be non-empty"
         );
     }
+
+    fn full_net(self_zid: ZenohIdProto) -> Network {
+        Network::new(
+            "[Test]".to_string(),
+            self_zid,
+            minimal_runtime(),
+            /* full_linkstate */ true,
+            /* gossip */ false,
+            /* gossip_multihop */ false,
+            WhatAmIMatcher::empty(),
+            AutoConnect::disabled(),
+            HashMap::new(),
+            Bound::North,
+        )
+    }
+
+    /// Connects `zid` as a router neighbour and feeds its linkstate (which lists `self_zid`)
+    /// so that the edge is established in both directions.
+    fn connect_router(net: &mut Network, self_zid: ZenohIdProto, zid: ZenohIdProto, sn: u64) {
+        use zenoh_transport::unicast::test_helpers::mock_transport_unicast;
+        let (transport, guard) = mock_transport_unicast(zid, WhatAmI::Router, Arc::new(|_| {}));
+        mem::forget(guard);
+        net.add_link(transport);
+        net.link_states(
+            vec![
+                LinkState {
+                    psid: 1,
+                    sn: 0,
+                    zid: Some(self_zid),
+                    whatami: None,
+                    locators: None,
+                    links: vec![],
+                    link_weights: None,
+                    is_gateway: false,
+                },
+                LinkState {
+                    psid: 0,
+                    sn,
+                    zid: Some(zid),
+                    whatami: Some(WhatAmI::Router),
+                    locators: None,
+                    links: vec![1],
+                    link_weights: None,
+                    is_gateway: false,
+                },
+            ],
+            zid,
+        );
+    }
+
+    fn new_children_of_self_tree(net: &mut Network) -> Vec<ZenohIdProto> {
+        let nc = net.compute_trees();
+        nc[net.idx.index()]
+            .iter()
+            .map(|i| net.graph[*i].zid)
+            .collect()
+    }
+
+    /// A different router takes over a just-freed `NodeIndex` before the next `compute_trees`,
+    /// as happens when both topology changes fall in one `TREES_COMPUTATION_DELAY_MS` window.
+    #[test]
+    fn test_compute_trees_new_child_reusing_freed_index_different_zid() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let y = "c2".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+
+        connect_router(&mut net, a, x, 1);
+        let first = new_children_of_self_tree(&mut net);
+        let x_idx = net.get_idx(&x).unwrap();
+        assert_eq!(first, vec![x]);
+
+        // Same coalescing window: x leaves, y joins, no compute in between.
+        net.remove_link(&x);
+        connect_router(&mut net, a, y, 1);
+        let y_idx = net.get_idx(&y).unwrap();
+        let second = new_children_of_self_tree(&mut net);
+        assert_eq!(y_idx, x_idx, "StableGraph should reuse the freed slot");
+        assert_eq!(
+            second,
+            vec![y],
+            "y is a new child of the local node and must be reported as such"
+        );
+    }
+
+    /// The same router drops and reconnects before the next `compute_trees`.
+    #[test]
+    fn test_compute_trees_new_child_reusing_freed_index_same_zid() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+        connect_router(&mut net, a, x, 1);
+        assert_eq!(new_children_of_self_tree(&mut net), vec![x]);
+        net.remove_link(&x);
+        connect_router(&mut net, a, x, 2);
+        let second = new_children_of_self_tree(&mut net);
+        assert_eq!(
+            second,
+            vec![x],
+            "x was reconnected and must be reported as a new child"
+        );
+    }
+
+    /// A `compute_trees` runs between the loss of `x` and the arrival of `y`.
+    #[test]
+    fn test_compute_trees_new_child_after_intermediate_computation() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let y = "c2".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+        connect_router(&mut net, a, x, 1);
+        assert_eq!(new_children_of_self_tree(&mut net), vec![x]);
+        net.remove_link(&x);
+        let _ = new_children_of_self_tree(&mut net);
+        connect_router(&mut net, a, y, 1);
+        assert_eq!(new_children_of_self_tree(&mut net), vec![y]);
+    }
+
+    /// Links `a` and `b` (two nodes already in the graph) in both directions.
+    fn link_nodes(net: &mut Network, a: ZenohIdProto, b: ZenohIdProto) {
+        let a_idx = net.get_idx(&a).unwrap();
+        let b_idx = net.get_idx(&b).unwrap();
+        net.graph[a_idx].links.insert(b, Default::default());
+        net.graph[b_idx].links.insert(a, Default::default());
+        net.update_edge(a_idx, b_idx);
+    }
+
+    /// Adds a router `zid` that is only reachable through `via`.
+    fn add_remote_router(net: &mut Network, zid: ZenohIdProto, via: ZenohIdProto) {
+        net.add_node(super::Node {
+            zid,
+            whatami: Some(WhatAmI::Router),
+            locators: None,
+            sn: 1,
+            links: HashMap::new(),
+            is_gateway: false,
+        });
+        link_nodes(net, zid, via);
+    }
+
+    /// `x` stays in the graph (reachable through `u`) while its direct link is lost and
+    /// re-established before the next `compute_trees`: no index is freed, but `x` is on a new
+    /// face and must be reported as a new child.
+    #[test]
+    fn test_compute_trees_new_child_reconnecting_while_reachable() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let u = "d3".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+        connect_router(&mut net, a, x, 1);
+        connect_router(&mut net, a, u, 1);
+        link_nodes(&mut net, x, u);
+        assert!(new_children_of_self_tree(&mut net).contains(&x));
+        let x_idx = net.get_idx(&x).unwrap();
+
+        net.remove_link(&x);
+        assert_eq!(
+            net.get_idx(&x),
+            Some(x_idx),
+            "x must stay reachable through u"
+        );
+        connect_router(&mut net, a, x, 2);
+        assert_eq!(new_children_of_self_tree(&mut net), vec![x]);
+    }
+
+    /// A different router takes over the index of a removed tree root before the next
+    /// `compute_trees`: the children of the tree rooted at that index are new for the new root.
+    #[test]
+    fn test_compute_trees_new_root_reusing_freed_index() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let y = "c2".parse::<ZenohIdProto>().unwrap();
+        let u = "d3".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+        connect_router(&mut net, a, x, 1);
+        connect_router(&mut net, a, u, 1);
+        let x_idx = net.get_idx(&x).unwrap();
+        let u_idx = net.get_idx(&u).unwrap();
+        net.compute_trees();
+        assert_eq!(net.trees[x_idx.index()].children, vec![u_idx]);
+
+        net.remove_link(&x);
+        connect_router(&mut net, a, y, 1);
+        let y_idx = net.get_idx(&y).unwrap();
+        assert_eq!(y_idx, x_idx, "StableGraph should reuse the freed slot");
+        let new_children = net.compute_trees();
+        assert_eq!(new_children[y_idx.index()], vec![u_idx]);
+    }
+
+    /// Same as above, but the root is removed by a linkstate received from a neighbor (whose
+    /// own link to us is unchanged) rather than by losing one of our links.
+    #[test]
+    fn test_compute_trees_new_root_reusing_index_freed_by_linkstate() {
+        let a = "a0".parse::<ZenohIdProto>().unwrap();
+        let x = "b1".parse::<ZenohIdProto>().unwrap();
+        let r = "e4".parse::<ZenohIdProto>().unwrap();
+        let y = "c2".parse::<ZenohIdProto>().unwrap();
+        let u = "d3".parse::<ZenohIdProto>().unwrap();
+        let mut net = full_net(a);
+        connect_router(&mut net, a, x, 1);
+        connect_router(&mut net, a, u, 1);
+        add_remote_router(&mut net, r, x);
+        let r_idx = net.get_idx(&r).unwrap();
+        let u_idx = net.get_idx(&u).unwrap();
+        net.compute_trees();
+        assert_eq!(net.trees[r_idx.index()].children, vec![u_idx]);
+
+        // x now only links to us: r is detached and removed.
+        net.link_states(
+            vec![LinkState {
+                psid: 0,
+                sn: 2,
+                zid: Some(x),
+                whatami: Some(WhatAmI::Router),
+                locators: None,
+                links: vec![1],
+                link_weights: None,
+                is_gateway: false,
+            }],
+            x,
+        );
+        assert!(net.get_idx(&r).is_none());
+
+        add_remote_router(&mut net, y, x);
+        let y_idx = net.get_idx(&y).unwrap();
+        assert_eq!(y_idx, r_idx, "StableGraph should reuse the freed slot");
+        let new_children = net.compute_trees();
+        assert_eq!(new_children[y_idx.index()], vec![u_idx]);
+    }
 }
