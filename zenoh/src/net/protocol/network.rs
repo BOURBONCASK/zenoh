@@ -146,6 +146,14 @@ pub(crate) struct Network {
     pub(crate) graph: petgraph::stable_graph::StableUnGraph<Node, f64>,
     pub(crate) runtime: WeakRuntime,
     pub(crate) link_weights: HashMap<ZenohIdProto, LinkEdgeWeight>,
+    /// Nodes that must be reported as new children by the next [`Network::compute_trees`] even
+    /// if they were children in the previous computation: a neighbor whose link was removed (it
+    /// may come back on a new face) or a removed node (`graph` is a `StableGraph`, so another node
+    /// may reuse its index).
+    stale_children: HashSet<NodeIndex>,
+    /// Tree roots whose children must all be reported as new by the next
+    /// [`Network::compute_trees`]: removed nodes, whose index may be reused by another root.
+    stale_roots: HashSet<NodeIndex>,
 }
 
 impl Network {
@@ -191,6 +199,8 @@ impl Network {
             graph,
             runtime: Runtime::downgrade(&runtime),
             link_weights,
+            stale_children: HashSet::new(),
+            stale_roots: HashSet::new(),
         }
     }
 
@@ -985,6 +995,11 @@ impl Network {
         tracing::trace!("{} remove_link {}", self.name, zid);
         self.links.retain(|_, link| link.zid != *zid);
         self.graph[self.idx].links.retain(|dest, _| dest != zid);
+        // `trees` still routes declarations and undeclarations until the next computation, so
+        // the neighbor is only marked here rather than removed from the recorded children.
+        if let Some(idx) = self.get_idx(zid) {
+            self.stale_children.insert(idx);
+        }
 
         if self.full_linkstate || self.gossip_multihop {
             if let Some((edge, _)) = self
@@ -1013,6 +1028,7 @@ impl Network {
         } else {
             if let Some(idx) = self.get_idx(zid) {
                 self.graph.remove_node(idx);
+                self.stale_roots.insert(idx);
             }
 
             vec![]
@@ -1057,6 +1073,8 @@ impl Network {
         for (idx, _) in &disconnected {
             tracing::debug!("Remove node {}", &self.graph[*idx].zid);
             self.graph.remove_node(*idx).unwrap();
+            self.stale_children.insert(*idx);
+            self.stale_roots.insert(*idx);
         }
         disconnected
     }
@@ -1067,6 +1085,8 @@ impl Network {
 
         let old_children: Vec<Vec<NodeIndex>> =
             self.trees.iter().map(|t| t.children.clone()).collect();
+        let stale_children = std::mem::take(&mut self.stale_children);
+        let stale_roots = std::mem::take(&mut self.stale_roots);
 
         self.trees.clear();
         self.trees.resize_with(max_idx.index() + 1, || Tree {
@@ -1149,11 +1169,12 @@ impl Network {
         new_children.resize(self.trees.len(), vec![]);
 
         for i in 0..new_children.len() {
-            new_children[i] = if i < old_children.len() {
+            new_children[i] = if i < old_children.len() && !stale_roots.contains(&NodeIndex::new(i))
+            {
                 self.trees[i]
                     .children
                     .iter()
-                    .filter(|idx| !old_children[i].contains(idx))
+                    .filter(|idx| !old_children[i].contains(idx) || stale_children.contains(idx))
                     .cloned()
                     .collect()
             } else {
