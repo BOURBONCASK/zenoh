@@ -744,7 +744,11 @@ impl<F: AcceptorCallback> QuicAcceptor<F> {
 
     /// Drives one incoming connection end-to-end: QUIC+TLS handshake, first
     /// stream/ALPN, link construction, and hand-off to the transport manager.
-    async fn drive_handshake(&self, incoming: quinn::Incoming, src_addr: SocketAddr) -> ZResult<()> {
+    async fn drive_handshake(
+        &self,
+        incoming: quinn::Incoming,
+        src_addr: SocketAddr,
+    ) -> ZResult<()> {
         let admission = tokio::time::timeout(
             std::time::Duration::from_millis(*QUIC_ACCEPT_CONNECTION_TIMEOUT_MS),
             async {
