@@ -202,8 +202,10 @@ impl TransportLinkUnicastUniversal {
                 // to finish in the close() joining its handle
                 // TODO(yuyuan): do more study to check which ZRuntime should be used or refine the
                 // termination
-                zenoh_runtime::ZRuntime::Net
-                    .spawn(async move { transport.del_link(tx.inner.link()).await });
+                let task_controller = transport.manager.task_controller.clone();
+                task_controller.spawn_with_rt(zenoh_runtime::ZRuntime::Net, async move {
+                    transport.del_link(tx.inner.link()).await
+                });
             }
         };
         self.task_controller
@@ -239,7 +241,8 @@ impl TransportLinkUnicastUniversal {
                 // to finish in the close() joining its handle
                 // WARN: Must be spawned on RX
 
-                zenoh_runtime::ZRuntime::RX.spawn(async move {
+                let task_controller = transport.manager.task_controller.clone();
+                task_controller.spawn_with_rt(zenoh_runtime::ZRuntime::RX, async move {
                     transport
                         .del_link(Link::new_unicast(&rx.link, priorities, reliability))
                         .await

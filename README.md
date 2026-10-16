@@ -66,10 +66,7 @@ If you already have the Rust toolchain installed, make sure it is up to date wit
 rustup update
 ```
 
-Zenoh can be successfully compiled with Rust stable (>= 1.75.0), but some of its dependencies may require
-newer Rust versions. The `zenoh` crate itself doesn't lock its dependencies with "=" to avoid conflicts.
-Instead, we provide the [zenoh-pinned-deps-1-75](commons/zenoh-pinned-deps-1-75) crate
-with `zenoh` dependencies locked to Rust 1.75-compatible versions.
+Zenoh can be successfully compiled with Rust stable (>= 1.81.0).
 
 To build Zenoh, simply type the command below after having followed the previous instructions:
 
