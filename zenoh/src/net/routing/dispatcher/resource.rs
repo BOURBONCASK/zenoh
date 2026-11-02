@@ -685,13 +685,15 @@ impl Resource {
                         };
                     }
                 }
-                if face.region.bound().is_north()
-                    || face.remote_key_interests.values().any(|res| {
-                        res.as_ref()
-                            .map(|res| res.matches(&nonwild_prefix))
-                            .unwrap_or(true)
-                    })
-                {
+                // Routers never send UndeclareKeyExpr, so a mapping lives as long as its face.
+                // North-bound faces (router mesh) are long-lived: mapping every key forwarded
+                // over them would pin each key ever declared in the system. Send full keys there
+                // and only map keys for faces that explicitly asked for keyexpr declarations.
+                if face.remote_key_interests.values().any(|res| {
+                    res.as_ref()
+                        .map(|res| res.matches(&nonwild_prefix))
+                        .unwrap_or(true)
+                }) {
                     let ctx = get_mut_unchecked(&mut nonwild_prefix)
                         .face_ctxs
                         .entry(face.id)

@@ -14,18 +14,22 @@
 
 //! Tests involving [`zenoh_protocol::network::declare`].
 
+use std::sync::Arc;
+
 use zenoh_protocol::{
     core::{Bound, Region, WhatAmI, WireExpr},
     network::{
         declare::queryable::ext::QueryableInfoType,
         interest::{InterestMode, InterestOptions},
-        Mapping,
+        Declare, DeclareBody, Mapping,
     },
 };
 
 use super::{
-    try_init_tracing_subscriber, Connection, EstablishedConnection, FaceDef, HarnessBuilder,
+    try_init_tracing_subscriber, Connection, EstablishedConnection, FaceDef, Harness,
+    HarnessBuilder, Message,
 };
+use crate::net::routing::dispatcher::resource::Resource;
 
 /// Tests that the gateway doesn't propagate tokens to the source router region.
 #[test]
@@ -468,4 +472,89 @@ fn test_router_disconnect_undeclares_token() {
     r1_r2.disconnect();
 
     assert_eq!(r2s.recorder().undeclared_tokens().len(), 1);
+}
+
+/// Tests that a router sends full keys (no `DeclareKeyExpr`) to a north router face, and that the
+/// resources of declarations forwarded over that face are released on both routers once
+/// undeclared. Routers never send `UndeclareKeyExpr`, so a mapping on a long-lived router-to-router
+/// face would keep every key ever forwarded over it alive.
+#[test]
+fn test_no_keyexpr_mapping_towards_north_router_face() {
+    try_init_tracing_subscriber();
+
+    const SUBSCRIBER_KEY: &str = "a/b/c/subscriber";
+    const QUERYABLE_KEY: &str = "a/b/c/queryable";
+    const TOKEN_KEY: &str = "a/b/c/token";
+
+    let r0 = HarnessBuilder::new()
+        .mode(WhatAmI::Router)
+        .subregions([Region::Local])
+        .build();
+    let r1 = HarnessBuilder::new()
+        .mode(WhatAmI::Router)
+        .subregions([Region::Local])
+        .build();
+
+    let mut r0_r1 = Connection {
+        a: &r0,
+        b: &r1,
+        a2b: FaceDef::default().mode(WhatAmI::Router),
+        b2a: FaceDef::default().mode(WhatAmI::Router),
+    }
+    .establish();
+    r0_r1.bi_fwd();
+
+    let r0s = r0.new_session();
+    r0s.declare_subscriber(None, 1, SUBSCRIBER_KEY);
+    r0s.declare_queryable(None, 2, QUERYABLE_KEY, QueryableInfoType::DEFAULT);
+    r0s.declare_token(None, 3, TOKEN_KEY);
+    r0_r1.bi_fwd();
+
+    let sent_keyexprs = r0_r1.a2b.recorder().with_messages(|msgs| {
+        msgs.iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    Message::Declare(Declare {
+                        body: DeclareBody::DeclareKeyExpr(_),
+                        ..
+                    })
+                )
+            })
+            .count()
+    });
+    assert_eq!(sent_keyexprs, 0);
+
+    let subscribers = r0_r1.a2b.recorder().subscribers();
+    assert_eq!(subscribers.len(), 1);
+    assert_eq!(subscribers[0].wire_expr.scope, 0);
+    assert_eq!(subscribers[0].wire_expr.suffix, SUBSCRIBER_KEY);
+
+    let queryables = r0_r1.a2b.recorder().queryables();
+    assert_eq!(queryables.len(), 1);
+    assert_eq!(queryables[0].wire_expr.scope, 0);
+    assert_eq!(queryables[0].wire_expr.suffix, QUERYABLE_KEY);
+
+    let tokens = r0_r1.a2b.recorder().tokens();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].wire_expr.scope, 0);
+    assert_eq!(tokens[0].wire_expr.suffix, TOKEN_KEY);
+
+    let weak_resource = |h: &Harness, key: &str| {
+        Resource::get_resource(zread!(h.gateway.tables.tables).data._get_root(), key)
+            .map(|res| Arc::downgrade(&res))
+            .expect("resource should exist while declared")
+    };
+    let resources = [&r0, &r1].map(|h| {
+        [SUBSCRIBER_KEY, QUERYABLE_KEY, TOKEN_KEY].map(|key| (key, weak_resource(h, key)))
+    });
+
+    r0s.undeclare_subscriber(1);
+    r0s.undeclare_queryable(2);
+    r0s.undeclare_token(3);
+    r0_r1.bi_fwd();
+
+    for (key, res) in resources.iter().flatten() {
+        assert!(res.upgrade().is_none(), "resource {key} was not released");
+    }
 }
