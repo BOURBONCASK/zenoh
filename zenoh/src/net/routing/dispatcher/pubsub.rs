@@ -106,8 +106,10 @@ impl Face {
                 send_declare,
             };
 
+            // NOTE: move `res` into the hat (don't clone it) so that `Resource::clean` below sees
+            // no extra strong reference and can drop the resource.
             if let Some(mut res) =
-                tables.hats[region].unregister_subscriber(ctx.reborrow(), id, res.clone(), node_id)
+                tables.hats[region].unregister_subscriber(ctx.reborrow(), id, res, node_id)
             {
                 tables.hats[region].disable_data_routes(&mut res);
 

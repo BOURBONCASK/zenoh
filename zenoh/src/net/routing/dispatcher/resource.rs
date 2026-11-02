@@ -685,7 +685,12 @@ impl Resource {
                         };
                     }
                 }
-                if face.region.bound().is_north()
+                // Routers never send UndeclareKeyExpr, so a mapping lives as long as its face.
+                // Faces to nodes of our own north region (router-router or peer-peer mesh) are
+                // long-lived and carry every key declared in the system: mapping them would pin
+                // each key ever forwarded. Send full keys there; keep mapping keys on the uplink
+                // to a node that has us in its south region (e.g. client to router).
+                if (face.region.bound().is_north() && face.remote_bound.is_south())
                     || face.remote_key_interests.values().any(|res| {
                         res.as_ref()
                             .map(|res| res.matches(&nonwild_prefix))
