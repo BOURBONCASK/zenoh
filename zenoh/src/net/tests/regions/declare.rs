@@ -558,3 +558,40 @@ fn test_no_keyexpr_mapping_towards_north_router_face() {
         assert!(res.upgrade().is_none(), "resource {key} was not released");
     }
 }
+
+/// Tests that a router still maps keyexprs on its uplink to a gateway that has it in a south
+/// region (only faces within the same north region skip mappings).
+#[test]
+fn test_keyexpr_mapping_kept_towards_north_gateway() {
+    try_init_tracing_subscriber();
+
+    let n = HarnessBuilder::new()
+        .mode(WhatAmI::Router)
+        .subregions([Region::default_south(WhatAmI::Router), Region::Local])
+        .build();
+    let s = HarnessBuilder::new()
+        .mode(WhatAmI::Router)
+        .subregions([Region::Local])
+        .build();
+
+    let mut s_n = Connection {
+        a: &s,
+        b: &n,
+        a2b: FaceDef::default()
+            .mode(WhatAmI::Router)
+            .remote_bound(Bound::South),
+        b2a: FaceDef::default()
+            .mode(WhatAmI::Router)
+            .region(Region::default_south(WhatAmI::Router)),
+    }
+    .establish();
+    s_n.bi_fwd();
+
+    let ss = s.new_session();
+    ss.declare_queryable(None, 1, "a/b/c/queryable", QueryableInfoType::DEFAULT);
+    s_n.bi_fwd();
+
+    let queryables = s_n.a2b.recorder().queryables();
+    assert_eq!(queryables.len(), 1);
+    assert_ne!(queryables[0].wire_expr.scope, 0);
+}
