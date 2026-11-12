@@ -42,6 +42,19 @@ serial = { max-threads = 1 }
 filter = 'test(zenoh_querier_matching_status::)'
 test-group = 'serial'
 
+# These two tests run more than u16::MAX declare/undeclare cycles and take about 3 s each,
+# so they cannot meet the 2 s limit of the `net::tests::regions` override below.
+# This override has to come first: nextest takes each setting from the first match.
+[[profile.default.overrides]]
+filter = """
+package(zenoh) and (
+  test(=net::tests::regions::expr_id::should_keep_routing_declarations_after_more_than_u16_max_churn_cycles) |
+  test(=net::tests::regions::expr_id::should_undeclare_an_expr_id_before_declaring_it_again)
+)
+"""
+retries = 0
+slow-timeout = { period = "30s", terminate-after = 1 }
+
 [[profile.default.overrides]]
 filter = """
 package(zenoh) and test(net::tests::regions)
