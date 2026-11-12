@@ -901,6 +901,8 @@ impl TransmissionPipelineProducer {
             (self.status.waits.wait_before_close, None)
         };
         let mut deadline = Deadline::new(wait_time, max_wait_time);
+        #[cfg(test)]
+        tests::after_entry_check();
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
         // The check on entry can be stale by now: this thread may have waited for the mutex
@@ -1171,6 +1173,19 @@ mod tests {
 
     const SLEEP: Duration = Duration::from_millis(100);
     const TIMEOUT: Duration = Duration::from_secs(60);
+
+    thread_local! {
+        // Runs once on the thread that set it, when `push_network_message` has passed its
+        // entry check and has not asked for the stage_in mutex yet.
+        static AFTER_ENTRY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_entry_check() {
+        if let Some(hook) = AFTER_ENTRY_CHECK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
 
     const CONFIG_STREAMED: TransmissionPipelineConf = TransmissionPipelineConf {
         batch: BatchConfig {
@@ -1474,7 +1489,10 @@ mod tests {
         // Takes the only batch: nothing pulls it, so every later push finds the queue full.
         assert!(producer.push_network_message(message.as_ref()).unwrap());
 
-        // Hold the serialization mutex while the other producers pass the entry check.
+        // Hold the serialization mutex while the other producers pass the entry check. Each
+        // of them reports from inside `push_network_message`, after that check and before it
+        // asks for the mutex, so none of them can still be in front of the check when the
+        // pipeline is marked disabled below.
         let mut queue = producer.stage_in[0].lock().unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -1485,8 +1503,9 @@ mod tests {
             let ready = ready_tx.clone();
             let done = done_tx.clone();
             workers.push(std::thread::spawn(move || {
-                assert!(producer.stage_in[0].try_lock().is_err());
-                ready.send(()).unwrap();
+                AFTER_ENTRY_CHECK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || ready.send(()).unwrap()));
+                });
                 done.send(producer.push_network_message(message.as_ref()))
                     .unwrap();
             }));
@@ -1503,22 +1522,19 @@ mod tests {
         producer.mark_disabled();
         drop(queue);
 
-        let start = Instant::now();
         let mut results = Vec::new();
         for _ in 0..QUEUED {
             results.push(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         }
-        let elapsed = start.elapsed();
         for worker in workers {
             worker.join().unwrap();
         }
+        // An error can only come from the check made with the mutex held: every producer was
+        // past the entry check before the pipeline was disabled, and the consumer is alive.
+        // A producer that starts a budget of its own returns `Ok(false)` instead.
         assert!(
             results.iter().all(|r| r.is_err()),
             "queued producers pushed to a disabled pipeline: {results:?}"
-        );
-        assert!(
-            elapsed < WBC,
-            "queued producers paid fresh budgets on a disabled pipeline: {elapsed:?}"
         );
         Ok(())
     }
@@ -1554,8 +1570,8 @@ mod tests {
             "expected Ok(false) after the budget, got {r:?}"
         );
         assert!(
-            elapsed >= WBC / 2,
-            "a Block push should wait about wait_before_close ({WBC:?}), waited {elapsed:?}"
+            elapsed >= WBC,
+            "a Block push should wait its whole wait_before_close ({WBC:?}), waited {elapsed:?}"
         );
         Ok(())
     }
