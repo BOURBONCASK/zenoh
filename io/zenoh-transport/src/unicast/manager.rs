@@ -945,6 +945,27 @@ impl TransportManager {
         Ok(())
     }
 
+    /// Unregisters the transport that owns `config`, and nothing else: a teardown that
+    /// gets here late can find the transport of a newer connection with the same peer
+    /// registered under its peer id.
+    pub(super) async fn del_this_transport_unicast(
+        &self,
+        config: &TransportConfigUnicast,
+    ) -> ZResult<()> {
+        let mut guard = zasynclock!(self.state.unicast.transports);
+        match guard.get(&config.zid) {
+            Some(transport) if std::ptr::eq(transport.get_config(), config) => {
+                guard.remove(&config.zid);
+                Ok(())
+            }
+            _ => {
+                let e = zerror!("Can not delete the transport of peer: {}", config.zid);
+                tracing::trace!("{}", e);
+                Err(e.into())
+            }
+        }
+    }
+
     pub(crate) async fn handle_new_link_unicast(&self, link: LinkUnicast) {
         let incoming_counter = self.state.unicast.incoming.clone();
         if incoming_counter.load(SeqCst) >= self.config.unicast.accept_pending {

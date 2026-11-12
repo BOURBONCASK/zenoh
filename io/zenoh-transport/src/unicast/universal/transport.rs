@@ -181,7 +181,8 @@ impl TransportUnicastUniversal {
         // We also drop the status_guard, to avoid deadlock due to different lock acquisition order in init_existing_transport unicast.
         // The lock is no longer needed at this point, as we have already marked the transport as not alive and taken the callback to notify it of the closure.
         drop(status_guard);
-        let _ = self.manager.del_transport_unicast(&self.config.zid).await;
+        // Every clone of this transport shares `config`, and no other transport does.
+        let _ = self.manager.del_this_transport_unicast(&self.config).await;
         Ok(())
     }
 
