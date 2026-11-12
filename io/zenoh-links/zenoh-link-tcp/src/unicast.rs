@@ -304,7 +304,9 @@ impl LinkUnicastTrait for LinkUnicastTcp {
         let stream = stream.into_std()?;
         let fd = AsyncFd::with_interest(stream, Interest::WRITABLE)?;
         *slot = TcpSocket::WriteOnly(fd);
-        tracing::debug!("TCP link {}: RX detached from the tokio reactor", self);
+        // No log statement here: the transport calls this while it holds the
+        // write lock on its link table, and formatting a transport for another
+        // log event takes the read lock on that table.
         Ok(())
     }
 }
