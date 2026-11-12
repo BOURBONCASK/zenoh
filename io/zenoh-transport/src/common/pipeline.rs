@@ -903,6 +903,11 @@ impl TransmissionPipelineProducer {
         let mut deadline = Deadline::new(wait_time, max_wait_time);
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
+        // The check on entry can be stale by now: this thread may have waited for the mutex
+        // behind the push that spent `wait_before_close` and marked the pipeline disabled.
+        if self.status.is_disabled() {
+            return Err(TransportClosed);
+        }
         // Check again for congestion in case it happens when blocking on the mutex.
         if msg.is_droppable() && self.status.is_congested(priority) {
             return Ok(false);
