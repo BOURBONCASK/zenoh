@@ -12,6 +12,8 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+use std::sync::atomic::Ordering;
+
 #[cfg(feature = "unstable")]
 use zenoh_protocol::core::CongestionControl;
 use zenoh_protocol::{
@@ -75,7 +77,13 @@ impl TransportUnicastUniversal {
         pushed: bool,
         #[cfg(feature = "stats")] stats: zenoh_stats::LinkStats,
     ) {
-        if !pushed && !msg.is_droppable() {
+        // Several pushes can give up on the same unresponsive peer: one per priority queue
+        // that has a producer waiting for a batch, and the producers that find the stage_in
+        // mutex free before the pipeline is marked disabled. Only the first of them closes
+        // the transport. A close task for each of them would tear the transport down again
+        // and again, and a late one could unregister the transport of a new connection
+        // with the same peer.
+        if !pushed && !msg.is_droppable() && !self.unresponsive.swap(true, Ordering::Relaxed) {
             tracing::error!(
                 "Unable to push non droppable network message to {}. Closing transport!",
                 self.config.zid

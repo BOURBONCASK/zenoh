@@ -96,6 +96,8 @@ pub(crate) struct TransportUnicastUniversal {
     pub(super) callback: Arc<ClosableCallback>,
     // Mutex for notification
     pub(super) status: Arc<AsyncMutex<TransportStatus>>,
+    // Set by the first push that gives up on an unresponsive peer and starts the close task
+    pub(super) unresponsive: Arc<AtomicBool>,
     // Transport statistics
     #[cfg(feature = "stats")]
     pub(super) stats: zenoh_stats::TransportStats,
@@ -139,6 +141,7 @@ impl TransportUnicastUniversal {
             links: Arc::new(RwLock::new(TransportLinks::default())),
             callback: Arc::new(ClosableCallback::new()),
             status: Arc::new(AsyncMutex::new(TransportStatus::Uninitialized)),
+            unresponsive: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "stats")]
             stats,
             #[cfg(feature = "shared-memory")]
