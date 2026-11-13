@@ -109,6 +109,10 @@ pub(crate) struct Hat {
     routers_trees_worker: TreesComputationWorker,
     #[cfg(test)]
     disable_async_tree_computation: bool,
+    /// Tests only: never compute trees on topology changes; the test runs
+    /// [`Hat::compute_trees_now`] itself.
+    #[cfg(test)]
+    manual_tree_computation: bool,
 }
 
 impl Debug for Hat {
@@ -128,12 +132,24 @@ impl Hat {
             routers_trees_worker: TreesComputationWorker::new(region),
             #[cfg(test)]
             disable_async_tree_computation: false,
+            #[cfg(test)]
+            manual_tree_computation: false,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn set_disable_async_tree_computation(&mut self, value: bool) {
         self.disable_async_tree_computation = value;
+    }
+
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn set_manual_tree_computation(&mut self, value: bool) {
+        self.manual_tree_computation = value;
+    }
+
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn compute_trees_now(&mut self, tables: &mut TablesData) {
+        self.do_compute_trees(tables);
     }
 
     pub(crate) fn net(&self) -> &Network {
@@ -187,7 +203,9 @@ impl Hat {
     fn compute_trees(&mut self, ctx: DispatcherContext) {
         #[cfg(test)]
         {
-            if self.disable_async_tree_computation {
+            if self.manual_tree_computation {
+                tracing::trace!("Trees computation left to the test");
+            } else if self.disable_async_tree_computation {
                 self.do_compute_trees(ctx.tables);
             } else {
                 self.compute_trees_async(ctx.tables_lock.clone());

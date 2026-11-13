@@ -229,6 +229,10 @@ pub(crate) trait HatBaseTrait: Any {
         Ok(())
     }
 
+    /// Re-announce this node's own link state to its neighbours. Hats that
+    /// do not advertise locators have nothing to do.
+    fn readvertise_locators(&mut self) {}
+
     fn links_info(&self) -> HashMap<ZenohIdProto, LinkInfo> {
         HashMap::new()
     }

@@ -366,13 +366,23 @@ impl TransportManager {
             }
         }
 
-        let mut tu_guard = zasynclock!(self.state.unicast.transports)
+        let tu_guard = zasynclock!(self.state.unicast.transports)
             .drain()
             .map(|(_, v)| v)
             .collect::<Vec<Arc<dyn TransportUnicastTrait>>>();
-        for tu in tu_guard.drain(..) {
-            let _ = tu.close(close::reason::GENERIC).await;
-        }
+        // Close all unicast transports concurrently. Each `tu.close()` already
+        // performs its own per-transport serialization (wtable / link state),
+        // so concurrent execution does not change the per-transport cost — it
+        // only collapses the manager's wall-clock from N × cost to ≈ max(cost).
+        //
+        // Without this, `session.close()` on a peer connected to N other peers
+        // pays N × per-transport-close time, which under the 50-peer churn
+        // workload accumulates to multiple seconds and amplifies tail latency
+        // observed during peer restart cycles.
+        let close_futs = tu_guard
+            .into_iter()
+            .map(|tu| async move { tu.close(close::reason::GENERIC).await });
+        let _ = futures::future::join_all(close_futs).await;
     }
 
     /*************************************/
@@ -933,6 +943,27 @@ impl TransportManager {
                 e
             })?;
         Ok(())
+    }
+
+    /// Unregisters the transport that owns `config`, and nothing else: a teardown that
+    /// gets here late can find the transport of a newer connection with the same peer
+    /// registered under its peer id.
+    pub(super) async fn del_this_transport_unicast(
+        &self,
+        config: &TransportConfigUnicast,
+    ) -> ZResult<()> {
+        let mut guard = zasynclock!(self.state.unicast.transports);
+        match guard.get(&config.zid) {
+            Some(transport) if std::ptr::eq(transport.get_config(), config) => {
+                guard.remove(&config.zid);
+                Ok(())
+            }
+            _ => {
+                let e = zerror!("Can not delete the transport of peer: {}", config.zid);
+                tracing::trace!("{}", e);
+                Err(e.into())
+            }
+        }
     }
 
     pub(crate) async fn handle_new_link_unicast(&self, link: LinkUnicast) {

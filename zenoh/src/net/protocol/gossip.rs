@@ -383,11 +383,14 @@ impl Gossip {
             }
 
             if self.autoconnect.should_autoconnect(zid, whatami) {
-                // Connect discovered peers (only if locators are available)
-                if let Some(locators) = locators {
+                // Connect discovered peers (only if locators are available).
+                // An empty list is not "available": the peer advertised itself
+                // before it had a routable address, and dialling nothing would
+                // arm the start condition below with nothing able to release it.
+                if let Some(locators) = locators.filter(|l| !l.is_empty()) {
                     let runtime = strong_runtime.clone();
                     let wait_declares = self.wait_declares;
-                    strong_runtime.spawn(async move {
+                    strong_runtime.spawn_abortable(async move {
                         if runtime
                             .manager()
                             .get_transport_unicast(&zid)
@@ -417,6 +420,24 @@ impl Gossip {
                 .start_conditions()
                 .terminate_peer_connector_zid(src);
         }
+    }
+
+    /// Re-announce this node's own link state, so that a locator set which
+    /// was empty when the links came up gets replaced at the far end. The
+    /// sequence number has to advance or receivers keep what they already have.
+    pub(crate) fn readvertise_self(&mut self) {
+        self.graph[self.idx].sn += 1;
+        self.send_on_links(
+            vec![(
+                self.idx,
+                Details {
+                    zid: false,
+                    locators: true,
+                    links: true,
+                },
+            )],
+            |_| true,
+        );
     }
 
     #[allow(clippy::incompatible_msrv)]

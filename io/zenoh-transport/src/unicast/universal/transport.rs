@@ -96,6 +96,8 @@ pub(crate) struct TransportUnicastUniversal {
     pub(super) callback: Arc<ClosableCallback>,
     // Mutex for notification
     pub(super) status: Arc<AsyncMutex<TransportStatus>>,
+    // Set by the first push that gives up on an unresponsive peer and starts the close task
+    pub(super) unresponsive: Arc<AtomicBool>,
     // Transport statistics
     #[cfg(feature = "stats")]
     pub(super) stats: zenoh_stats::TransportStats,
@@ -139,6 +141,7 @@ impl TransportUnicastUniversal {
             links: Arc::new(RwLock::new(TransportLinks::default())),
             callback: Arc::new(ClosableCallback::new()),
             status: Arc::new(AsyncMutex::new(TransportStatus::Uninitialized)),
+            unresponsive: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "stats")]
             stats,
             #[cfg(feature = "shared-memory")]
@@ -178,7 +181,8 @@ impl TransportUnicastUniversal {
         // We also drop the status_guard, to avoid deadlock due to different lock acquisition order in init_existing_transport unicast.
         // The lock is no longer needed at this point, as we have already marked the transport as not alive and taken the callback to notify it of the closure.
         drop(status_guard);
-        let _ = self.manager.del_transport_unicast(&self.config.zid).await;
+        // Every clone of this transport shares `config`, and no other transport does.
+        let _ = self.manager.del_this_transport_unicast(&self.config).await;
         Ok(())
     }
 
@@ -302,6 +306,28 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
                 );
                 let (l, asl) = link.fail();
                 return Err((e.into(), l, asl, close::reason::MAX_LINKS));
+            }
+        }
+
+        // io_uring owns the RX side of this link: drop the READABLE registration
+        // the link keeps with its tokio reactor before any task uses the socket.
+        #[cfg(all(
+            feature = "uring",
+            target_os = "linux",
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "loongarch64",
+                target_arch = "powerpc64"
+            )
+        ))]
+        if self.manager.state.uring.is_some() && link.link.link.get_fd().is_ok() {
+            // SAFETY: Establishment I/O has completed. The link is not published
+            // to the transport yet, and its TX/RX tasks have not been started.
+            if let Err(e) = unsafe { link.link.link.detach_rx_from_reactor() } {
+                let (l, asl) = link.fail();
+                return Err((e, l, asl, close::reason::GENERIC));
             }
         }
 

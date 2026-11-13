@@ -901,8 +901,15 @@ impl TransmissionPipelineProducer {
             (self.status.waits.wait_before_close, None)
         };
         let mut deadline = Deadline::new(wait_time, max_wait_time);
+        #[cfg(test)]
+        tests::after_entry_check();
         // Lock the channel. We are the only one that will be writing on it.
         let mut queue = zlock!(self.stage_in[idx]);
+        // The check on entry can be stale by now: this thread may have waited for the mutex
+        // behind the push that spent `wait_before_close` and marked the pipeline disabled.
+        if self.status.is_disabled() {
+            return Err(TransportClosed);
+        }
         // Check again for congestion in case it happens when blocking on the mutex.
         if msg.is_droppable() && self.status.is_congested(priority) {
             return Ok(false);
@@ -1166,6 +1173,19 @@ mod tests {
 
     const SLEEP: Duration = Duration::from_millis(100);
     const TIMEOUT: Duration = Duration::from_secs(60);
+
+    thread_local! {
+        // Runs once on the thread that set it, when `push_network_message` has passed its
+        // entry check and has not asked for the stage_in mutex yet.
+        static AFTER_ENTRY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn after_entry_check() {
+        if let Some(hook) = AFTER_ENTRY_CHECK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
 
     const CONFIG_STREAMED: TransmissionPipelineConf = TransmissionPipelineConf {
         batch: BatchConfig {
@@ -1442,6 +1462,117 @@ mod tests {
             timeout(TIMEOUT, h2).await??;
         }
 
+        Ok(())
+    }
+
+    // A push that passed the entry check and is waiting for the stage_in mutex when the
+    // pipeline is marked disabled must fail as soon as it gets the mutex. Otherwise every
+    // queued producer starts a fresh `wait_before_close` budget, one after the other, on a
+    // transport that is already being closed as unresponsive.
+    #[test]
+    fn disabled_pipeline_rejects_queued_producers() -> ZResult<()> {
+        use std::sync::mpsc;
+
+        const WBC: Duration = Duration::from_millis(300);
+        const QUEUED: usize = 3;
+        let config = TransmissionPipelineConf {
+            wait_before_close: WBC,
+            ..CONFIG_NOT_STREAMED
+        };
+        let priorities = vec![TransportPriorityTx::make(Bits::from(TransportSn::MAX))?];
+        let (producer, _consumer) = TransmissionPipeline::make(config, &priorities, false);
+        let message = NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, false),
+            ..Push::from(vec![0_u8; (CONFIG_NOT_STREAMED.batch.mtu / 2) as usize])
+        });
+        // Takes the only batch: nothing pulls it, so every later push finds the queue full.
+        assert!(producer.push_network_message(message.as_ref()).unwrap());
+
+        // Hold the serialization mutex while the other producers pass the entry check. Each
+        // of them reports from inside `push_network_message`, after that check and before it
+        // asks for the mutex, so none of them can still be in front of the check when the
+        // pipeline is marked disabled below.
+        let mut queue = producer.stage_in[0].lock().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..QUEUED {
+            let producer = producer.clone();
+            let message = message.clone();
+            let ready = ready_tx.clone();
+            let done = done_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                AFTER_ENTRY_CHECK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || ready.send(()).unwrap()));
+                });
+                done.send(producer.push_network_message(message.as_ref()))
+                    .unwrap();
+            }));
+        }
+        for _ in 0..QUEUED {
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        // The push holding the mutex spends its whole budget, as the first push to an
+        // unresponsive transport does, and the close decision follows.
+        let mut deadline = Deadline::new(WBC, None);
+        assert!(!queue
+            .push_network_message(message.as_ref(), Priority::DEFAULT, &mut deadline)
+            .unwrap());
+        producer.mark_disabled();
+        drop(queue);
+
+        let mut results = Vec::new();
+        for _ in 0..QUEUED {
+            results.push(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        // An error can only come from the check made with the mutex held: every producer was
+        // past the entry check before the pipeline was disabled, and the consumer is alive.
+        // A producer that starts a budget of its own returns `Ok(false)` instead.
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "queued producers pushed to a disabled pipeline: {results:?}"
+        );
+        Ok(())
+    }
+
+    // #1855 preserved: a Block (non-droppable) push on a full queue still waits its full
+    // `wait_before_close` budget while the pipeline is enabled. The fail-fast path must
+    // depend on the disabled flag only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn block_push_keeps_full_budget_when_not_disabled() -> ZResult<()> {
+        const WBC: Duration = Duration::from_millis(300);
+        let config = TransmissionPipelineConf {
+            wait_before_close: WBC,
+            ..CONFIG_NOT_STREAMED
+        };
+        let priorities = vec![TransportPriorityTx::make(Bits::from(TransportSn::MAX))?];
+        let (producer, _consumer) = TransmissionPipeline::make(config, &priorities, false);
+
+        let h = task::spawn_blocking(move || {
+            let message = NetworkMessage::from(Push {
+                wire_expr: "test".into(),
+                ext_qos: ext::QoSType::new(Priority::Control, CongestionControl::Block, false),
+                ..Push::from(vec![0_u8; (CONFIG_NOT_STREAMED.batch.mtu / 2) as usize])
+            });
+            producer.push_network_message(message.as_ref()).unwrap();
+            let start = Instant::now();
+            let r = producer.push_network_message(message.as_ref());
+            (r, start.elapsed())
+        });
+
+        let (r, elapsed) = timeout(Duration::from_secs(5), h).await??;
+        assert!(
+            matches!(r, Ok(false)),
+            "expected Ok(false) after the budget, got {r:?}"
+        );
+        assert!(
+            elapsed >= WBC,
+            "a Block push should wait its whole wait_before_close ({WBC:?}), waited {elapsed:?}"
+        );
         Ok(())
     }
 

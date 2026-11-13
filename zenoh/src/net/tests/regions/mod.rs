@@ -24,8 +24,10 @@
 
 mod adminspace;
 mod declare;
+mod expr_id;
 mod forwarding;
 mod interest;
+mod nodeidx_reuse;
 mod oam;
 
 use std::{
@@ -66,8 +68,9 @@ use crate::net::{
     primitives::{DeMux, EPrimitives, Primitives},
     protocol::linkstate::{LinkState, LinkStateList},
     routing::{
-        dispatcher::face::Face,
+        dispatcher::{face::Face, tables::TablesData},
         gateway::{Gateway, GatewayBuilder},
+        hat::router::Hat as RouterHat,
         RoutingContext,
     },
     runtime::{Runtime, RuntimeBuilder},
@@ -238,6 +241,27 @@ impl RecordingPrimitives {
                 } else {
                     None
                 }
+            })
+            .collect()
+    }
+
+    /// Key expression mapping messages in arrival order: `(id, Some(expr))` for a
+    /// `DeclareKeyExpr`, `(id, None)` for an `UndeclareKeyExpr`.
+    pub(crate) fn keyexpr_mappings(&self) -> Vec<(ExprId, Option<String>)> {
+        self.messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                Message::Declare(Declare {
+                    body: DeclareBody::DeclareKeyExpr(d),
+                    ..
+                }) => Some((d.id, Some(d.wire_expr.suffix.to_string()))),
+                Message::Declare(Declare {
+                    body: DeclareBody::UndeclareKeyExpr(u),
+                    ..
+                }) => Some((u.id, None)),
+                _ => None,
             })
             .collect()
     }
@@ -732,6 +756,7 @@ pub(crate) struct HarnessBuilder {
     subregions: Vec<Region>,
     start_runtime: bool,
     start_adminspace: bool,
+    manual_tree_computation: bool,
 }
 
 impl HarnessBuilder {
@@ -742,6 +767,7 @@ impl HarnessBuilder {
             subregions: Vec::new(),
             start_runtime: true,
             start_adminspace: false,
+            manual_tree_computation: false,
         }
     }
 
@@ -780,8 +806,26 @@ impl HarnessBuilder {
         self
     }
 
+    /// Leave routing tree computation to the test (default: `false`): topology changes do not
+    /// compute trees until [`Harness::compute_trees`] is called. This lets a test reproduce
+    /// several topology changes being folded into one computation, as the asynchronous
+    /// computation does in production.
+    pub(crate) fn manual_tree_computation(mut self, value: bool) -> Self {
+        self.manual_tree_computation = value;
+        self
+    }
+
     /// Consume this builder and produce a [`Harness`].
     pub(crate) fn build(self) -> Harness {
+        let manual_tree_computation = self.manual_tree_computation;
+        let harness = self.build_harness();
+        if manual_tree_computation {
+            harness.with_router_hats(|hat, _| hat.set_manual_tree_computation(true));
+        }
+        harness
+    }
+
+    fn build_harness(self) -> Harness {
         if self.start_runtime {
             let mut config = Config::default();
             if let Some(zid) = self.zid {
@@ -878,6 +922,22 @@ impl Harness {
 
     pub(crate) fn zid(&self) -> ZenohIdProto {
         self.zid
+    }
+
+    /// Compute the routing trees of every router region now. See
+    /// [`HarnessBuilder::manual_tree_computation`].
+    pub(crate) fn compute_trees(&self) {
+        self.with_router_hats(|hat, tables| hat.compute_trees_now(tables));
+    }
+
+    fn with_router_hats(&self, mut f: impl FnMut(&mut RouterHat, &mut TablesData)) {
+        let mut guard = self.gateway.tables.tables.write().unwrap();
+        let tables = &mut *guard;
+        for hat in tables.hats.values_mut() {
+            if let Some(hat) = hat.as_any_mut().downcast_mut::<RouterHat>() {
+                f(hat, &mut tables.data);
+            }
+        }
     }
 
     pub(crate) fn new_session(&self) -> MockFace {

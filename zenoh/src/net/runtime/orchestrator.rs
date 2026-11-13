@@ -49,6 +49,8 @@ use super::{Runtime, RuntimeSession};
 use crate::net::{common::AutoConnect, protocol::linkstate::LinkInfo};
 
 const RCV_BUF_SIZE: usize = u16::MAX as usize;
+/// How often a node with nothing to advertise re-checks its interfaces.
+const LATE_LOCATOR_WATCH_PERIOD: Duration = Duration::from_secs(1);
 const SCOUT_INITIAL_PERIOD: Duration = Duration::from_millis(1_000);
 const SCOUT_MAX_PERIOD: Duration = Duration::from_millis(8_000);
 const SCOUT_PERIOD_INCREASE_FACTOR: u32 = 2;
@@ -282,6 +284,9 @@ impl Runtime {
         {
             tracing::warn!("Scouting delay elapsed before start conditions are met.");
         }
+
+        self.watch_for_late_locators().await;
+
         Ok(())
     }
 
@@ -580,6 +585,8 @@ impl Runtime {
         retry_config: zenoh_config::ConnectionRetryConf,
     ) {
         let this = self.clone();
+        // Not abortable: a listener aborted part way through its setup can keep what it bound.
+        // The retry loop gives way to the runtime's cancellation between attempts instead.
         self.spawn(async move {
             this.add_listener_retry(listener, retry_config).await;
             this.print_locators();
@@ -592,11 +599,15 @@ impl Runtime {
         retry_config: zenoh_config::ConnectionRetryConf,
     ) {
         let mut period = retry_config.period();
+        let cancellation_token = self.get_cancellation_token();
         loop {
             if self.add_listener(listener.clone()).await.is_ok() {
                 break;
             }
-            tokio::time::sleep(period.next_duration()).await;
+            tokio::select! {
+                _ = tokio::time::sleep(period.next_duration()) => {}
+                _ = cancellation_token.cancelled() => break,
+            }
         }
     }
 
@@ -878,7 +889,7 @@ impl Runtime {
             let gossip = unwrap_or_default!(config.scouting().gossip().enabled());
             let wait_declares = unwrap_or_default!(config.open().return_conditions().declares());
             drop(config_guard);
-            self.spawn(async move {
+            self.spawn_abortable(async move {
                 if let Ok(zid) = this.peer_connector_retry(peer).await {
                     this.state.start_conditions.set_peer_connector_zid(idx, zid);
                 }
@@ -1408,7 +1419,7 @@ impl Runtime {
 
         if !peers.is_empty() {
             let runtime = session.runtime.clone();
-            session.runtime.spawn(async move {
+            session.runtime.spawn_abortable(async move {
                 runtime
                     .peers_connector_retry(peers, runtime.whatami() == WhatAmI::Client)
                     .await
@@ -1442,10 +1453,67 @@ impl Runtime {
 
         if peers.contains(&endpoint) && zwrite!(session.endpoints).remove(&endpoint) {
             let runtime = session.runtime.clone();
-            session.runtime.spawn(async move {
+            session.runtime.spawn_abortable(async move {
                 let _ = runtime.peer_connector_retry(endpoint).await;
             });
         }
+    }
+
+    /// Re-announce our own link state on every hat that keeps one.
+    ///
+    /// Resolving locators is *not* done here: `print_locators` must have run
+    /// beforehand, off-lock, because it reaches `TransportManager::get_locators`
+    /// and that blocks in place.
+    pub(crate) fn readvertise_locators(&self) {
+        let router = self.router();
+        let _ctrl_lock = zlock!(router.tables.ctrl_lock);
+        let mut wtables = zwrite!(router.tables.tables);
+        for hat in wtables.hats.values_mut() {
+            hat.readvertise_locators();
+        }
+    }
+
+    /// A node that binds a wildcard listener before its interface has a
+    /// routable address advertises an empty locator set, and no transport
+    /// event will ever revisit it: a peer with no locators cannot be dialled,
+    /// and a peer that dials nobody -- the smallest zid under the `greater-zid`
+    /// strategy, say -- never gains a transport of its own either. Watch for
+    /// the address instead, announce it once, and stop.
+    ///
+    /// Nothing is spawned in the ordinary case where an address is already
+    /// configured when the listeners come up, so this costs nothing at rest.
+    async fn watch_for_late_locators(&self) {
+        if !self.get_locators_noloopback().is_empty() {
+            return;
+        }
+        // Address expansion can be empty even with a bound wildcard listener when its
+        // selected interface has no address. Inspect bound endpoints off routing locks.
+        let has_wildcard = self.manager().get_listeners().await.iter().any(|endpoint| {
+            endpoint
+                .address()
+                .as_str()
+                .parse::<SocketAddr>()
+                .is_ok_and(|addr| addr.ip().is_unspecified())
+        });
+        if !has_wildcard {
+            return;
+        }
+        tracing::debug!(
+            "No locator to advertise yet: will announce one if an address appears later"
+        );
+        let runtime = self.clone();
+        self.spawn_abortable(async move {
+            loop {
+                tokio::time::sleep(LATE_LOCATOR_WATCH_PERIOD).await;
+                // Off-lock by construction: this task holds nothing.
+                runtime.print_locators();
+                if !runtime.get_locators_noloopback().is_empty() {
+                    tracing::info!("Locators became available: re-announcing link state");
+                    runtime.readvertise_locators();
+                    return;
+                }
+            }
+        });
     }
 
     #[allow(dead_code)]
@@ -1502,6 +1570,36 @@ mod tests {
 
         assert!(!runtime.connect(&zid, &[locator]).await);
         assert!(!runtime.remove_pending_connection(&zid).await);
+    }
+
+    #[cfg(feature = "transport_tcp")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_locator_watch_uses_bound_wildcard_with_empty_caches() {
+        use crate::net::runtime::RuntimeBuilder;
+
+        for endpoint in [None, Some("tcp/127.0.0.1:0"), Some("tcp/0.0.0.0:0")] {
+            let mut config = zenoh_config::Config::default();
+            config.set_mode(Some(WhatAmI::Peer)).unwrap();
+            config.listen.endpoints.set(vec![]).unwrap();
+            config.scouting.multicast.set_enabled(Some(false)).unwrap();
+            let runtime = RuntimeBuilder::new(config.into()).build().await.unwrap();
+            if let Some(endpoint) = endpoint {
+                runtime
+                    .manager()
+                    .add_listener(endpoint.parse().unwrap())
+                    .await
+                    .unwrap();
+            }
+            // Model the two empty caches produced by an addressless iface-bound listener.
+            // The listener itself is real; the watcher must query its bound endpoint.
+            assert!(runtime.get_locators().is_empty());
+            assert!(runtime.get_locators_noloopback().is_empty());
+            runtime.watch_for_late_locators().await;
+            tokio::time::sleep(LATE_LOCATOR_WATCH_PERIOD * 2).await;
+            let refreshed = !runtime.get_locators().is_empty();
+            runtime.close().await.unwrap();
+            assert_eq!(refreshed, endpoint == Some("tcp/0.0.0.0:0"), "{endpoint:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

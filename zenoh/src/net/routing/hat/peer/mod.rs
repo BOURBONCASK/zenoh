@@ -74,6 +74,9 @@ mod token;
 
 use crate::net::common::AutoConnect;
 
+// There is one `Hat` per region and it is not moved around: boxing the larger variant
+// would only add an indirection.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Hat {
     /// Uninitialized value.
     Uninit(Region),
@@ -396,6 +399,12 @@ impl HatBaseTrait for Hat {
         0
     }
 
+    fn readvertise_locators(&mut self) {
+        if let Some(net) = self.net_mut() {
+            net.readvertise_self();
+        }
+    }
+
     fn info(&self) -> String {
         self.net()
             .as_ref()
@@ -610,6 +619,13 @@ impl NetMut<'_> {
         match self {
             Self::Gossip(n) => n.remove_link(zid),
             Self::Network(n) => n.remove_link(zid),
+        }
+    }
+
+    pub(crate) fn readvertise_self(self) {
+        match self {
+            Self::Gossip(n) => n.readvertise_self(),
+            Self::Network(n) => n.readvertise_self(),
         }
     }
 
