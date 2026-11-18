@@ -567,6 +567,21 @@ impl Resource {
         }
     }
 
+    /// Clears the cached routes of `res` and of all its descendants, in every region.
+    pub(crate) fn disable_subtree_routes(res: &Arc<Resource>) {
+        let mut stack = vec![res.clone()];
+        while let Some(mut res) = stack.pop() {
+            if let Some(ctx) = get_mut_unchecked(&mut res).ctx.as_deref_mut() {
+                ctx.disable_data_routes();
+                for hat in ctx.hats.values_mut() {
+                    hat.disable_data_routes();
+                    hat.disable_query_routes();
+                }
+            }
+            stack.extend(res.children.iter().map(|child| child.0.clone()));
+        }
+    }
+
     /// Releases the ids this node declared for `res` to its faces when those mappings are the
     /// only remaining holders of `res` besides the caller, `clean`'s clone and the parent, and
     /// sends `UndeclareKeyExpr` to each face so the remote releases them too.
@@ -1072,6 +1087,8 @@ pub(crate) fn unregister_expr(tables: &TablesLock, face: &mut Arc<FaceState>, ex
             }
             hats[region].disable_data_routes(&mut res);
             hats[region].disable_query_routes(&mut res);
+            // Routes cached on descendants may use this id with a suffix (e.g. `(id, "/c")`).
+            Resource::disable_subtree_routes(&res);
             face.update_interceptors_caches(&mut res);
             Resource::clean(&mut res);
         }
