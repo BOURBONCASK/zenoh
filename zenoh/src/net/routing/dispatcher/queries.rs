@@ -134,8 +134,7 @@ impl Face {
                 send_declare,
             };
 
-            match tables.hats[region].unregister_queryable(ctx.reborrow(), id, res.clone(), node_id)
-            {
+            match tables.hats[region].unregister_queryable(ctx.reborrow(), id, res, node_id) {
                 UnregisterEntityResult::Noop => {} // ¯\_(ツ)_/¯
                 UnregisterEntityResult::DisableRoutes { mut res } => {
                     tables.hats[region].disable_query_routes(&mut res);

@@ -107,7 +107,7 @@ impl Face {
             };
 
             if let Some(mut res) =
-                tables.hats[region].unregister_subscriber(ctx.reborrow(), id, res.clone(), node_id)
+                tables.hats[region].unregister_subscriber(ctx.reborrow(), id, res, node_id)
             {
                 tables.hats[region].disable_data_routes(&mut res);
 
