@@ -228,3 +228,191 @@ fn should_resolve_the_key_of_a_token_undeclared_to_a_face_that_never_saw_it_decl
         vec![Some("a/b".to_string())]
     );
 }
+
+mod router_mesh {
+    use std::sync::Arc;
+
+    use zenoh_protocol::{
+        core::WireExpr,
+        network::{declare::queryable::ext::QueryableInfoType, Mapping},
+    };
+
+    use super::*;
+    use crate::net::{
+        routing::dispatcher::resource::Resource,
+        tests::regions::{Connection, EstablishedConnection},
+    };
+
+    fn two_meshed_routers() -> (Harness, Harness, EstablishedConnection) {
+        try_init_tracing_subscriber();
+        let r0 = HarnessBuilder::new()
+            .mode(WhatAmI::Router)
+            .subregions([Region::Local])
+            .build();
+        let r1 = HarnessBuilder::new()
+            .mode(WhatAmI::Router)
+            .subregions([Region::Local])
+            .build();
+        let mut conn = Connection {
+            a: &r0,
+            b: &r1,
+            a2b: FaceDef::default().mode(WhatAmI::Router),
+            b2a: FaceDef::default().mode(WhatAmI::Router),
+        }
+        .establish();
+        conn.bi_fwd();
+        (r0, r1, conn)
+    }
+
+    fn weak_resource(h: &Harness, key: &str) -> std::sync::Weak<Resource> {
+        Resource::get_resource(zread!(h.gateway.tables.tables).data._get_root(), key)
+            .map(|res| Arc::downgrade(&res))
+            .unwrap_or_else(|| panic!("resource {key} should exist while declared"))
+    }
+
+    /// Declare a subscriber, a queryable and a token on r0, undeclare them, and return the keys
+    /// whose resources are still alive on either router.
+    fn churn_one_of_each(
+        r0: &Harness,
+        r1: &Harness,
+        conn: &mut EstablishedConnection,
+    ) -> Vec<String> {
+        const KEYS: [&str; 3] = ["m/sub/leaf", "m/qabl/leaf", "m/token/leaf"];
+        let s = r0.new_session();
+        s.declare_subscriber(None, 1, KEYS[0]);
+        s.declare_queryable(None, 2, KEYS[1], QueryableInfoType::DEFAULT);
+        s.declare_token(None, 3, KEYS[2]);
+        conn.bi_fwd();
+        let weak = [("r0", r0), ("r1", r1)]
+            .map(|(name, h)| KEYS.map(|key| (format!("{name}:{key}"), weak_resource(h, key))));
+        s.undeclare_subscriber(1);
+        s.undeclare_queryable(2);
+        s.undeclare_token(3);
+        conn.bi_fwd();
+        weak.into_iter()
+            .flatten()
+            .filter(|(_, res)| res.upgrade().is_some())
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// Resources of declarations forwarded over a router-to-router face are released on both
+    /// routers once undeclared (the mapped path).
+    #[test]
+    fn should_release_resources_on_both_routers() {
+        let (r0, r1, mut conn) = two_meshed_routers();
+
+        let alive = churn_one_of_each(&r0, &r1, &mut conn);
+
+        assert_eq!(alive, Vec::<String>::new());
+        assert_eq!(local_mappings(&conn.a2b), 0);
+    }
+
+    /// Same, when the face fell back to full keys because its id space is exhausted.
+    #[test]
+    fn should_release_resources_on_both_routers_with_full_keys() {
+        let (r0, r1, mut conn) = two_meshed_routers();
+        exhaust_expr_ids(&conn.a2b);
+
+        let alive = churn_one_of_each(&r0, &r1, &mut conn);
+
+        assert_eq!(alive, Vec::<String>::new());
+    }
+
+    /// r1 routes `a/b/c` to r0's `a/**` subscriber using r0's id for `a/b` (mapping=Receiver).
+    /// After r0 releases that id, r1 must stop using it.
+    #[test]
+    fn should_keep_delivering_a_child_key_after_its_parent_expr_id_is_released() {
+        let (r0, r1, mut conn) = two_meshed_routers();
+        let wild = r0.new_session();
+        wild.declare_subscriber(None, 1, "a/**");
+        let parent = r0.new_session();
+        parent.declare_subscriber(None, 1, "a/b");
+        let publisher = r1.new_session();
+        publisher.declare_keyexpr(None, 1, "a/b/c");
+        conn.bi_fwd();
+        let put = |n: u8| {
+            publisher.put(
+                WireExpr {
+                    scope: 1,
+                    suffix: "".into(),
+                    mapping: Mapping::Sender,
+                },
+                vec![n],
+            )
+        };
+
+        put(0);
+        conn.bi_fwd();
+        assert_eq!(wild.recorder().pushes().len(), 1);
+
+        parent.undeclare_subscriber(1);
+        conn.bi_fwd();
+        put(1);
+        conn.bi_fwd();
+
+        let sent: Vec<_> = conn
+            .b2a
+            .recorder()
+            .pushes()
+            .into_iter()
+            .map(|p| p.wire_expr.to_owned())
+            .collect();
+        let undeclared = conn
+            .a2b
+            .recorder()
+            .keyexpr_mappings()
+            .into_iter()
+            .filter(|(_, e)| e.is_none())
+            .count();
+        assert_eq!(
+            wild.recorder().pushes().len(),
+            2,
+            "r1 sent {sent:?} to r0; r0 sent {undeclared} UndeclareKeyExpr"
+        );
+    }
+
+    /// Same as above, once r0 has reused the released id for another key: r1's stale route then
+    /// makes r0 deliver `a/b/c` samples as `z/y/c`.
+    #[test]
+    fn should_not_deliver_a_child_key_under_the_key_that_reused_its_parent_expr_id() {
+        let (r0, r1, mut conn) = two_meshed_routers();
+        let wild = r0.new_session();
+        wild.declare_subscriber(None, 1, "a/**");
+        let parent = r0.new_session();
+        parent.declare_subscriber(None, 1, "a/b");
+        let publisher = r1.new_session();
+        publisher.declare_keyexpr(None, 1, "a/b/c");
+        conn.bi_fwd();
+        let put = || {
+            publisher.put(
+                WireExpr {
+                    scope: 1,
+                    suffix: "".into(),
+                    mapping: Mapping::Sender,
+                },
+                vec![0],
+            )
+        };
+        put();
+        conn.bi_fwd();
+        assert_eq!(wild.recorder().pushes().len(), 1);
+
+        exhaust_expr_ids(&conn.a2b);
+        parent.undeclare_subscriber(1);
+        let victim = r0.new_session();
+        victim.declare_subscriber(None, 1, "z/y/**");
+        conn.bi_fwd();
+        put();
+        conn.bi_fwd();
+
+        let misdelivered: Vec<_> = victim
+            .recorder()
+            .pushes()
+            .into_iter()
+            .map(|p| p.wire_expr.suffix.to_string())
+            .collect();
+        assert_eq!(misdelivered, Vec::<String>::new());
+        assert_eq!(wild.recorder().pushes().len(), 2);
+    }
+}

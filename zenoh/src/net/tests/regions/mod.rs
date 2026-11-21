@@ -589,6 +589,49 @@ impl MockFace {
         });
     }
 
+    /// Undeclare a subscriber by key expression, as routers do for sourced subscribers.
+    pub(crate) fn undeclare_subscriber_by_key(&self, wire_expr: impl Into<WireExpr<'static>>) {
+        self.face.send_declare(&mut Declare {
+            interest_id: None,
+            ext_qos: ext::QoSType::DECLARE,
+            ext_tstamp: None,
+            ext_nodeid: NodeIdType::DEFAULT,
+            body: DeclareBody::UndeclareSubscriber(UndeclareSubscriber {
+                id: SubscriberId::default(),
+                ext_wire_expr: WireExprType {
+                    wire_expr: wire_expr.into(),
+                },
+            }),
+        });
+    }
+
+    /// Undeclare a queryable by key expression, as routers do for sourced queryables.
+    pub(crate) fn undeclare_queryable_by_key(&self, wire_expr: impl Into<WireExpr<'static>>) {
+        self.face.send_declare(&mut Declare {
+            interest_id: None,
+            ext_qos: ext::QoSType::DECLARE,
+            ext_tstamp: None,
+            ext_nodeid: NodeIdType::DEFAULT,
+            body: DeclareBody::UndeclareQueryable(UndeclareQueryable {
+                id: QueryableId::default(),
+                ext_wire_expr: WireExprType {
+                    wire_expr: wire_expr.into(),
+                },
+            }),
+        });
+    }
+
+    /// Undeclare a keyexpr from this face's perspective.
+    pub(crate) fn undeclare_keyexpr(&self, id: ExprId) {
+        self.face.send_declare(&mut Declare {
+            interest_id: None,
+            ext_qos: ext::QoSType::DECLARE,
+            ext_tstamp: None,
+            ext_nodeid: NodeIdType::DEFAULT,
+            body: DeclareBody::UndeclareKeyExpr(zenoh_protocol::network::UndeclareKeyExpr { id }),
+        });
+    }
+
     /// Declare a subscriber for `key_expr` from this face's perspective.
     pub(crate) fn declare_subscriber(
         &self,

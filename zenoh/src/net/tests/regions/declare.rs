@@ -14,6 +14,8 @@
 
 //! Tests involving [`zenoh_protocol::network::declare`].
 
+use std::sync::Arc;
+
 use zenoh_protocol::{
     core::{Bound, Region, WhatAmI, WireExpr},
     network::{
@@ -24,8 +26,10 @@ use zenoh_protocol::{
 };
 
 use super::{
-    try_init_tracing_subscriber, Connection, EstablishedConnection, FaceDef, HarnessBuilder,
+    try_init_tracing_subscriber, Connection, EstablishedConnection, FaceDef, Harness,
+    HarnessBuilder,
 };
+use crate::net::routing::dispatcher::resource::Resource;
 
 /// Tests that the gateway doesn't propagate tokens to the source router region.
 #[test]
@@ -468,4 +472,89 @@ fn test_router_disconnect_undeclares_token() {
     r1_r2.disconnect();
 
     assert_eq!(r2s.recorder().undeclared_tokens().len(), 1);
+}
+
+/// Tests that once a face undeclares a keyexpr, the gateway stops using its id in routes cached on
+/// child resources (e.g. `(id, "/c")` for `a/b/c` when the face declared `a/b`).
+#[test]
+fn test_undeclared_keyexpr_is_not_used_by_cached_child_route() {
+    try_init_tracing_subscriber();
+
+    let router = Harness::new_router();
+    let client = || {
+        router.new_face(
+            FaceDef::default()
+                .mode(WhatAmI::Client)
+                .region(Region::default_south(WhatAmI::Client)),
+        )
+    };
+    let subscriber = client();
+    subscriber.declare_keyexpr(None, 5, "a/b");
+    subscriber.declare_subscriber(None, 1, "a/**");
+    let publisher = client();
+    publisher.declare_keyexpr(None, 1, "a/b/c");
+    let put = || {
+        publisher.put(
+            WireExpr {
+                scope: 1,
+                suffix: "".into(),
+                mapping: Mapping::Sender,
+            },
+            vec![0],
+        )
+    };
+
+    put();
+    subscriber.undeclare_keyexpr(5);
+    put();
+
+    let sent: Vec<_> = subscriber
+        .recorder()
+        .pushes()
+        .into_iter()
+        .map(|p| (p.wire_expr.scope, p.wire_expr.mapping))
+        .collect();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0], (5, Mapping::Receiver));
+    assert_ne!(sent[1], (5, Mapping::Receiver), "{sent:?}");
+}
+
+/// Tests that a router releases the resources of a subscriber and a queryable that another router
+/// undeclares by key expression (sourced declarations carry no id).
+#[test]
+fn test_undeclare_by_key_from_router_releases_resource() {
+    try_init_tracing_subscriber();
+
+    let r0 = HarnessBuilder::new()
+        .mode(WhatAmI::Router)
+        .subregions([Region::Local])
+        .build();
+    let r1 = HarnessBuilder::new()
+        .mode(WhatAmI::Router)
+        .subregions([Region::Local])
+        .build();
+    let mut r0_r1 = Connection {
+        a: &r0,
+        b: &r1,
+        a2b: FaceDef::default().mode(WhatAmI::Router),
+        b2a: FaceDef::default().mode(WhatAmI::Router),
+    }
+    .establish();
+    r0_r1.bi_fwd();
+
+    // r0's face on r1 declares and undeclares with full keys
+    let from_r0 = &r0_r1.b2a;
+    from_r0.declare_subscriber(None, 0, "x/subscriber");
+    from_r0.declare_queryable(None, 0, "x/queryable", QueryableInfoType::DEFAULT);
+    let weak = ["x/subscriber", "x/queryable"].map(|key| {
+        let res = Resource::get_resource(zread!(r1.gateway.tables.tables).data._get_root(), key)
+            .expect("resource should exist while declared");
+        (key, Arc::downgrade(&res))
+    });
+    from_r0.undeclare_subscriber_by_key("x/subscriber");
+    from_r0.undeclare_queryable_by_key("x/queryable");
+
+    for (key, res) in weak {
+        assert!(res.upgrade().is_none(), "resource {key} was not released");
+    }
 }

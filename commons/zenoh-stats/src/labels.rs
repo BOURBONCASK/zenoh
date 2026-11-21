@@ -147,6 +147,26 @@ impl EncodeLabelValue for ReasonLabel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RejectionReasonLabel {
+    MaxSessions,
+    AcceptTimeout,
+}
+
+impl EncodeLabelValue for RejectionReasonLabel {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> fmt::Result {
+        encoder.write_str(match self {
+            Self::MaxSessions => "max_sessions",
+            Self::AcceptTimeout => "accept_timeout",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+pub(crate) struct SessionRejectionLabels {
+    pub(crate) reason: RejectionReasonLabel,
+}
+
 pub(crate) const SHM_NUM: usize = 2;
 
 macro_rules! wrap_label {
