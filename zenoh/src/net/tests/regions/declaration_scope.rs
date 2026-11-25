@@ -279,6 +279,28 @@ fn sent_by(face: &MockFace, key: impl Fn(&WireExpr) -> String) -> Sent {
     }
 }
 
+/// What was sent between `before` and `after`, two [`sent`] of the same face. (Clearing the
+/// recorder of a connected face would make it skip forwarding the next messages.)
+fn since(after: Sent, before: &Sent) -> Sent {
+    fn minus(mut after: Vec<String>, before: &[String]) -> Vec<String> {
+        for key in before {
+            if let Some(i) = after.iter().position(|k| k == key) {
+                after.remove(i);
+            }
+        }
+        after
+    }
+    Sent {
+        subscribers: minus(after.subscribers, &before.subscribers),
+        queryables: minus(after.queryables, &before.queryables),
+        tokens: minus(after.tokens, &before.tokens),
+        undeclared_subscribers: minus(after.undeclared_subscribers, &before.undeclared_subscribers),
+        undeclared_queryables: minus(after.undeclared_queryables, &before.undeclared_queryables),
+        undeclared_tokens: minus(after.undeclared_tokens, &before.undeclared_tokens),
+        keyexpr_mappings: after.keyexpr_mappings - before.keyexpr_mappings,
+    }
+}
+
 /// The subscribers, queryables and tokens `h` knows from other routers.
 fn known(h: &Harness) -> [BTreeSet<String>; 3] {
     let zid = h.zid().to_string();
@@ -724,13 +746,13 @@ fn a_transit_router_is_detected_and_no_longer_filtered() {
         [6, 0, 0],
         "k and later_b withheld from A"
     );
-    ga.a2b.recorder().clear();
+    let before = sent(&ga.a2b);
 
     let mut ab = connect_routers(&a, &b);
     settle(&mut [&mut ga, &mut ab]);
     assert_eq!(transit_faces(&g), [1, 2]);
     assert_eq!(
-        sent(&ga.a2b),
+        since(sent(&ga.a2b), &before),
         Sent::declared([k.as_str(), later_b.as_str()])
     );
     assert_eq!(known(&b), known_all([k.as_str(), later_b.as_str()]));
@@ -921,4 +943,106 @@ fn the_mode_is_read_at_start_only() {
     settle(&mut [&mut ga]);
     assert_eq!(sent(&ga.a2b), Sent::default());
     assert_eq!(scope_state(&g, SN_A).0, [3, 0, 0]);
+}
+
+/// G—A, then A—B: what the gateway sends to A across the transit change, with the given option.
+fn transit_change_output(conf: &str) -> (Sent, [usize; 2]) {
+    let g = gateway(conf);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga]);
+    let app = g.new_session();
+    declare(&app, 1, &[&own(SN_B)]);
+    settle(&mut [&mut ga]);
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    let transit = scoped_hat(&g, |hat, _| hat.transit_faces());
+    (sent(&ga.a2b), transit)
+}
+
+/// Observe mode withheld nothing, so a face that becomes a transit next hop is not replayed
+/// anything: the output is the same as without the option. The detection still happens.
+#[test]
+fn observe_mode_output_is_unchanged_across_a_transit_change() {
+    try_init_tracing_subscriber();
+    let (observed, transit) = transit_change_output(GATEWAY_OBSERVE);
+    let (unscoped, _) = transit_change_output(GATEWAY_WITHOUT_SCOPE);
+    assert_eq!(observed, unscoped);
+    assert_eq!(observed, Sent::declared([own(SN_B).as_str()]));
+    assert_eq!(transit, [1, 1]);
+}
+
+/// A face closed while it is a transit next hop: the detection clears; the router reconnects
+/// into the same topology and its new face is detected again, unfiltered before the replay.
+#[test]
+fn a_face_closed_while_transit_is_detected_again_on_reconnect() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    let app = g.new_session();
+    let k = own(SN_B);
+    declare(&app, 1, &[&k]);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), [1, 1]);
+
+    ga.disconnect();
+    settle(&mut [&mut ab]);
+    assert_eq!(transit_faces(&g), [0, 1]);
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), [1, 2]);
+    assert_eq!(scope_state(&g, SN_A), ([0; 3], true, false));
+    assert_eq!(sent(&ga.a2b), Sent::declared([k.as_str()]));
+    assert_eq!(known(&b), known_all([k.as_str()]));
+}
+
+/// The replay to a face that becomes transit covers every source: the gateway (its sessions)
+/// and another router of the subregion, with the current queryable information, including
+/// keys the face already had. Withdrawing everything afterwards leaves nothing behind.
+#[test]
+fn the_replay_to_a_transit_router_covers_every_source() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let (a, b, u) = (
+        router(Some(zid_of(SN_A))),
+        router(Some(zid_of(SN_B))),
+        router(None),
+    );
+    let (mut ga, mut gu) = (connect_south(&g, &a), connect_south(&g, &u));
+    settle(&mut [&mut ga, &mut gu]);
+    let (app, robot_u) = (g.new_session(), u.new_session());
+    let (own_a, own_b, from_u) = (own(SN_A), own(SN_B), format!("{SN_B}/svc/default/pub/u"));
+    declare(&app, 1, &[&own_a, &own_b]);
+    declare(&robot_u, 1, &[&from_u]);
+    let complete = QueryableInfoType {
+        complete: true,
+        distance: 0,
+    };
+    app.declare_queryable(None, 5, own_b.clone(), complete); // info update
+    settle(&mut [&mut ga, &mut gu]);
+    assert_eq!(known(&a), known_all([own_a.as_str()]));
+    let before = sent(&ga.a2b);
+
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut gu, &mut ab]);
+    let all = [own_a.as_str(), own_b.as_str(), from_u.as_str()];
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::declared(all));
+    assert!(ga
+        .a2b
+        .recorder()
+        .queryables()
+        .iter()
+        .any(|q| { q.wire_expr.suffix == own_b.as_str() && q.ext_info.complete }));
+    assert_eq!(known(&a), known_all(all));
+    assert_eq!(known(&b), known_all(all));
+
+    undeclare(&app, 1, 2);
+    undeclare(&robot_u, 1, 1);
+    settle(&mut [&mut ga, &mut gu, &mut ab]);
+    for h in [&g, &a, &b, &u] {
+        assert_eq!(known(h), known_all([]));
+    }
 }

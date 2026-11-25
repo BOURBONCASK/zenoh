@@ -304,8 +304,9 @@ impl Hat {
 
     /// Detects the scoped faces that are a transit next hop towards a router of the region
     /// outside of their scope: these routers would miss what is withheld from the face. Such a
-    /// face is no longer filtered for the rest of its life, and becomes a new child in every
-    /// tree, so that what was withheld from it is replayed. Each change is logged once.
+    /// face is no longer filtered for the rest of its life and, in enforce mode, becomes a new
+    /// child in every tree, so that what was withheld from it is replayed (observe mode withheld
+    /// nothing). Each change is logged once.
     fn check_leaves(&mut self, tables: &mut TablesData, new_children: &mut [Vec<NodeIndex>]) {
         let (Some(declaration_scope), Some(net)) = (&self.declaration_scope, &self.routers_net)
         else {
@@ -355,7 +356,12 @@ impl Hat {
                 continue;
             };
             let was_transit = mem::replace(&mut scope.transit, dst.is_some());
-            if dst.is_some() && !was_transit && !mem::replace(&mut scope.failed_open, true) {
+            // Observe mode withheld nothing: there is nothing to replay.
+            if dst.is_some()
+                && !was_transit
+                && !mem::replace(&mut scope.failed_open, true)
+                && !declaration_scope.observe()
+            {
                 replay.extend(idx);
             }
             let scope = self.face_hat(face).scope.as_ref().map_or("", |s| s.scope());
