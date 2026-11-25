@@ -73,6 +73,12 @@ pub struct GatewayExplicitSouthConf {
 /// from the routers of the subregion are not filtered.
 ///
 /// A router whose Zenoh ID does not yield a valid scope is not filtered.
+///
+/// **Prerequisite: the routers of the subregion must be leaves.** A router is only given what
+/// concerns its own scope, so it must not be a transit next hop, as seen from this router, towards
+/// a router of the same subregion outside of that scope: its routers would miss what was
+/// withheld. A router behind it in its own, separate south subregion is fine. A router that becomes
+/// a transit next hop is logged at error level and is no longer filtered until it reconnects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeclarationScopeConf {
@@ -81,6 +87,20 @@ pub struct DeclarationScopeConf {
     /// The scoped key expressions. The first chunk of each must be `*`: it stands for the scope
     /// (e.g. `*/telemetry/**`).
     pub key_exprs: NEVec<OwnedKeyExpr>,
+    /// What is done with the declarations that are out of scope. Read at start only.
+    #[serde(default)]
+    pub mode: DeclarationScopeMode,
+}
+
+/// What is done with the declarations that are out of the scope of a router.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeclarationScopeMode {
+    /// They are withheld.
+    #[default]
+    Enforce,
+    /// They are sent, and counted per router as if they had been withheld.
+    Observe,
 }
 
 /// Derivation of a scope from a Zenoh ID.

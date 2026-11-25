@@ -290,12 +290,24 @@
   ///     included in one of them and intersects none of them once `*` is replaced by the scope
   ///     of that router. With `["*/telemetry/**"]`, the router of scope `R2` gets declarations on
   ///     `R2/telemetry/a`, `*/telemetry/a` and `other/key`, but not on `R1/telemetry/a`.
+  ///   - `mode`: `"enforce"` (default) withholds the declarations that are out of scope;
+  ///     `"observe"` sends them and only counts them per router (logged when the router
+  ///     disconnects). Read at start only.
+  ///   A router that declares, itself, a key included in `key_exprs` but outside of its own scope
+  ///   is logged once (warning), in both modes: its Zenoh ID may not match the scope its
+  ///   applications use.
+  ///   Prerequisite: the routers of the subregion must be leaves. A router is only given what
+  ///   concerns its own scope, so it must not be a transit next hop, as seen from this router,
+  ///   towards a router of the same subregion outside of that scope. A router behind it in its own,
+  ///   separate south subregion is fine. A router that becomes a transit next hop is logged at
+  ///   error level and is no longer filtered until it reconnects.
   /// Example:
   ///   south: [{
   ///     filters: [{ modes: ["router"], region_names: ["edge"] }],
   ///     declaration_scope: {
   ///       zid: { radix: 36, skip: 1, length: 8, alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" },
   ///       key_exprs: ["*/telemetry/**"],
+  ///       mode: "enforce",
   ///     },
   ///   }]
   gateway: {

@@ -21,11 +21,18 @@
 //! expressions of that face (e.g. `<scope>/telemetry/**`).
 //!
 //! The decision depends only on the Zenoh ID of the face and on the key expression, both of
-//! which are constant: an undeclaration is withheld iff the declaration was.
+//! which are constant: an undeclaration is withheld iff the declaration was. The one exception is
+//! a face that becomes a transit next hop: it is no longer filtered for the rest of its life, and
+//! what was withheld is replayed to it.
+//!
+//! In observe mode nothing is withheld: what would have been is only counted.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
 
-use zenoh_config::gateway::DeclarationScopeConf;
+use zenoh_config::gateway::{DeclarationScopeConf, DeclarationScopeMode};
 use zenoh_keyexpr::{keyexpr, OwnedKeyExpr};
 use zenoh_protocol::core::ZenohIdProto;
 use zenoh_result::ZResult;
@@ -42,6 +49,7 @@ pub(super) struct DeclarationScope {
     alphabet: u64,
     /// The scoped key expressions. The first chunk of each is `*`.
     key_exprs: Vec<OwnedKeyExpr>,
+    mode: DeclarationScopeMode,
 }
 
 /// Why a Zenoh ID has no scope.
@@ -72,6 +80,17 @@ impl fmt::Display for NoScope {
 pub(super) struct FaceScope {
     /// The scoped key expressions with their first chunk replaced by the scope of the face.
     key_exprs: Box<[OwnedKeyExpr]>,
+    /// The face was a transit next hop towards a router outside of its scope at the last
+    /// computation of the trees.
+    pub(super) transit: bool,
+    /// The face has been a transit next hop: it is no longer filtered.
+    pub(super) failed_open: bool,
+    /// Declarations and undeclarations that were withheld (enforce mode) or would have been
+    /// (observe mode). Replays count again.
+    pub(super) out_of_scope: [AtomicU64; 2],
+    /// Declarations received from the router of the face itself that are scoped but out of its
+    /// scope.
+    pub(super) foreign: AtomicU64,
 }
 
 impl FaceScope {
@@ -79,6 +98,27 @@ impl FaceScope {
     #[inline]
     pub(super) fn concerns(&self, key_expr: &keyexpr) -> bool {
         self.key_exprs.iter().any(|ke| ke.intersects(key_expr))
+    }
+
+    /// The scope of the face.
+    pub(super) fn scope(&self) -> &str {
+        let ke = self.key_exprs[0].as_str();
+        ke.split('/').next().unwrap_or(ke)
+    }
+
+    /// Counts a declaration (`undeclaration` is `false`) or an undeclaration that is out of
+    /// scope. Returns `true` if it is the first of its kind.
+    #[inline]
+    pub(super) fn count_out_of_scope(&self, undeclaration: bool) -> bool {
+        self.out_of_scope[undeclaration as usize].fetch_add(1, Relaxed) == 0
+    }
+
+    pub(super) fn counts(&self) -> [u64; 3] {
+        [
+            self.out_of_scope[0].load(Relaxed),
+            self.out_of_scope[1].load(Relaxed),
+            self.foreign.load(Relaxed),
+        ]
     }
 }
 
@@ -126,7 +166,14 @@ impl DeclarationScope {
             length: zid.length,
             alphabet,
             key_exprs,
+            mode: conf.mode,
         })
+    }
+
+    /// Returns `true` in observe mode: nothing is withheld.
+    #[inline]
+    pub(super) fn observe(&self) -> bool {
+        self.mode == DeclarationScopeMode::Observe
     }
 
     /// Returns `true` if declarations on `key_expr` are subject to scoping, i.e. if `key_expr` is
@@ -149,7 +196,20 @@ impl DeclarationScope {
                 OwnedKeyExpr::new([scope, suffix].concat()).map_err(|_| NoScope::KeyExpr)
             })
             .collect::<Result<_, _>>()?;
-        Ok(FaceScope { key_exprs })
+        Ok(FaceScope {
+            key_exprs,
+            transit: false,
+            failed_open: false,
+            out_of_scope: Default::default(),
+            foreign: AtomicU64::new(0),
+        })
+    }
+
+    /// Returns `true` if `zid` yields the scope of `face`.
+    pub(super) fn has_scope_of(&self, zid: &ZenohIdProto, face: &FaceScope) -> bool {
+        let mut buf = [0u8; MAX_DIGITS];
+        self.scope_of(zid, &mut buf)
+            .is_ok_and(|scope| scope == face.scope())
     }
 
     /// Writes the scope of `zid` to `buf` and returns it.
@@ -454,5 +514,57 @@ mod tests {
         ] {
             assert!(!withheld(&scope, &face, &key), "{key} should pass");
         }
+    }
+    /// The key shapes of a production deployment, with the configuration recommended for it.
+    #[test]
+    fn production_key_shapes() {
+        const OWN: &str = "TEST000000000000001";
+        const OTHER: &str = "TEST000000000000002";
+
+        let scope = DeclarationScope::new(&conf(&["*/aorta/**", "*/http_bridge/**"])).unwrap();
+        let own = scope.face_scope(&zid_of(&format!("X{OWN}"))).unwrap();
+        let other = scope.face_scope(&zid_of(&format!("X{OTHER}"))).unwrap();
+        assert_eq!(own.scope(), OWN);
+
+        // Declared on the scope of one robot, by the cloud or by the robot itself: only the
+        // bridge of that robot gets them, and the identity check accepts them from that bridge.
+        for shape in [
+            "aorta/default/act/feedback/cloud/nav",
+            "aorta/default/srv/cloud/map/get",
+            "aorta/default/act/*/cloud/nav",
+            "aorta/default/sys/svc_owner/cloud/nav/node1",
+            "http_bridge/app/rpc/**",
+            "http_bridge/app/pub/sessions/**",
+        ] {
+            let key = format!("{OWN}/{shape}");
+            assert!(scope.is_scoped(ke(&key)), "{key} should be scoped");
+            assert!(own.concerns(ke(&key)), "{key} should reach its own bridge");
+            assert!(
+                withheld(&scope, &other, &key),
+                "{key} should not reach another bridge"
+            );
+        }
+
+        // Declared by the cloud for every robot: every bridge gets them.
+        for key in [
+            "**/aorta/default/srv/cloud/credential/issue",
+            "aorta/default/sys/svc_owner/cloud/credential/issue/node1",
+            "*/aorta/default/pub/x",
+        ] {
+            assert!(
+                !withheld(&scope, &own, key),
+                "{key} should reach every bridge"
+            );
+            assert!(
+                !withheld(&scope, &other, key),
+                "{key} should reach every bridge"
+            );
+        }
+        // The credential queryable answers a query of a robot on its own scope.
+        assert!(
+            ke("**/aorta/default/srv/cloud/credential/issue").intersects(ke(&format!(
+                "{OWN}/aorta/default/srv/cloud/credential/issue"
+            )))
+        );
     }
 }

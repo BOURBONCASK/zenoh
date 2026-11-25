@@ -97,7 +97,7 @@ impl Hat {
                             .as_ref()
                             .map(|src_face| someface.id != src_face.id)
                             .unwrap_or(true)
-                            && !self.withholds(scoped, &someface, res)
+                            && !self.withholds(scoped, &someface, res, false)
                         {
                             let key_expr = Resource::decl_key(res, &mut someface);
                             tracing::debug!(dst = %someface);
@@ -182,7 +182,7 @@ impl Hat {
                         if src_face
                             .map(|src_face| someface.id != src_face.id)
                             .unwrap_or(true)
-                            && !self.withholds(scoped, &someface, res)
+                            && !self.withholds(scoped, &someface, res, true)
                         {
                             let wire_expr = Resource::decl_key(res, &mut someface);
 
@@ -405,6 +405,7 @@ impl HatQueriesTrait for Hat {
         };
 
         debug_assert_ne!(router, ctx.tables.zid);
+        self.check_identity(ctx.src_face, &router, &res);
 
         self.res_hat_mut(&mut res)
             .router_qabls

@@ -22,10 +22,11 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     iter, mem,
-    sync::Arc,
+    sync::{atomic::Ordering::Relaxed, Arc},
 };
 
 use itertools::Itertools;
+use petgraph::graph::NodeIndex;
 use zenoh_config::{gateway::GatewaySouthConf, unwrap_or_default, ModeDependent, WhatAmI};
 use zenoh_protocol::{
     common::ZExtBody,
@@ -109,6 +110,10 @@ pub(crate) struct Hat {
     routers_net: Option<Network>,
     /// The declaration scope of this region (`gateway.south[].declaration_scope`), if any.
     declaration_scope: Option<scope::DeclarationScope>,
+    /// Scoped faces that are a transit next hop towards a router outside of their scope, and
+    /// how many times a face became one.
+    #[cfg_attr(not(all(test, feature = "test")), allow(dead_code))]
+    transit_faces: [usize; 2],
     routers_trees_worker: TreesComputationWorker,
     #[cfg(test)]
     disable_async_tree_computation: bool,
@@ -133,6 +138,7 @@ impl Hat {
             router_tokens: HashSet::new(),
             routers_net: None,
             declaration_scope: None,
+            transit_faces: [0; 2],
             routers_trees_worker: TreesComputationWorker::new(region),
             #[cfg(test)]
             disable_async_tree_computation: false,
@@ -154,6 +160,25 @@ impl Hat {
     #[cfg(all(test, feature = "test"))]
     pub(crate) fn compute_trees_now(&mut self, tables: &mut TablesData) {
         self.do_compute_trees(tables);
+    }
+
+    /// Tests only: the counts of the scoped face of `zid` (see [`scope::FaceScope::counts`]),
+    /// whether it is a transit next hop and whether it is still filtered.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn declaration_scope_of(
+        &self,
+        tables: &TablesData,
+        zid: &ZenohIdProto,
+    ) -> Option<([u64; 3], bool, bool)> {
+        let scope = self.face_hat(self.face(tables, zid)?).scope.as_ref()?;
+        Some((scope.counts(), scope.transit, !scope.failed_open))
+    }
+
+    /// Tests only: how many scoped faces are a transit next hop, and how many times a face
+    /// became one.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn transit_faces(&self) -> [usize; 2] {
+        self.transit_faces
     }
 
     pub(crate) fn net(&self) -> &Network {
@@ -213,14 +238,159 @@ impl Hat {
     ///
     /// This has to be checked before anything about `res` is sent to `face`, key expression
     /// declaration included. The answer is the same for the whole life of the face, so a
-    /// declaration and its undeclaration are either both sent or both withheld.
+    /// declaration and its undeclaration are either both sent or both withheld, unless the face
+    /// becomes a transit next hop (see [`Hat::check_leaves`]): it then gets everything.
+    ///
+    /// What is out of scope is counted, and only withheld in enforce mode.
     #[inline]
-    pub(self) fn withholds(&self, scoped: bool, face: &FaceState, res: &Resource) -> bool {
-        scoped
-            && self.face_hat(face).scope.as_ref().is_some_and(|scope| {
-                res.keyexpr()
-                    .is_some_and(|key_expr| !scope.concerns(key_expr))
-            })
+    pub(self) fn withholds(
+        &self,
+        scoped: bool,
+        face: &FaceState,
+        res: &Resource,
+        undeclaration: bool,
+    ) -> bool {
+        if !scoped {
+            return false;
+        }
+        let (Some(declaration_scope), Some(scope), Some(key_expr)) = (
+            &self.declaration_scope,
+            &self.face_hat(face).scope,
+            res.keyexpr(),
+        ) else {
+            return false;
+        };
+        if scope.failed_open || scope.concerns(key_expr) {
+            return false;
+        }
+        let first = scope.count_out_of_scope(undeclaration);
+        if !declaration_scope.observe() {
+            return true;
+        }
+        if first && !undeclaration {
+            tracing::info!(
+                "Declaration scope (observe): router {} ({}) would not get {} (out of its scope \
+                 {})",
+                face.zid,
+                face,
+                key_expr,
+                scope.scope()
+            );
+        }
+        false
+    }
+
+    /// Counts, and logs once per face, a declaration that the router of `face` makes itself on a
+    /// scoped key expression out of its own scope: its Zenoh ID may not match the scope that its
+    /// applications use.
+    #[inline]
+    pub(self) fn check_identity(&self, face: &FaceState, router: &ZenohIdProto, res: &Resource) {
+        if !self.is_scoped(res) || *router != face.zid {
+            return;
+        }
+        if let (Some(scope), Some(key_expr)) = (&self.face_hat(face).scope, res.keyexpr()) {
+            if !scope.concerns(key_expr) && scope.foreign.fetch_add(1, Relaxed) == 0 {
+                tracing::warn!(
+                    "Declaration scope: router {} ({}) declares {}, which is out of its scope {}: \
+                     its Zenoh ID may not match the scope its applications use",
+                    face.zid,
+                    face,
+                    key_expr,
+                    scope.scope()
+                );
+            }
+        }
+    }
+
+    /// Detects the scoped faces that are a transit next hop towards a router of the region
+    /// outside of their scope: these routers would miss what is withheld from the face. Such a
+    /// face is no longer filtered for the rest of its life, and becomes a new child in every
+    /// tree, so that what was withheld from it is replayed. Each change is logged once.
+    fn check_leaves(&mut self, tables: &mut TablesData, new_children: &mut [Vec<NodeIndex>]) {
+        let (Some(declaration_scope), Some(net)) = (&self.declaration_scope, &self.routers_net)
+        else {
+            return;
+        };
+        let idx_of = net
+            .graph
+            .node_indices()
+            .map(|idx| (net.graph[idx].zid, idx))
+            .collect::<HashMap<_, _>>();
+        // For each node, a router behind it that is out of its scope, if it is a scoped face.
+        let mut behind = vec![None; net.trees.len()];
+        {
+            let mut scopes = vec![None; net.trees.len()];
+            for face in tables.faces.values() {
+                if let (Some(scope), Some(idx)) =
+                    (&self.face_hat(face).scope, idx_of.get(&face.zid))
+                {
+                    scopes[idx.index()] = Some(scope);
+                }
+            }
+            for tree in &net.trees {
+                for (dst, hop) in tree.directions.iter().enumerate() {
+                    // `hop` is a child of this router in `tree`, and `dst` is behind it.
+                    let Some(hop) = *hop else { continue };
+                    if hop.index() == dst
+                        || Some(hop) == tree.parent
+                        || behind[hop.index()].is_some()
+                    {
+                        continue;
+                    }
+                    let dst = &net.graph[NodeIndex::new(dst)].zid;
+                    if let Some(Some(scope)) = scopes.get(hop.index()) {
+                        if !declaration_scope.has_scope_of(dst, scope) {
+                            behind[hop.index()] = Some(*dst);
+                        }
+                    }
+                }
+            }
+        }
+        let mut replay = vec![];
+        let (mut transit_faces, mut detections) = (0, 0);
+        for face in tables.faces.values_mut() {
+            let idx = idx_of.get(&face.zid).copied();
+            let dst = idx.and_then(|idx| behind[idx.index()]);
+            let Some(scope) = self.face_hat_mut(face).scope.as_mut() else {
+                continue;
+            };
+            let was_transit = mem::replace(&mut scope.transit, dst.is_some());
+            if dst.is_some() && !was_transit && !mem::replace(&mut scope.failed_open, true) {
+                replay.extend(idx);
+            }
+            let scope = self.face_hat(face).scope.as_ref().map_or("", |s| s.scope());
+            transit_faces += dst.is_some() as usize;
+            match (dst, was_transit) {
+                (Some(dst), false) => {
+                    detections += 1;
+                    tracing::error!(
+                        "Declaration scope: router {} ({}) is a transit next hop towards {}, \
+                         which is out of its scope {}; the routers of a scoped subregion must be \
+                         leaves. It is no longer filtered until it reconnects",
+                        face.zid,
+                        face,
+                        dst,
+                        scope
+                    );
+                }
+                (None, true) => tracing::info!(
+                    "Declaration scope: router {} ({}) is a leaf again (it stays unfiltered until \
+                     it reconnects)",
+                    face.zid,
+                    face
+                ),
+                _ => {}
+            }
+        }
+        self.transit_faces[0] = transit_faces;
+        self.transit_faces[1] += detections;
+        for idx in replay {
+            for (tree, children) in net.trees.iter().zip(new_children.iter_mut()) {
+                if tree.children.contains(&idx) && !children.contains(&idx) {
+                    children.push(idx);
+                }
+            }
+        }
     }
 
     fn compute_trees_async(&self, tables_ref: Arc<TablesLock>) {
@@ -248,7 +418,8 @@ impl Hat {
 
     fn do_compute_trees(&mut self, tables: &mut TablesData) {
         tracing::trace!("Compute trees");
-        let new_children = self.net_mut().compute_trees();
+        let mut new_children = self.net_mut().compute_trees();
+        self.check_leaves(tables, &mut new_children);
         tracing::trace!("Compute routes");
         self.pubsub_tree_change(tables, &new_children);
         self.queries_tree_change(tables, &new_children);
@@ -370,6 +541,7 @@ impl HatBaseTrait for Hat {
             tracing::info!(
                 region = %self.region,
                 key_exprs = ?conf.key_exprs.iter().map(|ke| ke.as_str()).collect_vec(),
+                mode = ?conf.mode,
                 "Declaration scope enabled"
             );
         }
@@ -443,6 +615,32 @@ impl HatBaseTrait for Hat {
 
     fn close_face(&mut self, ctx: DispatcherContext) {
         debug_assert!(self.owns(ctx.src_face));
+
+        if let (Some(declaration_scope), Some(scope)) =
+            (&self.declaration_scope, &self.face_hat(ctx.src_face).scope)
+        {
+            let [declarations, undeclarations, foreign] = scope.counts();
+            tracing::info!(
+                "Declaration scope: router {} ({}) closed (scope {}{}): {} declarations and {} \
+                 undeclarations out of scope {}, {} of its own declarations out of its scope",
+                ctx.src_face.zid,
+                ctx.src_face,
+                scope.scope(),
+                if scope.failed_open {
+                    ", unfiltered since it became a transit next hop"
+                } else {
+                    ""
+                },
+                declarations,
+                undeclarations,
+                if declaration_scope.observe() {
+                    "sent (observe mode)"
+                } else {
+                    "withheld"
+                },
+                foreign
+            );
+        }
 
         self.net_mut().remove_link(&ctx.src_face.zid);
         self.compute_trees(ctx);
