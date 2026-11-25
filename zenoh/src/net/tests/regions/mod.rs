@@ -983,6 +983,13 @@ impl Harness {
         self.zid
     }
 
+    /// The runtime of this harness. Panics if it was built without one.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        self._runtime
+            .as_ref()
+            .expect("harness built without a runtime")
+    }
+
     /// Compute the routing trees of every router region now. See
     /// [`HarnessBuilder::manual_tree_computation`].
     pub(crate) fn compute_trees(&self) {

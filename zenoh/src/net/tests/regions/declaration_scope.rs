@@ -23,7 +23,7 @@
 //! ```
 //!
 //! The Zenoh IDs of `A` and `B` yield the scopes [`SN_A`] and [`SN_B`]. The Zenoh ID of `U` does
-//! not yield a scope.
+//! not yield a scope. Some tests also link `A` and `B` together, which makes `A` a transit router.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -31,7 +31,10 @@ use std::{
     sync::Arc,
 };
 
-use zenoh_config::ZenohId;
+use zenoh_config::{
+    gateway::{DeclarationScopeMode, GatewaySouthConf},
+    ZenohId,
+};
 use zenoh_protocol::{
     core::{Bound, Region, WhatAmI, WireExpr},
     network::declare::queryable::ext::QueryableInfoType,
@@ -41,7 +44,10 @@ use super::{
     try_init_tracing_subscriber, Connection, EstablishedConnection, FaceDef, Harness,
     HarnessBuilder, MockFace,
 };
-use crate::net::routing::{dispatcher::resource::Resource, hat::Sources};
+use crate::net::routing::{
+    dispatcher::{resource::Resource, tables::TablesData},
+    hat::{router::Hat as RouterHat, Sources},
+};
 
 const SCOPED: Region = Region::South {
     id: 0,
@@ -59,6 +65,22 @@ const GATEWAY: &str = r#"{
                 alphabet: "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ",
             },
             key_exprs: ["*/svc/**"],
+        },
+    }],
+}"#;
+
+const GATEWAY_OBSERVE: &str = r#"{
+    south: [{
+        filters: [{ modes: ["router"] }],
+        declaration_scope: {
+            zid: {
+                radix: 36,
+                skip: 1,
+                length: 19,
+                alphabet: "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ",
+            },
+            key_exprs: ["*/svc/**"],
+            mode: "observe",
         },
     }],
 }"#;
@@ -116,6 +138,41 @@ fn connect_north<'a>(gateway: &'a Harness, north: &'a Harness) -> EstablishedCon
         b2a: FaceDef::default().mode(WhatAmI::Router),
     }
     .establish()
+}
+
+/// Links two routers of the same region.
+fn connect_routers<'a>(a: &'a Harness, b: &'a Harness) -> EstablishedConnection {
+    Connection {
+        a,
+        a2b: FaceDef::default().mode(WhatAmI::Router),
+        b,
+        b2a: FaceDef::default().mode(WhatAmI::Router),
+    }
+    .establish()
+}
+
+fn scoped_hat<R>(gateway: &Harness, f: impl FnOnce(&RouterHat, &TablesData) -> R) -> R {
+    let tables = gateway.gateway.tables.tables.read().unwrap();
+    let hat = tables.hats[SCOPED]
+        .as_any()
+        .downcast_ref::<RouterHat>()
+        .unwrap();
+    f(hat, &tables.data)
+}
+
+/// For the face of the gateway towards the router of `sn`: the declarations and
+/// undeclarations out of scope and the declarations of the router itself out of its scope;
+/// whether it is a transit next hop; whether it is still filtered.
+fn scope_state(gateway: &Harness, sn: &str) -> ([u64; 3], bool, bool) {
+    scoped_hat(gateway, |hat, tables| {
+        hat.declaration_scope_of(tables, &zid_of(sn).into())
+            .expect("no scoped face")
+    })
+}
+
+/// How many scoped faces are a transit next hop, and how many times a face became one.
+fn transit_faces(gateway: &Harness) -> [usize; 2] {
+    scoped_hat(gateway, |hat, _| hat.transit_faces())
 }
 
 fn settle(conns: &mut [&mut EstablishedConnection]) {
@@ -181,6 +238,15 @@ fn sorted<const N: usize>(keys: [&str; N]) -> Vec<String> {
 
 /// What `face` was sent since its recorder was last cleared.
 fn sent(face: &MockFace) -> Sent {
+    sent_by(face, key)
+}
+
+/// [`sent`], for a face that may be sent key expression ids that its remote declared.
+fn sent_with_ids(face: &MockFace) -> Sent {
+    sent_by(face, |w| format!("{}:{}", w.scope, w.suffix))
+}
+
+fn sent_by(face: &MockFace, key: impl Fn(&WireExpr) -> String) -> Sent {
     fn sort(mut keys: Vec<String>) -> Vec<String> {
         keys.sort();
         keys
@@ -608,4 +674,251 @@ fn data_queries_and_liveliness_flow_within_a_scope() {
     assert_eq!(g_b.a2b.recorder().pushes().len(), 0);
     assert_eq!(g_b.a2b.recorder().requests().len(), 0);
     assert_eq!(sent(&g_b.a2b), Sent::default());
+}
+
+/// The review's first probe: G—A—B, all declarations made once the graph has converged. A is the
+/// next hop towards B, which is out of A's scope. The gateway detects it, stops filtering A and
+/// replays to it what it withheld, so B gets the declarations on its own scope through A. Once
+/// the topology is a star again the detection clears; A stays unfiltered until it reconnects.
+#[test]
+fn a_transit_router_is_detected_and_no_longer_filtered() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let a = router(Some(zid_of(SN_A)));
+    let b = router(Some(zid_of(SN_B)));
+    let mut ga = connect_south(&g, &a);
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    let app = g.new_session();
+    let k = own(SN_B);
+    declare(&app, 1, &[&k]); // subscriber + queryable + token
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(known(&b), known_all([k.as_str()]));
+
+    // The detection.
+    assert_eq!(transit_faces(&g), [1, 1]);
+    let (counts, transit, filtered) = scope_state(&g, SN_A);
+    assert!(transit && !filtered);
+    assert_eq!(counts, [0; 3], "nothing was withheld from A");
+
+    // A declaration withheld while A was a leaf is replayed when A becomes a transit router.
+    let own_a = own(SN_A);
+    let later_b = format!("{SN_B}/svc/default/pub/later");
+    let star_b = format!("{SN_B}/svc/default/pub/star");
+    ab.disconnect();
+    settle(&mut [&mut ga]);
+    assert_eq!(transit_faces(&g), [0, 1], "a leaf again");
+    assert!(
+        !scope_state(&g, SN_A).2,
+        "A stays unfiltered until it reconnects"
+    );
+    ga.disconnect();
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga]);
+    assert!(scope_state(&g, SN_A).2, "a new face of A is filtered");
+    declare(&app, 100, &[&later_b]);
+    settle(&mut [&mut ga]);
+    assert_eq!(known(&a), known_all([]));
+    assert_eq!(
+        scope_state(&g, SN_A).0,
+        [6, 0, 0],
+        "k and later_b withheld from A"
+    );
+    ga.a2b.recorder().clear();
+
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), [1, 2]);
+    assert_eq!(
+        sent(&ga.a2b),
+        Sent::declared([k.as_str(), later_b.as_str()])
+    );
+    assert_eq!(known(&b), known_all([k.as_str(), later_b.as_str()]));
+
+    // Star again: B connects to the gateway and the link between A and B goes away.
+    let mut gb = connect_south(&g, &b);
+    ab.disconnect();
+    settle(&mut [&mut ga, &mut gb]);
+    assert_eq!(transit_faces(&g), [0, 2]);
+    assert!(!scope_state(&g, SN_A).1);
+    assert!(scope_state(&g, SN_B).2, "B is filtered");
+    declare(&app, 200, &[&own_a, &star_b]);
+    settle(&mut [&mut ga, &mut gb]);
+    assert_eq!(
+        known(&a),
+        known_all([k.as_str(), later_b.as_str(), &own_a, &star_b]),
+        "A is unfiltered"
+    );
+    assert_eq!(
+        known(&b),
+        known_all([k.as_str(), later_b.as_str(), &star_b])
+    );
+
+    // Undeclarations reach both and leave nothing behind. A is only sent undeclarations of what
+    // it was sent.
+    undeclare(&app, 1, 1);
+    undeclare(&app, 100, 1);
+    undeclare(&app, 200, 2);
+    settle(&mut [&mut ga, &mut gb]);
+    for h in [&a, &b] {
+        assert_eq!(known(h), known_all([]));
+    }
+    let to_a = sent(&ga.a2b);
+    for (declared, undeclared) in [
+        (&to_a.subscribers, &to_a.undeclared_subscribers),
+        (&to_a.queryables, &to_a.undeclared_queryables),
+        (&to_a.tokens, &to_a.undeclared_tokens),
+    ] {
+        assert!(undeclared.iter().all(|k| declared.contains(k)), "{to_a:?}");
+    }
+}
+
+/// The review's second probe: G—A, G—B and A—B. A is a leaf until the link between G and B is
+/// lost; then B's publications go through A, which must know the gateway's subscriber on B's
+/// scope.
+#[test]
+fn a_router_that_becomes_transit_after_a_link_loss() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let a = router(Some(zid_of(SN_A)));
+    let b = router(Some(zid_of(SN_B)));
+    let mut ga = connect_south(&g, &a);
+    let mut gb = connect_south(&g, &b);
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut gb, &mut ab]);
+    assert_eq!(transit_faces(&g), [0, 0]);
+
+    let app = g.new_session();
+    let rb = b.new_session();
+    let k = own(SN_B);
+    app.declare_subscriber(None, 1, k.clone());
+    settle(&mut [&mut ga, &mut gb, &mut ab]);
+    rb.put(k.clone(), vec![1]);
+    settle(&mut [&mut ga, &mut gb, &mut ab]);
+    assert_eq!(app.recorder().pushes().len(), 1);
+    assert_eq!(scope_state(&g, SN_A), ([1, 0, 0], false, true));
+    gb.disconnect();
+    settle(&mut [&mut ga, &mut ab]);
+    rb.put(k.clone(), vec![2]);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(app.recorder().pushes().len(), 2);
+
+    assert_eq!(transit_faces(&g), [1, 1]);
+    assert_eq!(scope_state(&g, SN_A), ([1, 0, 0], true, false));
+
+    // Star again.
+    let mut gb = connect_south(&g, &b);
+    ab.disconnect();
+    settle(&mut [&mut ga, &mut gb]);
+    assert_eq!(transit_faces(&g), [0, 1]);
+    assert_eq!(scope_state(&g, SN_A), ([1, 0, 0], false, false));
+    rb.put(k.clone(), vec![3]);
+    settle(&mut [&mut ga, &mut gb]);
+    assert_eq!(app.recorder().pushes().len(), 3);
+
+    app.undeclare_subscriber(1);
+    settle(&mut [&mut ga, &mut gb]);
+    for h in [&a, &b] {
+        assert_eq!(known(h), known_all([]));
+    }
+}
+
+/// The same declarations and undeclarations, in the given mode: what each of A and B was sent,
+/// and the counts of their faces. A declares on B's scope, which the identity check reports; B
+/// only declares on its own scope.
+fn mode_scenario(conf: &str) -> ([Sent; 2], Option<[[u64; 3]; 2]>) {
+    let (own_a, own_b) = (own(SN_A), own(SN_B));
+    let (own_a, own_b) = (own_a.as_str(), own_b.as_str());
+
+    let g = gateway(conf);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let (mut ga, mut gb) = (connect_south(&g, &a), connect_south(&g, &b));
+    settle(&mut [&mut ga, &mut gb]);
+
+    let app = g.new_session();
+    let (robot_a, robot_b) = (a.new_session(), b.new_session());
+    declare(&app, 1, &[own_a, own_b, WILD, UNSCOPED]);
+    declare(&robot_a, 1, &[own_a, own_b, WILD, UNSCOPED]);
+    declare(&robot_b, 1, &[own_b, WILD, UNSCOPED]);
+    settle(&mut [&mut ga, &mut gb]);
+    undeclare(&app, 1, 4);
+    undeclare(&robot_a, 1, 4);
+    undeclare(&robot_b, 1, 3);
+    settle(&mut [&mut ga, &mut gb]);
+    for h in [&g, &a, &b] {
+        assert_eq!(known(h), known_all([]));
+    }
+
+    let counts = scoped_hat(&g, |hat, tables| {
+        let a = hat.declaration_scope_of(tables, &zid_of(SN_A).into())?;
+        let b = hat.declaration_scope_of(tables, &zid_of(SN_B).into())?;
+        Some([a.0, b.0])
+    });
+    ([sent_with_ids(&ga.a2b), sent_with_ids(&gb.a2b)], counts)
+}
+
+fn messages(sent: &Sent) -> u64 {
+    [
+        &sent.subscribers,
+        &sent.queryables,
+        &sent.tokens,
+        &sent.undeclared_subscribers,
+        &sent.undeclared_queryables,
+        &sent.undeclared_tokens,
+    ]
+    .iter()
+    .map(|v| v.len() as u64)
+    .sum()
+}
+
+/// Observe mode sends what a gateway without the option sends, and counts exactly what enforce
+/// mode withholds. The identity check reports A, which declares on B's scope, and not B, in
+/// both modes.
+#[test]
+fn observe_mode_withholds_nothing_and_counts_what_enforce_mode_withholds() {
+    try_init_tracing_subscriber();
+    let (enforced, enforce_counts) = mode_scenario(GATEWAY);
+    let (observed, observe_counts) = mode_scenario(GATEWAY_OBSERVE);
+    let (unscoped, no_counts) = mode_scenario(GATEWAY_WITHOUT_SCOPE);
+
+    assert_eq!(observed, unscoped);
+    assert_eq!(no_counts, None);
+    // A: the gateway's and B's declarations on B's scope, three kinds each; B: the gateway's
+    // and A's on A's scope. A declared three entities on B's scope.
+    assert_eq!(enforce_counts, Some([[6, 6, 3], [6, 6, 0]]));
+    assert_eq!(observe_counts, enforce_counts);
+    for i in 0..2 {
+        let [declarations, undeclarations, _] = enforce_counts.unwrap()[i];
+        assert_eq!(
+            messages(&observed[i]),
+            messages(&enforced[i]) + declarations + undeclarations
+        );
+    }
+}
+
+/// The mode is read when the router starts: changing it in the configuration of a running
+/// router has no effect.
+#[test]
+fn the_mode_is_read_at_start_only() {
+    try_init_tracing_subscriber();
+    let own_b = own(SN_B);
+    let g = gateway(GATEWAY);
+    let a = router(Some(zid_of(SN_A)));
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga]);
+
+    {
+        let mut config = g.runtime().config().lock();
+        let Some(GatewaySouthConf::Custom(south)) = config.gateway.south.as_mut() else {
+            panic!("custom gateway.south expected");
+        };
+        south[0].declaration_scope.as_mut().unwrap().mode = DeclarationScopeMode::Observe;
+    }
+    g.runtime().update_network().unwrap();
+
+    let app = g.new_session();
+    declare(&app, 1, &[&own_b]);
+    settle(&mut [&mut ga]);
+    assert_eq!(sent(&ga.a2b), Sent::default());
+    assert_eq!(scope_state(&g, SN_A).0, [3, 0, 0]);
 }
