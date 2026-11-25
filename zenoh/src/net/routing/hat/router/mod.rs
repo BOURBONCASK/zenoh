@@ -26,7 +26,7 @@ use std::{
 };
 
 use itertools::Itertools;
-use zenoh_config::{unwrap_or_default, ModeDependent, WhatAmI};
+use zenoh_config::{gateway::GatewaySouthConf, unwrap_or_default, ModeDependent, WhatAmI};
 use zenoh_protocol::{
     common::ZExtBody,
     core::{Region, ZenohIdProto},
@@ -64,6 +64,7 @@ use crate::net::{
 mod interests;
 mod pubsub;
 mod queries;
+mod scope;
 mod token;
 
 use crate::net::{common::AutoConnect, protocol::network::SuccessorEntry};
@@ -106,6 +107,8 @@ pub(crate) struct Hat {
     router_tokens: HashSet<Arc<Resource>>,
     router_qabls: HashSet<Arc<Resource>>,
     routers_net: Option<Network>,
+    /// The declaration scope of this region (`gateway.south[].declaration_scope`), if any.
+    declaration_scope: Option<scope::DeclarationScope>,
     routers_trees_worker: TreesComputationWorker,
     #[cfg(test)]
     disable_async_tree_computation: bool,
@@ -129,6 +132,7 @@ impl Hat {
             router_qabls: HashSet::new(),
             router_tokens: HashSet::new(),
             routers_net: None,
+            declaration_scope: None,
             routers_trees_worker: TreesComputationWorker::new(region),
             #[cfg(test)]
             disable_async_tree_computation: false,
@@ -191,6 +195,32 @@ impl Hat {
         zid: &ZenohIdProto,
     ) -> Option<&'t Arc<FaceState>> {
         tables.faces.values().find(|face| face.zid == *zid)
+    }
+
+    /// Returns `true` if declarations on `res` are subject to this region's declaration scope.
+    ///
+    /// Always `false` when the region has no declaration scope.
+    #[inline]
+    pub(self) fn is_scoped(&self, res: &Resource) -> bool {
+        match (&self.declaration_scope, res.keyexpr()) {
+            (Some(scope), Some(key_expr)) => scope.is_scoped(key_expr),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if a declaration or undeclaration on `res`, for which
+    /// [`Hat::is_scoped`] returned `scoped`, must not be sent to `face`.
+    ///
+    /// This has to be checked before anything about `res` is sent to `face`, key expression
+    /// declaration included. The answer is the same for the whole life of the face, so a
+    /// declaration and its undeclaration are either both sent or both withheld.
+    #[inline]
+    pub(self) fn withholds(&self, scoped: bool, face: &FaceState, res: &Resource) -> bool {
+        scoped
+            && self.face_hat(face).scope.as_ref().is_some_and(|scope| {
+                res.keyexpr()
+                    .is_some_and(|key_expr| !scope.concerns(key_expr))
+            })
     }
 
     fn compute_trees_async(&self, tables_ref: Arc<TablesLock>) {
@@ -324,7 +354,25 @@ impl HatBaseTrait for Hat {
             .linkstate()
             .transport_weights()
             .clone();
+        let declaration_scope = match (self.region, config.gateway.south.as_ref()) {
+            (Region::South { id, .. }, Some(GatewaySouthConf::Custom(subregions))) => subregions
+                .get(id)
+                .and_then(|subregion| subregion.declaration_scope.clone()),
+            _ => None,
+        };
         drop(config_guard);
+
+        self.declaration_scope = declaration_scope
+            .as_ref()
+            .map(scope::DeclarationScope::new)
+            .transpose()?;
+        if let Some(conf) = &declaration_scope {
+            tracing::info!(
+                region = %self.region,
+                key_exprs = ?conf.key_exprs.iter().map(|ke| ke.as_str()).collect_vec(),
+                "Declaration scope enabled"
+            );
+        }
 
         self.routers_net = Some(Network::new(
             ROUTERS_NET_NAME.to_string(),
@@ -372,6 +420,21 @@ impl HatBaseTrait for Hat {
 
         let link_id = self.net_mut().add_link(transport.clone());
         self.face_hat_mut(ctx.src_face).link_id = link_id;
+
+        if let Some(declaration_scope) = &self.declaration_scope {
+            match declaration_scope.face_scope(&ctx.src_face.zid) {
+                Ok(scope) => {
+                    tracing::debug!(face = %ctx.src_face, ?scope, "Declarations are scoped");
+                    self.face_hat_mut(ctx.src_face).scope = Some(scope);
+                }
+                // Fail open: a router that has no scope gets every declaration.
+                Err(reason) => tracing::warn!(
+                    "{} has no declaration scope ({}): declarations to it are not filtered",
+                    ctx.src_face,
+                    reason
+                ),
+            }
+        }
 
         self.compute_trees(ctx);
 
@@ -635,12 +698,16 @@ impl HatContext {
 
 struct HatFace {
     link_id: LinkId,
+    /// The declaration scope of the face. [`None`] if the region has no declaration scope or if
+    /// the Zenoh ID of the remote does not yield one: the face is then not filtered.
+    scope: Option<scope::FaceScope>,
 }
 
 impl HatFace {
     fn new() -> Self {
         Self {
             link_id: LinkId::default(),
+            scope: None,
         }
     }
 }

@@ -15,6 +15,7 @@ use nonempty_collections::NEVec;
 use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use zenoh_core::polyfill::*;
+use zenoh_keyexpr::OwnedKeyExpr;
 use zenoh_protocol::core::{RegionName, WhatAmIMatcher};
 
 use crate::{Interface, ZenohId};
@@ -55,6 +56,52 @@ pub struct GatewayExplicitSouthConf {
     ///
     /// If [`None`], a subject _always_ matches.
     pub filters: Option<Vec<GatewayFiltersConf>>,
+    /// Declaration scope of the routers of this subregion.
+    ///
+    /// If [`None`] (the default), every declaration is propagated to every router of the
+    /// subregion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_scope: Option<DeclarationScopeConf>,
+}
+
+/// Declaration scope of a south router subregion.
+///
+/// Each router of the subregion is given a _scope_: a key expression chunk derived from its
+/// Zenoh ID. A subscriber, queryable or token declaration is withheld from a router iff its key
+/// expression is included in one of [`DeclarationScopeConf::key_exprs`] and intersects none of
+/// them once their leading `*` is replaced by the scope of that router. Declarations _received_
+/// from the routers of the subregion are not filtered.
+///
+/// A router whose Zenoh ID does not yield a valid scope is not filtered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclarationScopeConf {
+    /// How the scope of a router is derived from its Zenoh ID.
+    pub zid: ZidScopeConf,
+    /// The scoped key expressions. The first chunk of each must be `*`: it stands for the scope
+    /// (e.g. `*/telemetry/**`).
+    pub key_exprs: NEVec<OwnedKeyExpr>,
+}
+
+/// Derivation of a scope from a Zenoh ID.
+///
+/// The Zenoh ID is taken as an unsigned integer and written in [`ZidScopeConf::radix`] without
+/// leading zeros, using `0-9` then `A-Z` as digits. That text must be exactly
+/// [`ZidScopeConf::skip`] + [`ZidScopeConf::length`] characters long. The scope is what follows
+/// the first [`ZidScopeConf::skip`] characters; it must only contain characters of
+/// [`ZidScopeConf::alphabet`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZidScopeConf {
+    /// Radix of the text, from 2 to 36.
+    pub radix: u32,
+    /// Number of leading characters of the text that are not part of the scope.
+    #[serde(default)]
+    pub skip: usize,
+    /// Exact number of characters of a scope.
+    pub length: usize,
+    /// The characters a scope may contain. Each must be a digit of [`ZidScopeConf::radix`].
+    pub alphabet: String,
 }
 
 /// Bound filter.

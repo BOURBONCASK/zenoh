@@ -274,6 +274,30 @@
   ///   - `interfaces`: a non-empty array of network interface names.
   ///   - `zids`: a non-empty array of Zenoh IDs.
   ///   - `region_names`: a non-empty array of region names.
+  ///
+  /// An element of `gateway.south` may also have a `declaration_scope` (unset by default). It
+  /// applies to the routers of that subregion: each of them is given a scope, derived from its
+  /// Zenoh ID, and only gets the subscriber, queryable and liveliness token declarations that can
+  /// concern its scope. Declarations received from these routers, data and queries are not
+  /// filtered.
+  ///   - `zid`: how the scope is derived. The Zenoh ID is taken as an integer and written in
+  ///     `radix` (2 to 36, digits `0-9` then `A-Z`) without leading zeros. This text must be
+  ///     exactly `skip` + `length` characters long; the scope is what follows the first `skip`
+  ///     characters and must only contain characters of `alphabet`. A router whose Zenoh ID does
+  ///     not yield a scope is not filtered (a warning is logged when it connects).
+  ///   - `key_exprs`: a non-empty array of scoped key expressions whose first chunk is `*`, which
+  ///     stands for the scope. A declaration is withheld from a router iff its key expression is
+  ///     included in one of them and intersects none of them once `*` is replaced by the scope
+  ///     of that router. With `["*/telemetry/**"]`, the router of scope `R2` gets declarations on
+  ///     `R2/telemetry/a`, `*/telemetry/a` and `other/key`, but not on `R1/telemetry/a`.
+  /// Example:
+  ///   south: [{
+  ///     filters: [{ modes: ["router"], region_names: ["edge"] }],
+  ///     declaration_scope: {
+  ///       zid: { radix: 36, skip: 1, length: 8, alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" },
+  ///       key_exprs: ["*/telemetry/**"],
+  ///     },
+  ///   }]
   gateway: {
     /// The `auto` preset mode puts peers and clients south of routers and client south of peers.
     /// This is the only available preset.

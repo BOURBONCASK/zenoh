@@ -91,6 +91,7 @@ impl Hat {
         node_id: NodeId,
     ) {
         let net = self.net();
+        let scoped = self.is_scoped(res);
         for child in children {
             if net.graph.contains_node(*child) {
                 match self.face(tables, &net.graph[*child].zid).cloned() {
@@ -98,6 +99,7 @@ impl Hat {
                         if src_face
                             .map(|src_face| someface.id != src_face.id)
                             .unwrap_or(true)
+                            && !self.withholds(scoped, &someface, res)
                         {
                             let key_expr = Resource::decl_key(res, &mut someface);
 
@@ -172,6 +174,7 @@ impl Hat {
         src_face: Option<&Arc<FaceState>>,
         routing_context: Option<NodeId>,
     ) {
+        let scoped = self.is_scoped(res);
         for child in children {
             if net.graph.contains_node(*child) {
                 match self.face(tables, &net.graph[*child].zid).cloned() {
@@ -179,6 +182,7 @@ impl Hat {
                         if src_face
                             .map(|src_face| someface.id != src_face.id)
                             .unwrap_or(true)
+                            && !self.withholds(scoped, &someface, res)
                         {
                             let wire_expr = Resource::decl_key(res, &mut someface);
 
