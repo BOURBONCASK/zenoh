@@ -23,6 +23,7 @@
 //! face.
 
 mod adminspace;
+mod declaration_scope;
 mod declare;
 mod expr_id;
 mod forwarding;
@@ -800,6 +801,7 @@ pub(crate) struct HarnessBuilder {
     start_runtime: bool,
     start_adminspace: bool,
     manual_tree_computation: bool,
+    gateway: Option<String>,
 }
 
 impl HarnessBuilder {
@@ -811,7 +813,18 @@ impl HarnessBuilder {
             start_runtime: true,
             start_adminspace: false,
             manual_tree_computation: false,
+            gateway: None,
         }
+    }
+
+    /// Set the `gateway` section of the runtime config, in JSON5.
+    ///
+    /// The regions of the gateway are still those given to
+    /// [`subregions`](Self::subregions): `Region::South { id, .. }` reads the options of
+    /// `gateway.south[id]`. Only meaningful when [`start_runtime`](Self::start_runtime) is `true`.
+    pub(crate) fn gateway(mut self, gateway: &str) -> Self {
+        self.gateway = Some(gateway.to_string());
+        self
     }
 
     /// Set the [`WhatAmI`] mode of this harness.
@@ -885,6 +898,9 @@ impl HarnessBuilder {
                 .set_enabled(self.start_adminspace)
                 .unwrap();
             config.plugins_loading.set_enabled(false).unwrap();
+            if let Some(gateway) = &self.gateway {
+                config.gateway = json5::from_str(gateway).unwrap();
+            }
 
             let runtime = block_on(
                 RuntimeBuilder::new(crate::api::config::Config(config))
