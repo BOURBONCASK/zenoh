@@ -47,11 +47,14 @@ const MAX_DIGITS: usize = 128;
 /// A router that loses its link to this region and reconnects at once, for instance when a
 /// gateway restarts, may announce on its new link, for a moment, the links of its previous
 /// connection (the previous gateway and the routers behind it): it reconnects before it is done
-/// closing the lost transport. It is then a transit next hop until its next link state. That
-/// takes about as long as processing the declarations it held, up to a few seconds on a slow
-/// router; the grace period leaves a margin over that and is still short next to the time an
-/// operator takes to notice a router that is really wired as a transit router.
-pub(super) const TRANSIT_GRACE: Duration = Duration::from_secs(10);
+/// closing the lost transport. It is then a transit next hop until its next link state.
+///
+/// This is a debounce chosen from measurements, not a proven bound: such episodes lasted 0.1 to
+/// 3.9 s (median 0.25 to 0.4 s) on routers much faster than the robots they stand for. An old
+/// transport that stays open until its lease expires (20 s in the deployment this was measured
+/// for) can make an episode last longer; 30 s covers that lease with a margin. A router that is
+/// really wired as a transit router keeps missing what is withheld from it for that long.
+pub(crate) const TRANSIT_GRACE: Duration = Duration::from_secs(30);
 
 /// The declaration scope of a region.
 pub(super) struct DeclarationScope {
@@ -98,7 +101,8 @@ pub(super) struct FaceScope {
     pub(super) transit: Option<Transit>,
     /// The face stayed a transit next hop for the grace period: it is no longer filtered.
     pub(super) failed_open: bool,
-    /// How many times the face was a transit next hop for less than the grace period.
+    /// How many times the face was a leaf again after being a transit next hop, before it was
+    /// unfiltered.
     pub(super) transient: u64,
     /// Declarations and undeclarations that were withheld (enforce mode) or would have been
     /// (observe mode). Replays count again.

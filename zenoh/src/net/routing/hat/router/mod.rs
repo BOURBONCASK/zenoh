@@ -69,6 +69,9 @@ mod queries;
 mod scope;
 mod token;
 
+#[cfg(all(test, feature = "test"))]
+pub(crate) use scope::TRANSIT_GRACE;
+
 use crate::net::{common::AutoConnect, protocol::network::SuccessorEntry};
 
 struct TreesComputationWorker {
@@ -121,6 +124,11 @@ pub(crate) struct Hat {
     transit_recheck: Option<Instant>,
     /// The tables of this hat, for the re-check. Set when a scoped face is created.
     tables_ref: Weak<TablesLock>,
+    /// A computation of the trees is scheduled and has not run yet: the trees and the transit
+    /// state of the faces may be outdated. Only maintained with a declaration scope; set by
+    /// [`Hat::compute_trees_async`], cleared by [`Hat::do_compute_trees`], both under the tables
+    /// lock.
+    trees_outdated: bool,
     routers_trees_worker: TreesComputationWorker,
     /// Tests only: the time, if the test controls it.
     #[cfg(test)]
@@ -144,7 +152,8 @@ pub(crate) struct TransitCounts {
     pub(crate) violating: usize,
     /// How many times a face was no longer filtered at the end of its grace period.
     pub(crate) failed_open: usize,
-    /// How many times a face was a leaf again before the end of its grace period.
+    /// How many times a face was a leaf again before it was unfiltered: normally within its grace
+    /// period, later if the evaluation at its end was delayed.
     pub(crate) transient: usize,
 }
 
@@ -167,6 +176,7 @@ impl Hat {
             transit_grace: scope::TRANSIT_GRACE,
             transit_recheck: None,
             tables_ref: Weak::new(),
+            trees_outdated: false,
             routers_trees_worker: TreesComputationWorker::new(region),
             #[cfg(test)]
             clock: None,
@@ -239,6 +249,40 @@ impl Hat {
     #[cfg(all(test, feature = "test"))]
     pub(crate) fn recheck_transit_now(&mut self, tables: &mut TablesData) {
         self.recheck_transit(tables);
+    }
+
+    /// Tests only: schedule a computation of the trees as a topology change does, and wait until
+    /// the worker has taken it. The caller holds the tables lock, so the worker then waits for
+    /// it and computes the trees once it is released.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn hand_tree_computation_to_worker(&mut self, tables_ref: Arc<TablesLock>) {
+        self.compute_trees_async(tables_ref);
+        let start = Instant::now();
+        while !self.routers_trees_worker.tx.is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "the worker is stuck"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Tests only: whether a computation of the trees is scheduled and has not run yet.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn trees_outdated(&self) -> bool {
+        self.trees_outdated
+    }
+
+    /// Tests only: the router out of scope behind the scoped face of `zid`, if it is a transit
+    /// next hop.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn transit_towards(
+        &self,
+        tables: &TablesData,
+        zid: &ZenohIdProto,
+    ) -> Option<ZenohIdProto> {
+        let scope = self.face_hat(self.face(tables, zid)?).scope.as_ref()?;
+        scope.transit.map(|transit| transit.towards)
     }
 
     fn now(&self) -> Instant {
@@ -376,10 +420,14 @@ impl Hat {
     ///
     /// Such a face stays filtered for a grace period first ([`Hat::transit_grace`]): a router that
     /// reconnects may announce for a moment the links of its previous connection, which makes it
-    /// look like a transit next hop until its next link state (see [`scope::TRANSIT_GRACE`]).
+    /// look like a transit next hop until its next link state (see [`scope::TRANSIT_GRACE`]). The
+    /// grace period ends at the first evaluation at or after its end, which can be later than its
+    /// end if that evaluation is delayed: a face that is a leaf again before it was unfiltered is
+    /// never unfiltered for that episode.
     ///
-    /// The face is evaluated after each computation of the trees, and by the re-check that runs
-    /// at the end of a grace period on the trees that exist then ([`Hat::recheck_transit`]). A
+    /// The face is evaluated after each computation of the trees, and by the re-check at the end
+    /// of a grace period, which reuses the result of the last computation unless another one is
+    /// scheduled ([`Hat::recheck_transit`]). A
     /// grace period starts at the first evaluation that finds the face a transit next hop after
     /// an evaluation that found it a leaf (or after it connected), and lasts as long as every
     /// evaluation finds it a transit next hop: an evaluation that finds it a leaf ends it, and the
@@ -429,7 +477,7 @@ impl Hat {
                 }
             }
         }
-        let now = self.now();
+        let (now, observe) = (self.now(), declaration_scope.observe());
         let mut transient = 0;
         for face in tables.faces.values_mut() {
             let dst = idx_of.get(&face.zid).and_then(|idx| behind[idx.index()]);
@@ -458,13 +506,22 @@ impl Hat {
                 ),
                 (None, Some(dst)) => tracing::info!(
                     "Declaration scope: router {} ({}) is a transit next hop towards {}, which is \
-                     out of its scope {}. It stays filtered; if it is still one in {:.1} s, it will \
-                     no longer be filtered",
+                     out of its scope {}. {} {:.1} s, {}",
                     face.zid,
                     face,
                     dst,
                     scope,
-                    self.transit_grace.as_secs_f64()
+                    if observe {
+                        "Observe mode filters nothing; if it is still one in"
+                    } else {
+                        "It stays filtered; if it is still one in"
+                    },
+                    self.transit_grace.as_secs_f64(),
+                    if observe {
+                        "it will be reported as no longer filtered"
+                    } else {
+                        "it will no longer be filtered"
+                    }
                 ),
                 (Some(_), None) if failed_open => tracing::info!(
                     "Declaration scope: router {} ({}) is a leaf again (it stays unfiltered until \
@@ -473,11 +530,16 @@ impl Hat {
                     face
                 ),
                 (Some(since), None) => tracing::info!(
-                    "Declaration scope: router {} ({}) is a leaf again after {:.1} s, within the \
-                     grace period: it stays filtered",
+                    "Declaration scope: router {} ({}) is a leaf again after {:.1} s, before it was \
+                     unfiltered{}",
                     face.zid,
                     face,
-                    now.saturating_duration_since(since).as_secs_f64()
+                    now.saturating_duration_since(since).as_secs_f64(),
+                    if observe {
+                        " (observe mode)"
+                    } else {
+                        ": it stays filtered"
+                    }
                 ),
                 _ => {}
             }
@@ -584,14 +646,16 @@ impl Hat {
     }
 
     /// The re-check at the end of a grace period: what [`Hat::check_leaves`] does once the trees
-    /// are computed, on the trees that exist. They are current: every topology change computes
-    /// them, and the transit state of each face is as of that computation, so this only ends the
-    /// grace periods that are over ([`Hat::expire_transit`]) and replays to the faces that are no
-    /// longer filtered. If a computation of the trees is queued, it is left to that computation,
-    /// which will see the new topology.
+    /// are computed, without computing them. The transit state of each face is the result of the
+    /// last computation; it is only current if no computation is scheduled since (the
+    /// `trees_outdated` marker), which covers a computation that the worker has already taken
+    /// and that waits for the tables lock. Then this ends the grace periods that are over
+    /// ([`Hat::expire_transit`]) and replays to the faces that are no longer filtered.
+    /// Otherwise it does nothing: the scheduled computation evaluates the faces on the new
+    /// topology, ends the grace periods that are over and schedules the next re-check.
     fn recheck_transit(&mut self, tables: &mut TablesData) {
         self.transit_recheck = None;
-        if !self.routers_trees_worker.tx.is_empty() {
+        if self.trees_outdated {
             return;
         }
         let mut new_children = vec![vec![]; self.net().trees.len()];
@@ -603,8 +667,13 @@ impl Hat {
         }
     }
 
-    fn compute_trees_async(&self, tables_ref: Arc<TablesLock>) {
+    /// Schedules a computation of the trees. Every production path that changes the topology or
+    /// the link weights goes through here.
+    fn compute_trees_async(&mut self, tables_ref: Arc<TablesLock>) {
         tracing::trace!("Schedule trees computation");
+        if self.declaration_scope.is_some() {
+            self.trees_outdated = true;
+        }
         if let Err(err) = self.routers_trees_worker.tx.try_send(tables_ref) {
             tracing::trace!(%err, "Failed to schedule routing tree computation");
         }
@@ -615,6 +684,9 @@ impl Hat {
         {
             if self.manual_tree_computation {
                 tracing::trace!("Trees computation left to the test");
+                if self.declaration_scope.is_some() {
+                    self.trees_outdated = true;
+                }
             } else if self.disable_async_tree_computation {
                 self.do_compute_trees(ctx.tables);
             } else {
@@ -629,6 +701,7 @@ impl Hat {
     fn do_compute_trees(&mut self, tables: &mut TablesData) {
         tracing::trace!("Compute trees");
         let mut new_children = self.net_mut().compute_trees();
+        self.trees_outdated = false;
         self.check_leaves(tables, &mut new_children);
         tracing::trace!("Compute routes");
         self.pubsub_tree_change(tables, &new_children);
@@ -855,7 +928,7 @@ impl HatBaseTrait for Hat {
                 },
                 match scope.transient {
                     0 => String::new(),
-                    n => format!(", a transit next hop {n} times for less than the grace period"),
+                    n => format!(", a leaf again {n} times after being a transit next hop"),
                 },
                 declarations,
                 undeclarations,
