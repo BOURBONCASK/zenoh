@@ -1619,3 +1619,74 @@ fn a_leaf_found_after_a_delayed_end_of_grace_period_is_not_unfiltered() {
     assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
     assert_eq!(since(sent(&ga.a2b), &before), Sent::default());
 }
+
+/// Runs `f` with a subscriber that captures the messages of the events of this thread. The close
+/// of a face and, in these tests, the computations of the trees run on the thread of the test.
+fn captured_messages(f: impl FnOnce()) -> Vec<String> {
+    use tracing_subscriber::layer::SubscriberExt;
+    let storage = tracing_capture::SharedStorage::default();
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_capture::CaptureLayer::new(&storage));
+    tracing::subscriber::with_default(subscriber, f);
+    let storage = storage.lock();
+    storage
+        .all_events()
+        .filter_map(|event| event.message().map(str::to_string))
+        .collect()
+}
+
+/// A is a leaf again twice: once before and once after it was unfiltered. The close summary
+/// counts only the first one and says so, as does the line of each.
+fn two_recoveries_logs(conf: &str) -> Vec<String> {
+    let g = gateway(conf);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    captured_messages(|| {
+        let mut ga = connect_south(&g, &a);
+        settle(&mut [&mut ga]);
+        let mut ab = connect_routers(&a, &b);
+        settle(&mut [&mut ga, &mut ab]);
+        assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+        ab.disconnect();
+        settle(&mut [&mut ga]);
+        assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
+        let mut ab = connect_routers(&a, &b);
+        settle(&mut [&mut ga, &mut ab]);
+        elapse(&g, GRACE);
+        assert_eq!(transit_faces(&g), transit(0, 1, 1, 1));
+        ab.disconnect();
+        settle(&mut [&mut ga]);
+        assert_eq!(transit_faces(&g), transit(0, 0, 1, 1), "not counted");
+        ga.disconnect();
+    })
+}
+
+#[test]
+fn the_close_summary_counts_the_leaf_states_before_the_face_was_unfiltered() {
+    for (conf, leaf) in [
+        (GATEWAY, "before it was unfiltered: it stays filtered"),
+        (GATEWAY_OBSERVE, "before it was unfiltered (observe mode)"),
+    ] {
+        let logs = two_recoveries_logs(conf);
+        let count = |pattern: &str| logs.iter().filter(|l| l.contains(pattern)).count();
+        assert_eq!(count(leaf), 1, "{logs:#?}");
+        assert_eq!(
+            count("is a leaf again (it stays unfiltered"),
+            1,
+            "{logs:#?}"
+        );
+        assert_eq!(count("has been a transit next hop"), 1, "{logs:#?}");
+        let closed = logs
+            .iter()
+            .filter(|l| l.contains(") closed (scope"))
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1, "{logs:#?}");
+        assert!(
+            closed[0].contains(
+                ", unfiltered since it stayed a transit next hop for the grace period, a leaf \
+                 again 1 times before it was unfiltered)"
+            ),
+            "{}",
+            closed[0]
+        );
+    }
+}

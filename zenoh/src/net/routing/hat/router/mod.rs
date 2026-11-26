@@ -928,7 +928,7 @@ impl HatBaseTrait for Hat {
                 },
                 match scope.transient {
                     0 => String::new(),
-                    n => format!(", a leaf again {n} times after being a transit next hop"),
+                    n => format!(", a leaf again {n} times before it was unfiltered"),
                 },
                 declarations,
                 undeclarations,
