@@ -24,11 +24,16 @@
 //!
 //! The Zenoh IDs of `A` and `B` yield the scopes [`SN_A`] and [`SN_B`]. The Zenoh ID of `U` does
 //! not yield a scope. Some tests also link `A` and `B` together, which makes `A` a transit router.
+//!
+//! The clock of the gateway is stopped: a test moves it with [`elapse`], which also runs the
+//! re-check of the faces in their grace period as its timer would. The tests that need the timer
+//! itself run with the real clock ([`gateway_with_timer`]).
 
 use std::{
     collections::{BTreeSet, HashMap},
     str::FromStr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use zenoh_config::{
@@ -46,7 +51,10 @@ use super::{
 };
 use crate::net::routing::{
     dispatcher::{resource::Resource, tables::TablesData},
-    hat::{router::Hat as RouterHat, Sources},
+    hat::{
+        router::{Hat as RouterHat, TransitCounts},
+        Sources,
+    },
 };
 
 const SCOPED: Region = Region::South {
@@ -97,12 +105,25 @@ fn zid_of(sn: &str) -> ZenohId {
     ZenohId::from_str(&format!("{n:x}")).unwrap()
 }
 
+/// The grace period of a face that is a transit next hop, in the tests that stop the clock.
+const GRACE: Duration = Duration::from_secs(10);
+
+/// A gateway with the given `gateway` configuration, whose clock is stopped.
 fn gateway(conf: &str) -> Harness {
-    HarnessBuilder::new()
+    let g = gateway_with_timer(conf, GRACE);
+    scoped_hat_mut(&g, |hat, _| hat.set_clock(Some(Instant::now())));
+    g
+}
+
+/// A gateway with the given `gateway` configuration and grace period, whose clock runs.
+fn gateway_with_timer(conf: &str, grace: Duration) -> Harness {
+    let g = HarnessBuilder::new()
         .mode(WhatAmI::Router)
         .subregions([SCOPED, Region::Local])
         .gateway(conf)
-        .build()
+        .build();
+    scoped_hat_mut(&g, |hat, _| hat.set_transit_grace(grace));
+    g
 }
 
 fn router(zid: Option<ZenohId>) -> Harness {
@@ -160,6 +181,25 @@ fn scoped_hat<R>(gateway: &Harness, f: impl FnOnce(&RouterHat, &TablesData) -> R
     f(hat, &tables.data)
 }
 
+fn scoped_hat_mut<R>(gateway: &Harness, f: impl FnOnce(&mut RouterHat, &mut TablesData) -> R) -> R {
+    let mut guard = gateway.gateway.tables.tables.write().unwrap();
+    let tables = &mut *guard;
+    let hat = tables.hats[SCOPED]
+        .as_any_mut()
+        .downcast_mut::<RouterHat>()
+        .unwrap();
+    f(hat, &mut tables.data)
+}
+
+/// Moves the stopped clock of `gateway` forward by `by`, then runs the re-check of the faces in
+/// their grace period, as its timer does when it is due. No topology changes.
+fn elapse(gateway: &Harness, by: Duration) {
+    scoped_hat_mut(gateway, |hat, tables| {
+        hat.advance_clock(by);
+        hat.recheck_transit_now(tables);
+    });
+}
+
 /// For the face of the gateway towards the router of `sn`: the declarations and
 /// undeclarations out of scope and the declarations of the router itself out of its scope;
 /// whether it is a transit next hop; whether it is still filtered.
@@ -170,9 +210,26 @@ fn scope_state(gateway: &Harness, sn: &str) -> ([u64; 3], bool, bool) {
     })
 }
 
-/// How many scoped faces are a transit next hop, and how many times a face became one.
-fn transit_faces(gateway: &Harness) -> [usize; 2] {
-    scoped_hat(gateway, |hat, _| hat.transit_faces())
+/// The scoped faces that are a transit next hop.
+fn transit_faces(gateway: &Harness) -> TransitCounts {
+    scoped_hat(gateway, |hat, _| hat.transit_counts())
+}
+
+/// Faces in their grace period, faces no longer filtered that are a transit next hop, how many
+/// times a face was no longer filtered, how many times a face was a leaf again within its grace
+/// period.
+fn transit(
+    pending: usize,
+    violating: usize,
+    failed_open: usize,
+    transient: usize,
+) -> TransitCounts {
+    TransitCounts {
+        pending,
+        violating,
+        failed_open,
+        transient,
+    }
 }
 
 fn settle(conns: &mut [&mut EstablishedConnection]) {
@@ -698,10 +755,11 @@ fn data_queries_and_liveliness_flow_within_a_scope() {
     assert_eq!(sent(&g_b.a2b), Sent::default());
 }
 
-/// The review's first probe: G—A—B, all declarations made once the graph has converged. A is the
-/// next hop towards B, which is out of A's scope. The gateway detects it, stops filtering A and
-/// replays to it what it withheld, so B gets the declarations on its own scope through A. Once
-/// the topology is a star again the detection clears; A stays unfiltered until it reconnects.
+/// G—A—B, all declarations made once the graph has converged. A is the next hop towards B,
+/// which is out of A's scope. The gateway detects it; at the end of the grace period it stops
+/// filtering A and replays to it what it withheld, so B gets the declarations on its own scope
+/// through A. Once the topology is a star again the detection clears; A stays unfiltered until
+/// it reconnects.
 #[test]
 fn a_transit_router_is_detected_and_no_longer_filtered() {
     try_init_tracing_subscriber();
@@ -715,13 +773,18 @@ fn a_transit_router_is_detected_and_no_longer_filtered() {
     let k = own(SN_B);
     declare(&app, 1, &[&k]); // subscriber + queryable + token
     settle(&mut [&mut ga, &mut ab]);
-    assert_eq!(known(&b), known_all([k.as_str()]));
 
-    // The detection.
-    assert_eq!(transit_faces(&g), [1, 1]);
-    let (counts, transit, filtered) = scope_state(&g, SN_A);
-    assert!(transit && !filtered);
-    assert_eq!(counts, [0; 3], "nothing was withheld from A");
+    // The detection. During the grace period A is still filtered, so B misses k.
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], true, true));
+    assert_eq!(known(&b), known_all([]));
+
+    // The end of the grace period, with no topology change.
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(known(&b), known_all([k.as_str()]));
+    assert_eq!(transit_faces(&g), transit(0, 1, 1, 0));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], true, false));
 
     // A declaration withheld while A was a leaf is replayed when A becomes a transit router.
     let own_a = own(SN_A);
@@ -729,7 +792,7 @@ fn a_transit_router_is_detected_and_no_longer_filtered() {
     let star_b = format!("{SN_B}/svc/default/pub/star");
     ab.disconnect();
     settle(&mut [&mut ga]);
-    assert_eq!(transit_faces(&g), [0, 1], "a leaf again");
+    assert_eq!(transit_faces(&g), transit(0, 0, 1, 0), "a leaf again");
     assert!(
         !scope_state(&g, SN_A).2,
         "A stays unfiltered until it reconnects"
@@ -750,7 +813,11 @@ fn a_transit_router_is_detected_and_no_longer_filtered() {
 
     let mut ab = connect_routers(&a, &b);
     settle(&mut [&mut ga, &mut ab]);
-    assert_eq!(transit_faces(&g), [1, 2]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 1, 0));
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::default());
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 1, 2, 0));
     assert_eq!(
         since(sent(&ga.a2b), &before),
         Sent::declared([k.as_str(), later_b.as_str()])
@@ -761,7 +828,7 @@ fn a_transit_router_is_detected_and_no_longer_filtered() {
     let mut gb = connect_south(&g, &b);
     ab.disconnect();
     settle(&mut [&mut ga, &mut gb]);
-    assert_eq!(transit_faces(&g), [0, 2]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 2, 0));
     assert!(!scope_state(&g, SN_A).1);
     assert!(scope_state(&g, SN_B).2, "B is filtered");
     declare(&app, 200, &[&own_a, &star_b]);
@@ -795,9 +862,9 @@ fn a_transit_router_is_detected_and_no_longer_filtered() {
     }
 }
 
-/// The review's second probe: G—A, G—B and A—B. A is a leaf until the link between G and B is
-/// lost; then B's publications go through A, which must know the gateway's subscriber on B's
-/// scope.
+/// G—A, G—B and A—B. A is a leaf until the link between G and B is lost; then B's publications
+/// go through A, which must know the gateway's subscriber on B's scope. It gets it at the end of
+/// the grace period: until then, B's publications do not reach the gateway.
 #[test]
 fn a_router_that_becomes_transit_after_a_link_loss() {
     try_init_tracing_subscriber();
@@ -808,7 +875,7 @@ fn a_router_that_becomes_transit_after_a_link_loss() {
     let mut gb = connect_south(&g, &b);
     let mut ab = connect_routers(&a, &b);
     settle(&mut [&mut ga, &mut gb, &mut ab]);
-    assert_eq!(transit_faces(&g), [0, 0]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 0));
 
     let app = g.new_session();
     let rb = b.new_session();
@@ -821,20 +888,31 @@ fn a_router_that_becomes_transit_after_a_link_loss() {
     assert_eq!(scope_state(&g, SN_A), ([1, 0, 0], false, true));
     gb.disconnect();
     settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    assert_eq!(scope_state(&g, SN_A), ([1, 0, 0], true, true));
     rb.put(k.clone(), vec![2]);
     settle(&mut [&mut ga, &mut ab]);
-    assert_eq!(app.recorder().pushes().len(), 2);
+    assert_eq!(
+        app.recorder().pushes().len(),
+        1,
+        "lost during the grace period"
+    );
 
-    assert_eq!(transit_faces(&g), [1, 1]);
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga, &mut ab]);
+    rb.put(k.clone(), vec![3]);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(app.recorder().pushes().len(), 2);
+    assert_eq!(transit_faces(&g), transit(0, 1, 1, 0));
     assert_eq!(scope_state(&g, SN_A), ([1, 0, 0], true, false));
 
     // Star again.
     let mut gb = connect_south(&g, &b);
     ab.disconnect();
     settle(&mut [&mut ga, &mut gb]);
-    assert_eq!(transit_faces(&g), [0, 1]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 1, 0));
     assert_eq!(scope_state(&g, SN_A), ([1, 0, 0], false, false));
-    rb.put(k.clone(), vec![3]);
+    rb.put(k.clone(), vec![4]);
     settle(&mut [&mut ga, &mut gb]);
     assert_eq!(app.recorder().pushes().len(), 3);
 
@@ -945,8 +1023,9 @@ fn the_mode_is_read_at_start_only() {
     assert_eq!(scope_state(&g, SN_A).0, [3, 0, 0]);
 }
 
-/// G—A, then A—B: what the gateway sends to A across the transit change, with the given option.
-fn transit_change_output(conf: &str) -> (Sent, [usize; 2]) {
+/// G—A, then A—B, past the grace period: what the gateway sends to A across the transit
+/// change, with the given option.
+fn transit_change_output(conf: &str) -> (Sent, TransitCounts) {
     let g = gateway(conf);
     let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
     let mut ga = connect_south(&g, &a);
@@ -956,8 +1035,9 @@ fn transit_change_output(conf: &str) -> (Sent, [usize; 2]) {
     settle(&mut [&mut ga]);
     let mut ab = connect_routers(&a, &b);
     settle(&mut [&mut ga, &mut ab]);
-    let transit = scoped_hat(&g, |hat, _| hat.transit_faces());
-    (sent(&ga.a2b), transit)
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga, &mut ab]);
+    (sent(&ga.a2b), transit_faces(&g))
 }
 
 /// Observe mode withheld nothing, so a face that becomes a transit next hop is not replayed
@@ -969,11 +1049,12 @@ fn observe_mode_output_is_unchanged_across_a_transit_change() {
     let (unscoped, _) = transit_change_output(GATEWAY_WITHOUT_SCOPE);
     assert_eq!(observed, unscoped);
     assert_eq!(observed, Sent::declared([own(SN_B).as_str()]));
-    assert_eq!(transit, [1, 1]);
+    assert_eq!(transit, self::transit(0, 1, 1, 0));
 }
 
-/// A face closed while it is a transit next hop: the detection clears; the router reconnects
-/// into the same topology and its new face is detected again, unfiltered before the replay.
+/// A face closed while it is a transit next hop and no longer filtered: the detection clears; the
+/// router reconnects into the same topology and its new face starts a new grace period, filtered,
+/// and gets the replay at its end.
 #[test]
 fn a_face_closed_while_transit_is_detected_again_on_reconnect() {
     try_init_tracing_subscriber();
@@ -986,15 +1067,22 @@ fn a_face_closed_while_transit_is_detected_again_on_reconnect() {
     let k = own(SN_B);
     declare(&app, 1, &[&k]);
     settle(&mut [&mut ga, &mut ab]);
-    assert_eq!(transit_faces(&g), [1, 1]);
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 1, 1, 0));
 
     ga.disconnect();
     settle(&mut [&mut ab]);
-    assert_eq!(transit_faces(&g), [0, 1]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 1, 0));
     let mut ga = connect_south(&g, &a);
     settle(&mut [&mut ga, &mut ab]);
-    assert_eq!(transit_faces(&g), [1, 2]);
-    assert_eq!(scope_state(&g, SN_A), ([0; 3], true, false));
+    assert_eq!(transit_faces(&g), transit(1, 0, 1, 0));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], true, true));
+    assert_eq!(sent(&ga.a2b), Sent::default());
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 1, 2, 0));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], true, false));
     assert_eq!(sent(&ga.a2b), Sent::declared([k.as_str()]));
     assert_eq!(known(&b), known_all([k.as_str()]));
 }
@@ -1028,6 +1116,8 @@ fn the_replay_to_a_transit_router_covers_every_source() {
 
     let mut ab = connect_routers(&a, &b);
     settle(&mut [&mut ga, &mut gu, &mut ab]);
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga, &mut gu, &mut ab]);
     let all = [own_a.as_str(), own_b.as_str(), from_u.as_str()];
     assert_eq!(since(sent(&ga.a2b), &before), Sent::declared(all));
     assert!(ga
@@ -1045,4 +1135,305 @@ fn the_replay_to_a_transit_router_covers_every_source() {
     for h in [&g, &a, &b, &u] {
         assert_eq!(known(h), known_all([]));
     }
+}
+
+/// A—B appears, then goes away before the end of the grace period: A is never unfiltered, nothing
+/// is replayed to it, and it is still filtered afterwards.
+#[test]
+fn a_transit_state_shorter_than_the_grace_period_is_ignored() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga]);
+    let app = g.new_session();
+    declare(&app, 1, &[&own(SN_B)]);
+    settle(&mut [&mut ga]);
+    let before = sent(&ga.a2b);
+
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    elapse(&g, GRACE - Duration::from_millis(1));
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    ab.disconnect();
+    settle(&mut [&mut ga]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
+
+    // Well past the end of the grace period that was cut short.
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], false, true));
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::default());
+    assert_eq!(known(&a), known_all([]));
+
+    let later = format!("{SN_B}/svc/default/pub/later");
+    declare(&app, 100, &[&later]);
+    settle(&mut [&mut ga]);
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::default());
+    assert_eq!(scope_state(&g, SN_A).0, [6, 0, 0]);
+}
+
+/// The shape seen when a gateway restarts: A was linked to the previous gateway `old`, with B
+/// behind it, and connects to this gateway before it is done removing that link. Its first link
+/// state makes it the next hop towards `old`, which has no scope and is reachable only through A,
+/// and towards B, of another scope; its next link state withdraws them. A is never unfiltered.
+#[test]
+fn a_router_announcing_its_previous_links_when_it_connects_stays_filtered() {
+    try_init_tracing_subscriber();
+    let (own_a, own_b) = (own(SN_A), own(SN_B));
+    let g = gateway(GATEWAY);
+    let old = router(None);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut old_a = connect_routers(&old, &a);
+    let mut old_b = connect_routers(&old, &b);
+    settle(&mut [&mut old_a, &mut old_b]);
+    let app = g.new_session();
+    declare(&app, 1, &[&own_a, &own_b]);
+
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga, &mut old_a, &mut old_b]);
+    let behind_a = scoped_hat(&g, |hat, _| {
+        [old.zid(), b.zid()].map(|zid| hat.net().get_idx(&zid).is_some())
+    });
+    assert_eq!(behind_a, [true, true], "the gateway sees old and B");
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], true, true));
+
+    old_a.disconnect();
+    settle(&mut [&mut ga, &mut old_b]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
+    elapse(&g, GRACE);
+    settle(&mut [&mut ga]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], false, true));
+    assert_eq!(sent(&ga.a2b), Sent::declared([own_a.as_str()]));
+    assert_eq!(known(&a), known_all([own_a.as_str()]));
+
+    // B reconnects to this gateway too: a star, each router with its own scope.
+    old_b.disconnect();
+    let mut gb = connect_south(&g, &b);
+    settle(&mut [&mut ga, &mut gb]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
+    assert_eq!(sent(&gb.a2b), Sent::declared([own_b.as_str()]));
+}
+
+/// The grace period of the tests that use the timer of the re-check.
+const TIMER_GRACE: Duration = Duration::from_millis(300);
+
+/// Waits for the re-check timer of `gateway` to stop filtering the face of `sn`.
+fn wait_unfiltered(gateway: &Harness, sn: &str) {
+    let start = Instant::now();
+    while scope_state(gateway, sn).2 {
+        assert!(
+            start.elapsed() < Duration::from_millis(1200),
+            "the face of {sn} is still filtered"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A transit state that persists, with no topology change once it started: the re-check timer
+/// stops filtering A at the end of the grace period and replays to it, exactly once, everything
+/// withheld from it, including a declaration made during the grace period.
+#[test]
+fn a_persistent_transit_state_fails_open_at_the_end_of_the_grace_period() {
+    try_init_tracing_subscriber();
+    let g = gateway_with_timer(GATEWAY, TIMER_GRACE);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga]);
+    let app = g.new_session();
+    let (k, during) = (own(SN_B), format!("{SN_B}/svc/default/pub/during"));
+    declare(&app, 1, &[&k]);
+    settle(&mut [&mut ga]);
+    let before = sent(&ga.a2b);
+
+    let start = Instant::now();
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    declare(&app, 100, &[&during]);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    assert_eq!(scope_state(&g, SN_A), ([6, 0, 0], true, true));
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::default());
+    assert!(scoped_hat(&g, |hat, _| hat.transit_recheck_due()).is_some());
+
+    // No topology change from here on.
+    wait_unfiltered(&g, SN_A);
+    assert!(start.elapsed() >= TIMER_GRACE);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 1, 1, 0));
+    assert_eq!(scoped_hat(&g, |hat, _| hat.transit_recheck_due()), None);
+    let replay = Sent::declared([k.as_str(), during.as_str()]);
+    assert_eq!(since(sent(&ga.a2b), &before), replay);
+    assert_eq!(known(&b), known_all([k.as_str(), during.as_str()]));
+
+    std::thread::sleep(Duration::from_millis(100));
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(since(sent(&ga.a2b), &before), replay, "replayed once");
+}
+
+/// The same in observe mode: nothing was withheld, so nothing is replayed when the face is no
+/// longer filtered.
+#[test]
+fn a_persistent_transit_state_replays_nothing_in_observe_mode() {
+    try_init_tracing_subscriber();
+    let g = gateway_with_timer(GATEWAY_OBSERVE, TIMER_GRACE);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga]);
+    let app = g.new_session();
+    let (k, during) = (own(SN_B), format!("{SN_B}/svc/default/pub/during"));
+    declare(&app, 1, &[&k]);
+    settle(&mut [&mut ga]);
+
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    declare(&app, 100, &[&during]);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    assert_eq!(scope_state(&g, SN_A), ([6, 0, 0], true, true));
+    let before = sent(&ga.a2b);
+    assert_eq!(before, Sent::declared([k.as_str(), during.as_str()]));
+
+    wait_unfiltered(&g, SN_A);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 1, 1, 0));
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::default());
+}
+
+/// Leaf, transit, leaf, transit: each transit state starts a new, full grace period.
+#[test]
+fn a_router_flapping_between_leaf_and_transit_restarts_its_grace_period() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga]);
+    let app = g.new_session();
+    let k = own(SN_B);
+    declare(&app, 1, &[&k]);
+    settle(&mut [&mut ga]);
+    let before = sent(&ga.a2b);
+
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    elapse(&g, GRACE / 2);
+    ab.disconnect();
+    settle(&mut [&mut ga]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 1));
+    elapse(&g, GRACE / 4);
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 1));
+
+    // 5/4 of the grace period after the first transit state, 1/2 after the second.
+    elapse(&g, GRACE / 2);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 1));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], true, true));
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::default());
+
+    // The end of the second grace period.
+    elapse(&g, GRACE / 2);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 1, 1, 1));
+    assert_eq!(since(sent(&ga.a2b), &before), Sent::declared([k.as_str()]));
+    assert_eq!(known(&b), known_all([k.as_str()]));
+}
+
+/// A face closed during its grace period leaves nothing behind: the counts drop at once and the
+/// re-check that comes later does nothing. The router reconnects into the same topology: its new
+/// face starts clean, with a full grace period of its own.
+#[test]
+fn a_face_closed_during_its_grace_period_leaves_nothing_behind() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    let app = g.new_session();
+    let k = own(SN_B);
+    declare(&app, 1, &[&k]);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    elapse(&g, GRACE / 2);
+
+    ga.disconnect();
+    settle(&mut [&mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 0));
+    elapse(&g, GRACE);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 0));
+    assert_eq!(scoped_hat(&g, |hat, _| hat.transit_recheck_due()), None);
+
+    let mut ga = connect_south(&g, &a);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    assert_eq!(scope_state(&g, SN_A), ([3, 0, 0], true, true));
+    elapse(&g, GRACE - Duration::from_millis(1));
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    assert_eq!(sent(&ga.a2b), Sent::default());
+    elapse(&g, Duration::from_millis(1));
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 1, 1, 0));
+    assert_eq!(sent(&ga.a2b), Sent::declared([k.as_str()]));
+    assert_eq!(known(&b), known_all([k.as_str()]));
+}
+
+/// The timer of the re-check fires after the face in its grace period closed: it does nothing.
+#[test]
+fn the_recheck_timer_does_nothing_for_a_closed_face() {
+    try_init_tracing_subscriber();
+    let g = gateway_with_timer(GATEWAY, TIMER_GRACE);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let mut ga = connect_south(&g, &a);
+    let mut ab = connect_routers(&a, &b);
+    settle(&mut [&mut ga, &mut ab]);
+    assert_eq!(transit_faces(&g), transit(1, 0, 0, 0));
+    ga.disconnect();
+    settle(&mut [&mut ab]);
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 0));
+
+    let start = Instant::now();
+    while scoped_hat(&g, |hat, _| hat.transit_recheck_due()).is_some() {
+        assert!(start.elapsed() < Duration::from_millis(1200), "no re-check");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(transit_faces(&g), transit(0, 0, 0, 0));
+}
+
+/// One re-check per gateway, due at the earliest end of a grace period, whatever the number of
+/// faces in their grace period.
+#[test]
+fn one_recheck_for_all_the_faces_in_their_grace_period() {
+    try_init_tracing_subscriber();
+    let g = gateway(GATEWAY);
+    let (a, b) = (router(Some(zid_of(SN_A))), router(Some(zid_of(SN_B))));
+    let (c, d) = (router(Some(zid_of(SN_N))), router(None));
+    let due = || scoped_hat(&g, |hat, _| hat.transit_recheck_due());
+    assert_eq!(due(), None);
+
+    let (mut ga, mut ab) = (connect_south(&g, &a), connect_routers(&a, &b));
+    settle(&mut [&mut ga, &mut ab]);
+    let first = due().expect("a re-check");
+    elapse(&g, GRACE / 2);
+    let (mut gc, mut cd) = (connect_south(&g, &c), connect_routers(&c, &d));
+    settle(&mut [&mut ga, &mut ab, &mut gc, &mut cd]);
+    assert_eq!(transit_faces(&g), transit(2, 0, 0, 0));
+    assert_eq!(due(), Some(first));
+    // A re-check while both are in their grace period: the next one is due at the first end.
+    elapse(&g, Duration::ZERO);
+    assert_eq!(transit_faces(&g), transit(2, 0, 0, 0));
+    assert_eq!(due(), Some(first));
+
+    elapse(&g, GRACE / 2);
+    assert_eq!(transit_faces(&g), transit(1, 1, 1, 0));
+    assert_eq!(due(), Some(first + GRACE / 2));
+    elapse(&g, GRACE / 2);
+    assert_eq!(transit_faces(&g), transit(0, 2, 2, 0));
+    assert_eq!(due(), None);
 }
