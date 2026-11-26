@@ -77,8 +77,14 @@ pub struct GatewayExplicitSouthConf {
 /// **Prerequisite: the routers of the subregion must be leaves.** A router is only given what
 /// concerns its own scope, so it must not be a transit next hop, as seen from this router, towards
 /// a router of the same subregion outside of that scope: its routers would miss what was
-/// withheld. A router behind it in its own, separate south subregion is fine. A router that becomes
-/// a transit next hop is logged at error level and is no longer filtered until it reconnects.
+/// withheld. A router behind it in its own, separate south subregion is fine.
+///
+/// A router that becomes a transit next hop stays filtered for a grace period of 10 seconds: a
+/// router that reconnects, for instance when this router restarts, can announce the links of its
+/// previous connection for a moment. If it is a leaf again before the end of the grace period,
+/// nothing changes. If it is still a transit next hop at the end, this is logged at error level
+/// and it is no longer filtered until it reconnects: in enforce mode, what was withheld from it is
+/// then sent to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeclarationScopeConf {

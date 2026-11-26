@@ -22,14 +22,15 @@
 //!
 //! The decision depends only on the Zenoh ID of the face and on the key expression, both of
 //! which are constant: an undeclaration is withheld iff the declaration was. The one exception is
-//! a face that becomes a transit next hop: it is no longer filtered for the rest of its life, and
-//! what was withheld is replayed to it.
+//! a face that stays a transit next hop for [`TRANSIT_GRACE`]: it is no longer filtered for the
+//! rest of its life, and what was withheld is replayed to it.
 //!
 //! In observe mode nothing is withheld: what would have been is only counted.
 
 use std::{
     fmt,
     sync::atomic::{AtomicU64, Ordering::Relaxed},
+    time::{Duration, Instant},
 };
 
 use zenoh_config::gateway::{DeclarationScopeConf, DeclarationScopeMode};
@@ -39,6 +40,18 @@ use zenoh_result::ZResult;
 
 /// The most digits a Zenoh ID can have: 128 bits in radix 2.
 const MAX_DIGITS: usize = 128;
+
+/// How long a scoped face that is a transit next hop stays filtered before it is no longer
+/// filtered.
+///
+/// A router that loses its link to this region and reconnects at once, for instance when a
+/// gateway restarts, may announce on its new link, for a moment, the links of its previous
+/// connection (the previous gateway and the routers behind it): it reconnects before it is done
+/// closing the lost transport. It is then a transit next hop until its next link state. That
+/// takes about as long as processing the declarations it held, up to a few seconds on a slow
+/// router; the grace period leaves a margin over that and is still short next to the time an
+/// operator takes to notice a router that is really wired as a transit router.
+pub(super) const TRANSIT_GRACE: Duration = Duration::from_secs(10);
 
 /// The declaration scope of a region.
 pub(super) struct DeclarationScope {
@@ -80,17 +93,29 @@ impl fmt::Display for NoScope {
 pub(super) struct FaceScope {
     /// The scoped key expressions with their first chunk replaced by the scope of the face.
     key_exprs: Box<[OwnedKeyExpr]>,
-    /// The face was a transit next hop towards a router outside of its scope at the last
+    /// The face is a transit next hop towards a router outside of its scope, as of the last
     /// computation of the trees.
-    pub(super) transit: bool,
-    /// The face has been a transit next hop: it is no longer filtered.
+    pub(super) transit: Option<Transit>,
+    /// The face stayed a transit next hop for the grace period: it is no longer filtered.
     pub(super) failed_open: bool,
+    /// How many times the face was a transit next hop for less than the grace period.
+    pub(super) transient: u64,
     /// Declarations and undeclarations that were withheld (enforce mode) or would have been
     /// (observe mode). Replays count again.
     pub(super) out_of_scope: [AtomicU64; 2],
     /// Declarations received from the router of the face itself that are scoped but out of its
     /// scope.
     pub(super) foreign: AtomicU64,
+}
+
+/// A scoped face that is a transit next hop towards a router outside of its scope.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Transit {
+    /// A router outside of the scope of the face that is behind it, as of the last computation
+    /// of the trees.
+    pub(super) towards: ZenohIdProto,
+    /// When the face was found to be a transit next hop, after it was last found to be a leaf.
+    pub(super) since: Instant,
 }
 
 impl FaceScope {
@@ -198,8 +223,9 @@ impl DeclarationScope {
             .collect::<Result<_, _>>()?;
         Ok(FaceScope {
             key_exprs,
-            transit: false,
+            transit: None,
             failed_open: false,
+            transient: 0,
             out_of_scope: Default::default(),
             foreign: AtomicU64::new(0),
         })

@@ -22,7 +22,8 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
     iter, mem,
-    sync::{atomic::Ordering::Relaxed, Arc},
+    sync::{atomic::Ordering::Relaxed, Arc, Weak},
+    time::{Duration, Instant},
 };
 
 use itertools::Itertools;
@@ -110,17 +111,41 @@ pub(crate) struct Hat {
     routers_net: Option<Network>,
     /// The declaration scope of this region (`gateway.south[].declaration_scope`), if any.
     declaration_scope: Option<scope::DeclarationScope>,
-    /// Scoped faces that are a transit next hop towards a router outside of their scope, and
-    /// how many times a face became one.
-    #[cfg_attr(not(all(test, feature = "test")), allow(dead_code))]
-    transit_faces: [usize; 2],
+    /// The scoped faces that are a transit next hop, see [`Hat::check_leaves`].
+    transit: TransitCounts,
+    /// How long a scoped face that is a transit next hop stays filtered:
+    /// [`scope::TRANSIT_GRACE`], or what a test sets.
+    transit_grace: Duration,
+    /// When the pending re-check of the faces in their grace period is due, if one is pending.
+    /// There is at most one per hat; see [`Hat::schedule_transit_recheck`].
+    transit_recheck: Option<Instant>,
+    /// The tables of this hat, for the re-check. Set when a scoped face is created.
+    tables_ref: Weak<TablesLock>,
     routers_trees_worker: TreesComputationWorker,
+    /// Tests only: the time, if the test controls it.
+    #[cfg(test)]
+    clock: Option<Instant>,
     #[cfg(test)]
     disable_async_tree_computation: bool,
     /// Tests only: never compute trees on topology changes; the test runs
     /// [`Hat::compute_trees_now`] itself.
     #[cfg(test)]
     manual_tree_computation: bool,
+}
+
+/// The scoped faces that are a transit next hop towards a router outside of their scope, see
+/// [`Hat::check_leaves`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(all(test, feature = "test")), allow(dead_code))]
+pub(crate) struct TransitCounts {
+    /// Faces in their grace period: they are still filtered.
+    pub(crate) pending: usize,
+    /// Faces that are no longer filtered.
+    pub(crate) violating: usize,
+    /// How many times a face was no longer filtered at the end of its grace period.
+    pub(crate) failed_open: usize,
+    /// How many times a face was a leaf again before the end of its grace period.
+    pub(crate) transient: usize,
 }
 
 impl Debug for Hat {
@@ -138,8 +163,13 @@ impl Hat {
             router_tokens: HashSet::new(),
             routers_net: None,
             declaration_scope: None,
-            transit_faces: [0; 2],
+            transit: TransitCounts::default(),
+            transit_grace: scope::TRANSIT_GRACE,
+            transit_recheck: None,
+            tables_ref: Weak::new(),
             routers_trees_worker: TreesComputationWorker::new(region),
+            #[cfg(test)]
+            clock: None,
             #[cfg(test)]
             disable_async_tree_computation: false,
             #[cfg(test)]
@@ -171,14 +201,52 @@ impl Hat {
         zid: &ZenohIdProto,
     ) -> Option<([u64; 3], bool, bool)> {
         let scope = self.face_hat(self.face(tables, zid)?).scope.as_ref()?;
-        Some((scope.counts(), scope.transit, !scope.failed_open))
+        Some((scope.counts(), scope.transit.is_some(), !scope.failed_open))
     }
 
-    /// Tests only: how many scoped faces are a transit next hop, and how many times a face
-    /// became one.
+    /// Tests only: the scoped faces that are a transit next hop.
     #[cfg(all(test, feature = "test"))]
-    pub(crate) fn transit_faces(&self) -> [usize; 2] {
-        self.transit_faces
+    pub(crate) fn transit_counts(&self) -> TransitCounts {
+        self.transit
+    }
+
+    /// Tests only: when the pending re-check of the faces in their grace period is due.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn transit_recheck_due(&self) -> Option<Instant> {
+        self.transit_recheck
+    }
+
+    /// Tests only: set the grace period of the faces that are a transit next hop.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn set_transit_grace(&mut self, grace: Duration) {
+        self.transit_grace = grace;
+    }
+
+    /// Tests only: stop the clock of this hat at `now` (it then only moves with
+    /// [`Hat::advance_clock`]), or let it run again (`None`).
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn set_clock(&mut self, now: Option<Instant>) {
+        self.clock = now;
+    }
+
+    /// Tests only: move the stopped clock of this hat forward.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn advance_clock(&mut self, by: Duration) {
+        self.clock = Some(self.now() + by);
+    }
+
+    /// Tests only: run the re-check of the faces in their grace period now, as its timer does.
+    #[cfg(all(test, feature = "test"))]
+    pub(crate) fn recheck_transit_now(&mut self, tables: &mut TablesData) {
+        self.recheck_transit(tables);
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.clock {
+            return now;
+        }
+        Instant::now()
     }
 
     pub(crate) fn net(&self) -> &Network {
@@ -239,7 +307,8 @@ impl Hat {
     /// This has to be checked before anything about `res` is sent to `face`, key expression
     /// declaration included. The answer is the same for the whole life of the face, so a
     /// declaration and its undeclaration are either both sent or both withheld, unless the face
-    /// becomes a transit next hop (see [`Hat::check_leaves`]): it then gets everything.
+    /// stays a transit next hop for the grace period (see [`Hat::check_leaves`]): it then gets
+    /// everything.
     ///
     /// What is out of scope is counted, and only withheld in enforce mode.
     #[inline]
@@ -303,10 +372,23 @@ impl Hat {
     }
 
     /// Detects the scoped faces that are a transit next hop towards a router of the region
-    /// outside of their scope: these routers would miss what is withheld from the face. Such a
-    /// face is no longer filtered for the rest of its life and, in enforce mode, becomes a new
-    /// child in every tree, so that what was withheld from it is replayed (observe mode withheld
-    /// nothing). Each change is logged once.
+    /// outside of their scope: these routers would miss what is withheld from the face.
+    ///
+    /// Such a face stays filtered for a grace period first ([`Hat::transit_grace`]): a router that
+    /// reconnects may announce for a moment the links of its previous connection, which makes it
+    /// look like a transit next hop until its next link state (see [`scope::TRANSIT_GRACE`]).
+    ///
+    /// The face is evaluated after each computation of the trees, and by the re-check that runs
+    /// at the end of a grace period on the trees that exist then ([`Hat::recheck_transit`]). A
+    /// grace period starts at the first evaluation that finds the face a transit next hop after
+    /// an evaluation that found it a leaf (or after it connected), and lasts as long as every
+    /// evaluation finds it a transit next hop: an evaluation that finds it a leaf ends it, and the
+    /// next one that finds it a transit next hop starts a new, full grace period. A leaf state
+    /// that starts and ends between two computations of the trees is not seen. If an evaluation
+    /// at or after the end of the grace period still finds it a transit next hop, the face is no
+    /// longer filtered for the rest of its life and, in enforce mode, becomes a new child in every
+    /// tree, so that everything withheld from it, during the grace period included, is replayed
+    /// (observe mode withheld nothing).
     fn check_leaves(&mut self, tables: &mut TablesData, new_children: &mut [Vec<NodeIndex>]) {
         let (Some(declaration_scope), Some(net)) = (&self.declaration_scope, &self.routers_net)
         else {
@@ -347,55 +429,177 @@ impl Hat {
                 }
             }
         }
-        let mut replay = vec![];
-        let (mut transit_faces, mut detections) = (0, 0);
+        let now = self.now();
+        let mut transient = 0;
         for face in tables.faces.values_mut() {
-            let idx = idx_of.get(&face.zid).copied();
-            let dst = idx.and_then(|idx| behind[idx.index()]);
+            let dst = idx_of.get(&face.zid).and_then(|idx| behind[idx.index()]);
             let Some(scope) = self.face_hat_mut(face).scope.as_mut() else {
                 continue;
             };
-            let was_transit = mem::replace(&mut scope.transit, dst.is_some());
-            // Observe mode withheld nothing: there is nothing to replay.
-            if dst.is_some()
-                && !was_transit
-                && !mem::replace(&mut scope.failed_open, true)
-                && !declaration_scope.observe()
-            {
-                replay.extend(idx);
+            let since = scope.transit.map(|transit| transit.since);
+            scope.transit = dst.map(|towards| scope::Transit {
+                towards,
+                since: since.unwrap_or(now),
+            });
+            let failed_open = scope.failed_open;
+            if since.is_some() && dst.is_none() && !failed_open {
+                scope.transient += 1;
+                transient += 1;
             }
             let scope = self.face_hat(face).scope.as_ref().map_or("", |s| s.scope());
-            transit_faces += dst.is_some() as usize;
-            match (dst, was_transit) {
-                (Some(dst), false) => {
-                    detections += 1;
-                    tracing::error!(
-                        "Declaration scope: router {} ({}) is a transit next hop towards {}, \
-                         which is out of its scope {}; the routers of a scoped subregion must be \
-                         leaves. It is no longer filtered until it reconnects",
-                        face.zid,
-                        face,
-                        dst,
-                        scope
-                    );
-                }
-                (None, true) => tracing::info!(
+            match (since, dst) {
+                (None, Some(dst)) if failed_open => tracing::info!(
+                    "Declaration scope: router {} ({}) is a transit next hop towards {}, which is \
+                     out of its scope {}, again (it is unfiltered until it reconnects)",
+                    face.zid,
+                    face,
+                    dst,
+                    scope
+                ),
+                (None, Some(dst)) => tracing::info!(
+                    "Declaration scope: router {} ({}) is a transit next hop towards {}, which is \
+                     out of its scope {}. It stays filtered; if it is still one in {:.1} s, it will \
+                     no longer be filtered",
+                    face.zid,
+                    face,
+                    dst,
+                    scope,
+                    self.transit_grace.as_secs_f64()
+                ),
+                (Some(_), None) if failed_open => tracing::info!(
                     "Declaration scope: router {} ({}) is a leaf again (it stays unfiltered until \
                      it reconnects)",
                     face.zid,
                     face
                 ),
+                (Some(since), None) => tracing::info!(
+                    "Declaration scope: router {} ({}) is a leaf again after {:.1} s, within the \
+                     grace period: it stays filtered",
+                    face.zid,
+                    face,
+                    now.saturating_duration_since(since).as_secs_f64()
+                ),
                 _ => {}
             }
         }
-        self.transit_faces[0] = transit_faces;
-        self.transit_faces[1] += detections;
-        for idx in replay {
+        self.transit.transient += transient;
+        self.expire_transit(tables, new_children);
+    }
+
+    /// Ends the grace period of the scoped faces that have been a transit next hop for
+    /// [`Hat::transit_grace`], as of the last evaluation (see [`Hat::check_leaves`]): they are no
+    /// longer filtered and, in enforce mode, are added to `new_children` in every tree in which
+    /// they are a child. Then counts the faces in each state and schedules the re-check of the
+    /// faces still in their grace period.
+    fn expire_transit(&mut self, tables: &mut TablesData, new_children: &mut [Vec<NodeIndex>]) {
+        let Some(declaration_scope) = &self.declaration_scope else {
+            return;
+        };
+        let (now, grace) = (self.now(), self.transit_grace);
+        let (mut pending, mut violating, mut failed_open) = (0, 0, 0);
+        let mut due = None::<Instant>;
+        let mut replay = vec![];
+        for face in tables.faces.values_mut() {
+            let Some(scope) = self.face_hat_mut(face).scope.as_mut() else {
+                continue;
+            };
+            let Some(transit) = scope.transit else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(transit.since);
+            if scope.failed_open {
+                violating += 1;
+                continue;
+            } else if elapsed < grace {
+                pending += 1;
+                let end = transit.since + grace;
+                due = Some(due.map_or(end, |due| due.min(end)));
+                continue;
+            }
+            scope.failed_open = true;
+            violating += 1;
+            failed_open += 1;
+            // Observe mode withheld nothing: there is nothing to replay.
+            if !declaration_scope.observe() {
+                replay.push(face.zid);
+            }
+            let scope = self.face_hat(face).scope.as_ref().map_or("", |s| s.scope());
+            tracing::error!(
+                "Declaration scope: router {} ({}) has been a transit next hop towards {}, which \
+                 is out of its scope {}, for {:.1} s; the routers of a scoped subregion must be \
+                 leaves. It is no longer filtered until it reconnects",
+                face.zid,
+                face,
+                transit.towards,
+                scope,
+                elapsed.as_secs_f64()
+            );
+        }
+        self.transit.pending = pending;
+        self.transit.violating = violating;
+        self.transit.failed_open += failed_open;
+        let net = self.net();
+        for zid in replay {
+            let Some(idx) = net.get_idx(&zid) else {
+                continue;
+            };
             for (tree, children) in net.trees.iter().zip(new_children.iter_mut()) {
                 if tree.children.contains(&idx) && !children.contains(&idx) {
                     children.push(idx);
                 }
             }
+        }
+        if let Some(due) = due {
+            self.schedule_transit_recheck(due);
+        }
+    }
+
+    /// Schedules the re-check of the faces in their grace period at `due`, the earliest end of
+    /// their grace periods, unless one is pending already. The pending one is then due first: all
+    /// grace periods have the same length, so a grace period that starts later ends later. When it
+    /// runs, it schedules the next one if faces are still in their grace period.
+    fn schedule_transit_recheck(&mut self, due: Instant) {
+        if self.transit_recheck.is_some() {
+            return;
+        }
+        self.transit_recheck = Some(due);
+        let delay = due.saturating_duration_since(self.now());
+        let (tables_ref, region) = (self.tables_ref.clone(), self.region);
+        zenoh_runtime::ZRuntime::Net.spawn(async move {
+            tokio::time::sleep(delay).await;
+            // The tables, and the hat with them, may be gone.
+            let Some(tables_ref) = tables_ref.upgrade() else {
+                return;
+            };
+            let mut wtables = zwrite!(tables_ref.tables);
+            let tables = &mut *wtables;
+            if let Some(hat) = tables
+                .hats
+                .get_mut(&region)
+                .and_then(|hat| hat.as_any_mut().downcast_mut::<Hat>())
+            {
+                hat.recheck_transit(&mut tables.data);
+            }
+        });
+    }
+
+    /// The re-check at the end of a grace period: what [`Hat::check_leaves`] does once the trees
+    /// are computed, on the trees that exist. They are current: every topology change computes
+    /// them, and the transit state of each face is as of that computation, so this only ends the
+    /// grace periods that are over ([`Hat::expire_transit`]) and replays to the faces that are no
+    /// longer filtered. If a computation of the trees is queued, it is left to that computation,
+    /// which will see the new topology.
+    fn recheck_transit(&mut self, tables: &mut TablesData) {
+        self.transit_recheck = None;
+        if !self.routers_trees_worker.tx.is_empty() {
+            return;
+        }
+        let mut new_children = vec![vec![]; self.net().trees.len()];
+        self.expire_transit(tables, &mut new_children);
+        if new_children.iter().any(|children| !children.is_empty()) {
+            self.pubsub_tree_change(tables, &new_children);
+            self.queries_tree_change(tables, &new_children);
+            self.token_tree_change(tables, &new_children);
         }
     }
 
@@ -604,6 +808,7 @@ impl HatBaseTrait for Hat {
                 Ok(scope) => {
                     tracing::debug!(face = %ctx.src_face, ?scope, "Declarations are scoped");
                     self.face_hat_mut(ctx.src_face).scope = Some(scope);
+                    self.tables_ref = Arc::downgrade(ctx.tables_lock);
                 }
                 // Fail open: a router that has no scope gets every declaration.
                 Err(reason) => tracing::warn!(
@@ -622,20 +827,35 @@ impl HatBaseTrait for Hat {
     fn close_face(&mut self, ctx: DispatcherContext) {
         debug_assert!(self.owns(ctx.src_face));
 
+        if let Some(scope) = self.face_hat_mut(ctx.src_face).scope.as_mut() {
+            // The face leaves its transit state, if any, with nothing left to re-check.
+            if scope.transit.take().is_some() {
+                let count = if scope.failed_open {
+                    &mut self.transit.violating
+                } else {
+                    &mut self.transit.pending
+                };
+                *count = count.saturating_sub(1);
+            }
+        }
         if let (Some(declaration_scope), Some(scope)) =
             (&self.declaration_scope, &self.face_hat(ctx.src_face).scope)
         {
             let [declarations, undeclarations, foreign] = scope.counts();
             tracing::info!(
-                "Declaration scope: router {} ({}) closed (scope {}{}): {} declarations and {} \
+                "Declaration scope: router {} ({}) closed (scope {}{}{}): {} declarations and {} \
                  undeclarations out of scope {}, {} of its own declarations out of its scope",
                 ctx.src_face.zid,
                 ctx.src_face,
                 scope.scope(),
                 if scope.failed_open {
-                    ", unfiltered since it became a transit next hop"
+                    ", unfiltered since it stayed a transit next hop for the grace period"
                 } else {
                     ""
+                },
+                match scope.transient {
+                    0 => String::new(),
+                    n => format!(", a transit next hop {n} times for less than the grace period"),
                 },
                 declarations,
                 undeclarations,
