@@ -27,6 +27,7 @@ use std::{
 
 use itertools::Itertools;
 use zenoh_config::{unwrap_or_default, ModeDependent, WhatAmI};
+use zenoh_keyexpr::keyexpr;
 use zenoh_protocol::{
     common::ZExtBody,
     core::{Region, ZenohIdProto},
@@ -53,7 +54,7 @@ use crate::net::{
     },
     routing::{
         dispatcher::{queries::merge_qabl_infos, region::RegionMap},
-        gateway::DEFAULT_NODE_ID,
+        gateway::{DefaultRoute, DEFAULT_NODE_ID},
         hat::{
             DispatcherContext, Remote, UnregisterFaceEntitiesResult, TREES_COMPUTATION_DELAY_MS,
         },
@@ -107,6 +108,10 @@ pub(crate) struct Hat {
     router_qabls: HashSet<Arc<Resource>>,
     routers_net: Option<Network>,
     routers_trees_worker: TreesComputationWorker,
+    /// The key expressions that are also routed towards the gateway of this region, without a
+    /// matching declaration (`gateway.north.default_route`). Only set on the hat of the north
+    /// region, and `None` by default.
+    default_route: Option<Arc<DefaultRoute>>,
     #[cfg(test)]
     disable_async_tree_computation: bool,
     /// Tests only: never compute trees on topology changes; the test runs
@@ -130,6 +135,7 @@ impl Hat {
             router_tokens: HashSet::new(),
             routers_net: None,
             routers_trees_worker: TreesComputationWorker::new(region),
+            default_route: None,
             #[cfg(test)]
             disable_async_tree_computation: false,
             #[cfg(test)]
@@ -150,6 +156,63 @@ impl Hat {
     #[cfg(all(test, feature = "test"))]
     pub(crate) fn compute_trees_now(&mut self, tables: &mut TablesData) {
         self.do_compute_trees(tables);
+    }
+
+    pub(crate) fn set_default_route(&mut self, default_route: Arc<DefaultRoute>) {
+        debug_assert!(self.region.bound().is_north());
+        self.default_route = Some(default_route);
+    }
+
+    /// The face towards the default gateway of this region, and the source node to send with,
+    /// for a publication or a query on `key_expr` that comes from `src_region` (from the node
+    /// `node_id` if it is this region).
+    ///
+    /// A message that is eligible to the default route (`gateway.north.default_route`) is sent
+    /// towards the gateway in addition to its declared destinations: the gateway may know
+    /// destinations that nobody declared in this region.
+    ///
+    /// + The default gateway is the gateway of the region with the greatest ZID. This is the
+    ///   one the inter-region filter lets forward what comes from this region.
+    /// + The direction is the one of the routing tree of `source`, as for a subscriber of the
+    ///   gateway: a router on the way forwards the message iff it has the same default route.
+    /// + A message whose source is the default gateway does not go back to it.
+    ///
+    /// Returns `None` if there is no default route (the default), if `key_expr` is not
+    /// eligible, and if there is no gateway or no tree yet.
+    pub(super) fn default_route_face<'t>(
+        &self,
+        tables: &'t TablesData,
+        key_expr: &keyexpr,
+        src_region: &Region,
+        node_id: NodeId,
+    ) -> Option<(&'t Arc<FaceState>, NodeId)> {
+        let default_route = self.default_route.as_ref()?;
+        if !default_route.is_eligible(key_expr) {
+            return None;
+        }
+        let net = self.net();
+        let source = if *src_region == self.region {
+            node_id
+        } else {
+            net.idx.index() as NodeId
+        };
+        let gateway = net
+            .graph
+            .node_indices()
+            .filter(|idx| net.graph[*idx].is_gateway && *idx != net.idx)
+            .max_by_key(|idx| net.graph[*idx].zid)?;
+        if gateway.index() == source as usize {
+            return None;
+        }
+        let direction = (*net
+            .trees
+            .get(source as usize)?
+            .directions
+            .get(gateway.index())?)?;
+        if !net.graph.contains_node(direction) {
+            return None;
+        }
+        Some((self.face(tables, &net.graph[direction].zid)?, source))
     }
 
     pub(crate) fn net(&self) -> &Network {

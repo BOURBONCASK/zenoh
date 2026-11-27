@@ -113,6 +113,20 @@ pub(crate) fn check_north_config(config: &ExpandedConfig) -> ZResult<()> {
     let Some(north) = &config.gateway.north else {
         return Ok(());
     };
+    if let Some(default_route) = &north.default_route {
+        if !config.mode().is_router() {
+            bail!(
+                "gateway.north.default_route only applies to a router (mode is '{}')",
+                config.mode()
+            )
+        }
+        if default_route.key_exprs.is_empty() {
+            bail!(
+                "gateway.north.default_route.key_exprs is empty: no key expression would take \
+                 the default route"
+            )
+        }
+    }
     if !is_leaf(config) {
         if !north.uplinks.is_empty() || !north.interests.is_empty() {
             bail!(
@@ -599,6 +613,14 @@ mod tests {
         let interests = r#"{ interests: [{ key_expr: "a/**", subscribers: true }] }"#;
         let e = check(router, interests).unwrap_err();
         assert!(e.contains("only apply to a router"), "{e}");
+        // a default route does not need a leaf, but needs a router and a key expression
+        let default_route = r#"default_route: { key_exprs: ["*/app/**"], except: ["r1/**"] }"#;
+        assert!(check(router, &format!("{{ {default_route} }}")).is_ok());
+        assert!(check(router, &format!(r#"{{ mode: "client", {quic}, {default_route} }}"#)).is_ok());
+        let e = check(WhatAmI::Peer, &format!("{{ {default_route} }}")).unwrap_err();
+        assert!(e.contains("default_route only applies to a router"), "{e}");
+        let e = check(router, r#"{ default_route: { key_exprs: [] } }"#).unwrap_err();
+        assert!(e.contains("default_route.key_exprs is empty"), "{e}");
     }
 
     /// An endpoint is known to be an uplink before it is dialed only when no interface has to be

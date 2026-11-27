@@ -110,39 +110,51 @@ impl Hat {
         );
     }
 
-    /// Returns `true` if a configured interest tells what to do with a publication (or a
-    /// query) on `key_expr` for which the north remote declared no subscriber (or queryable):
-    /// keep it south.
+    /// Returns `true` if a publication (resp. a query) on `key_expr` is only sent to `face`, the
+    /// north face, towards a matching subscriber (resp. queryable) that the north remote
+    /// declared. `asks_for` tells if an interest asks for that kind of entity.
     ///
-    /// This is the case when a configured interest includes `key_expr`, asks for that kind of
-    /// entity, and is no longer pending:
-    /// + finalized: every matching entity of the north remote has been declared to this node;
-    /// + denied, or unanswered at its deadline: this node does not know the entities of the
-    ///   north remote, but south traffic must not flow to the uplink for as long as an interest
-    ///   stays without an answer.
+    /// + A configured interest includes `key_expr`, asks for the kind and is no longer pending:
+    ///   `true`. Finalized, every matching entity of the north remote has been declared to this
+    ///   node. Denied, or unanswered at its deadline, this node does not know the entities of
+    ///   the north remote, but south traffic must not flow to the uplink for as long as an
+    ///   interest stays without an answer.
+    /// + Such an interest is pending: `false`, the entities are not known yet.
+    /// + No configured interest includes `key_expr`: `false`, unless a default route is
+    ///   configured and `key_expr` is not eligible to it.
     ///
-    /// While the interest is pending, and for a key expression that no configured interest
-    /// includes, this returns `false`: the hat routes as without configured interests.
-    pub(super) fn uplink_interests_settle(
+    /// Without configured interests and default route, this returns `false`: the hat routes as
+    /// the one of any client.
+    pub(super) fn stays_south(
         &self,
         face: &FaceState,
         key_expr: &keyexpr,
         asks_for: impl Fn(&InterestOptions) -> bool,
     ) -> bool {
-        if self.uplink_interests.is_empty() {
+        if self.uplink_interests.is_empty() && self.default_route.is_none() {
             return false;
         }
         let Some(hat_face) = face.hats[self.region].downcast_ref::<HatFace>() else {
             return false;
         };
-        hat_face.uplink_interests.iter().any(|interest| {
-            interest.state != UplinkInterestState::Pending
-                && asks_for(&interest.options)
+        let mut pending = false;
+        for interest in hat_face.uplink_interests.iter().filter(|interest| {
+            asks_for(&interest.options)
                 && interest
                     .res
                     .keyexpr()
                     .is_some_and(|interest_ke| interest_ke.includes(key_expr))
-        })
+        }) {
+            if interest.state != UplinkInterestState::Pending {
+                return true;
+            }
+            pending = true;
+        }
+        !pending
+            && self
+                .default_route
+                .as_ref()
+                .is_some_and(|default_route| !default_route.is_eligible(key_expr))
     }
 
     /// Marks the configured interests of `face` that are still pending as unanswered.

@@ -47,7 +47,7 @@ use super::{
 use crate::net::{
     routing::{
         dispatcher::{interests::RemoteInterest, region::RegionMap},
-        gateway::{FaceContext, DEFAULT_NODE_ID},
+        gateway::{DefaultRoute, FaceContext, DEFAULT_NODE_ID},
         hat::{DispatcherContext, Remote, UnregisterFaceEntitiesResult},
     },
     runtime::Runtime,
@@ -68,6 +68,11 @@ pub(crate) struct Hat {
     ///
     /// Empty unless `gateway.north.interests` is set.
     uplink_interests: Vec<(Arc<Resource>, InterestOptions)>,
+    /// What is sent to the north remote without a matching declaration, among the key
+    /// expressions that no configured interest includes (`gateway.north.default_route`).
+    ///
+    /// `None` (the default): all of them.
+    default_route: Option<Arc<DefaultRoute>>,
 }
 
 /// State of a configured interest (`gateway.north.interests`) on a north face.
@@ -118,7 +123,12 @@ impl Hat {
         Self {
             region,
             uplink_interests: Vec::new(),
+            default_route: None,
         }
+    }
+
+    pub(crate) fn set_default_route(&mut self, default_route: Arc<DefaultRoute>) {
+        self.default_route = Some(default_route);
     }
 
     pub(crate) fn set_uplink_interests(

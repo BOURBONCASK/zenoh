@@ -19,9 +19,10 @@ use std::{
 use arc_swap::ArcSwapOption;
 use uhlc::HLC;
 use zenoh_config::{
-    gateway::{GatewayPresetConf, GatewaySouthConf},
+    gateway::{GatewayDefaultRouteConf, GatewayPresetConf, GatewaySouthConf},
     ExpandedConfig,
 };
+use zenoh_keyexpr::{keyexpr, OwnedKeyExpr};
 use zenoh_protocol::{
     core::{Bound, Region, WhatAmI, ZenohIdProto},
     network::interest::InterestOptions,
@@ -247,6 +248,18 @@ impl<'conf> GatewayBuilder<'conf> {
             }
         }
 
+        if let Some(conf) = north.and_then(|north| north.default_route.as_ref()) {
+            let default_route = Arc::new(DefaultRoute::new(conf));
+            let hat = tables.hats[Region::North].as_any_mut();
+            if let Some(hat) = hat.downcast_mut::<hat::client::Hat>() {
+                hat.set_default_route(default_route);
+            } else if let Some(hat) = hat.downcast_mut::<hat::router::Hat>() {
+                hat.set_default_route(default_route);
+            } else {
+                bail!("gateway.north.default_route only applies to a router")
+            }
+        }
+
         Ok(Gateway {
             tables: Arc::new(TablesLock {
                 tables: RwLock::new(tables),
@@ -254,6 +267,33 @@ impl<'conf> GatewayBuilder<'conf> {
                 queries_lock: RwLock::new(()),
             }),
         })
+    }
+}
+
+/// The key expressions that are routed towards the north without a matching declaration
+/// (`gateway.north.default_route`).
+#[derive(Debug)]
+pub(crate) struct DefaultRoute {
+    key_exprs: Vec<OwnedKeyExpr>,
+    except: Vec<OwnedKeyExpr>,
+}
+
+impl DefaultRoute {
+    pub(crate) fn new(conf: &GatewayDefaultRouteConf) -> Self {
+        Self {
+            key_exprs: conf.key_exprs.clone(),
+            except: conf.except.clone(),
+        }
+    }
+
+    /// Whether a publication or a query on `key_expr` takes the default route.
+    ///
+    /// The whole key expression must be one that may have unknown destinations (inclusion in
+    /// `key_exprs`, not intersection: a wider wildcard is not eligible), and not one whose
+    /// destinations are all known (inclusion in `except`).
+    pub(crate) fn is_eligible(&self, key_expr: &keyexpr) -> bool {
+        self.key_exprs.iter().any(|ke| ke.includes(key_expr))
+            && !self.except.iter().any(|ke| ke.includes(key_expr))
     }
 }
 
@@ -523,5 +563,53 @@ impl Gateway {
             interceptor,
             this_zid,
         )))
+    }
+}
+
+#[cfg(test)]
+mod default_route_tests {
+    use zenoh_keyexpr::keyexpr;
+
+    use super::DefaultRoute;
+
+    fn eligible(default_route: &DefaultRoute, key_expr: &str) -> bool {
+        default_route.is_eligible(keyexpr::new(key_expr).unwrap())
+    }
+
+    #[test]
+    fn default_route_takes_the_fleet_keys_that_are_not_those_of_the_robot() {
+        let conf = json5::from_str(
+            r#"{ key_exprs: ["*/app/**", "*/bridge/**"], except: ["r1/**"] }"#,
+        )
+        .unwrap();
+        let default_route = DefaultRoute::new(&conf);
+
+        // another robot
+        assert!(eligible(&default_route, "r2/app/control"));
+        assert!(eligible(&default_route, "r2/bridge/rpc/a"));
+        assert!(eligible(&default_route, "r2/app/**"));
+        // the robot itself
+        assert!(!eligible(&default_route, "r1/app/control"));
+        assert!(!eligible(&default_route, "r1/app/**"));
+        assert!(!eligible(&default_route, "r1/**"));
+        // inside the keys of the fleet, wider than the robot
+        assert!(eligible(&default_route, "*/app/status"));
+        assert!(eligible(&default_route, "*/app/**"));
+        // outside or wider than the keys of the fleet
+        assert!(!eligible(&default_route, "r2/internal/joint"));
+        assert!(!eligible(&default_route, "app/unscoped"));
+        assert!(!eligible(&default_route, "rt/camera"));
+        assert!(!eligible(&default_route, "r2/**"));
+        assert!(!eligible(&default_route, "**"));
+        assert!(!eligible(&default_route, "*/**"));
+        assert!(!eligible(&default_route, "@/r2/app/control"));
+    }
+
+    #[test]
+    fn default_route_without_exception() {
+        let conf = json5::from_str(r#"{ key_exprs: ["fleet/**"] }"#).unwrap();
+        let default_route = DefaultRoute::new(&conf);
+        assert!(eligible(&default_route, "fleet/time"));
+        assert!(!eligible(&default_route, "local/time"));
     }
 }

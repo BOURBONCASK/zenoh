@@ -124,6 +124,7 @@ impl HatPubSubTrait for Hat {
     /// + `mres.owned_face_ctx.subscriber_interest_finalized` for all matching resources `mres`.
     /// + `owned_face.initial_interest_finalized` for all owned faces.
     /// + the state of the configured interests (`gateway.north.interests`) of the north face.
+    /// + the default route (`gateway.north.default_route`).
     #[tracing::instrument(level = "debug", skip(tables, src_region, _node_id), ret)]
     fn compute_data_route(
         &self,
@@ -168,13 +169,13 @@ impl HatPubSubTrait for Hat {
                 .find(|f| f.region.bound().is_north())
             {
                 route.try_insert(face.id, || {
-                    // NOTE(leaf): a configured interest that includes this key expression
-                    // tells, once it is no longer pending, to keep the publication south.
+                    // NOTE(leaf): the configured interests and the default route of a leaf
+                    // tell which publications are not sent north without a subscriber.
                     let has_interest_finalized = expr
                         .resource()
                         .and_then(|res| res.face_ctxs.get(&face.id))
                         .is_some_and(|ctx| ctx.subscriber_interest_finalized)
-                        || self.uplink_interests_settle(face, key_expr, |o| o.subscribers());
+                        || self.stays_south(face, key_expr, |o| o.subscribers());
                     (!has_interest_finalized).then(|| {
                         tracing::debug!(dst = %face, dst.has_unfinalized_subscriber_interest = true);
                         let wire_expr = expr.get_best_key(face.id);

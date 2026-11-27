@@ -380,6 +380,24 @@ impl HatQueriesTrait for Hat {
             );
         }
 
+        // NOTE(leaf): the gateway is a destination of unknown content, not a queryable: it is
+        // kept by `All` and `AllComplete`, and never preferred by `BestMatching`.
+        if let Some((face, source)) =
+            self.default_route_face(tables, key_expr, src_region, node_id)
+        {
+            tracing::debug!(dst = %face, dst.is_default_gateway = true);
+            let wire_expr = expr.get_best_key(face.id);
+            route.push(QueryTargetQabl {
+                dir: Direction {
+                    dst_face: face.clone(),
+                    wire_expr: wire_expr.to_owned(),
+                    node_id: source,
+                },
+                info: None,
+                region: self.region,
+            });
+        }
+
         route.sort_by_key(|qabl| qabl.info.map_or(u16::MAX, |i| i.distance));
         Arc::new(route)
     }
