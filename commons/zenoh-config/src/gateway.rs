@@ -51,6 +51,29 @@ pub struct GatewayNorthConf {
     /// behalf of the south router subregions, which have no interest protocol of their own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interests: Vec<GatewayNorthInterestConf>,
+    /// Key expressions that are routed towards the north without a matching declaration. Unset
+    /// by default. Does not need `mode`: it also applies to a router whose north region is a
+    /// router region with a gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_route: Option<GatewayDefaultRouteConf>,
+}
+
+/// Default route towards the north.
+///
+/// A publication or a query is _eligible_ iff its key expression is included in one of
+/// `key_exprs` and in none of `except`. An eligible message is sent towards the north in
+/// addition to its declared destinations:
+/// + by a router of a router region, to the gateway of the region;
+/// + by a leaf (`mode: "client"`), to its north remote. With this option set, a leaf does not
+///   send to its north remote the other key expressions that no configured interest includes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayDefaultRouteConf {
+    /// The key expressions that may have destinations this node does not know. At least one.
+    pub key_exprs: Vec<OwnedKeyExpr>,
+    /// The key expressions whose destinations this node knows, typically its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<OwnedKeyExpr>,
 }
 
 /// Uplink filter. A link matches iff it matches _all_ of the given fields; at least one is
@@ -130,6 +153,39 @@ pub struct GatewayFiltersConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_route_is_parsed() {
+        let conf: GatewayConf = json5::from_str(
+            r#"{
+                north: {
+                    default_route: { key_exprs: ["*/fleet/**"], except: ["r1/**"] },
+                },
+            }"#,
+        )
+        .unwrap();
+        let north = conf.north.unwrap();
+        assert!(north.mode.is_none());
+        let default_route = north.default_route.unwrap();
+        assert_eq!(default_route.key_exprs[0].as_str(), "*/fleet/**");
+        assert_eq!(default_route.except[0].as_str(), "r1/**");
+
+        let conf: GatewayConf =
+            json5::from_str(r#"{ north: { default_route: { key_exprs: ["a/**"] } } }"#).unwrap();
+        assert!(conf.north.unwrap().default_route.unwrap().except.is_empty());
+
+        assert!(json5::from_str::<GatewayConf>(r#"{ north: { default_route: {} } }"#).is_err());
+        assert!(json5::from_str::<GatewayConf>(
+            r#"{ north: { default_route: { key_exprs: ["a/**"], local: ["a/b"] } } }"#
+        )
+        .is_err());
+        assert!(json5::from_str::<GatewayConf>(r#"{ north: { mode: "client" } }"#)
+            .unwrap()
+            .north
+            .unwrap()
+            .default_route
+            .is_none());
+    }
 
     #[test]
     fn north_section_is_parsed() {
