@@ -200,6 +200,15 @@ impl Face {
 
     pub fn route_query(&self, msg: &mut Request) {
         let rtables = zread!(self.tables.tables);
+        if self.state.is_closed() {
+            // NOTE: no final is sent back: the face is closed, there is nobody to send it to.
+            tracing::debug!(
+                "{}:{} Query dropped: the face is closed",
+                self.state,
+                msg.id
+            );
+            return;
+        }
         match rtables
             .data
             .get_mapping(&self.state, &msg.wire_expr.scope, msg.wire_expr.mapping)

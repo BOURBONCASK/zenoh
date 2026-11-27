@@ -72,6 +72,7 @@ pub(crate) trait TransportUnicastTrait: Send + Sync {
     async fn get_status(&self) -> AsyncMutexGuard<'_, TransportStatus>;
     fn get_zid(&self) -> ZenohIdProto;
     fn get_whatami(&self) -> WhatAmI;
+    fn get_local_whatami(&self) -> WhatAmI;
     fn get_callback(&self) -> Option<Arc<dyn TransportPeerEventHandler>>;
     fn get_links(&self) -> Vec<Link>;
     fn get_auth_ids(&self) -> super::authentication::TransportAuthId;

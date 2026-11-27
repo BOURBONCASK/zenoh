@@ -27,6 +27,7 @@ mod declare;
 mod expr_id;
 mod forwarding;
 mod interest;
+mod leaf_uplink;
 mod nodeidx_reuse;
 mod oam;
 
@@ -540,13 +541,23 @@ impl MockFace {
 
     /// Inject a `Get` with an explicit payload.
     pub(crate) fn query(&self, id: RequestId, wire_expr: impl Into<WireExpr<'static>>) {
+        self.query_with_target(id, wire_expr, QueryTarget::DEFAULT)
+    }
+
+    /// Inject a `Query` request with the given target into the gateway.
+    pub(crate) fn query_with_target(
+        &self,
+        id: RequestId,
+        wire_expr: impl Into<WireExpr<'static>>,
+        target: QueryTarget,
+    ) {
         self.face.send_request(&mut Request {
             id,
             wire_expr: wire_expr.into(),
             ext_qos: ext::QoSType::DEFAULT,
             ext_tstamp: None,
             ext_nodeid: NodeIdType::DEFAULT,
-            ext_target: QueryTarget::DEFAULT,
+            ext_target: target,
             ext_budget: None,
             ext_timeout: None,
             ext_ts_stack: None,
@@ -800,6 +811,8 @@ pub(crate) struct HarnessBuilder {
     start_runtime: bool,
     start_adminspace: bool,
     manual_tree_computation: bool,
+    gateway: Option<String>,
+    config: Vec<(String, String)>,
 }
 
 impl HarnessBuilder {
@@ -811,7 +824,26 @@ impl HarnessBuilder {
             start_runtime: true,
             start_adminspace: false,
             manual_tree_computation: false,
+            gateway: None,
+            config: Vec::new(),
         }
+    }
+
+    /// Set the value at `key` of the runtime config, in JSON5 (e.g. `routing/interests/timeout`).
+    /// Only meaningful when [`start_runtime`](Self::start_runtime) is `true`.
+    pub(crate) fn config(mut self, key: &str, value: &str) -> Self {
+        self.config.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Set the `gateway` section of the runtime config, in JSON5.
+    ///
+    /// The regions of the gateway are still those given to
+    /// [`subregions`](Self::subregions): `Region::South { id, .. }` reads the options of
+    /// `gateway.south[id]`. Only meaningful when [`start_runtime`](Self::start_runtime) is `true`.
+    pub(crate) fn gateway(mut self, gateway: &str) -> Self {
+        self.gateway = Some(gateway.to_string());
+        self
     }
 
     /// Set the [`WhatAmI`] mode of this harness.
@@ -885,6 +917,12 @@ impl HarnessBuilder {
                 .set_enabled(self.start_adminspace)
                 .unwrap();
             config.plugins_loading.set_enabled(false).unwrap();
+            if let Some(gateway) = &self.gateway {
+                config.gateway = json5::from_str(gateway).unwrap();
+            }
+            for (key, value) in &self.config {
+                config.insert_json5(key, value).unwrap();
+            }
 
             let runtime = block_on(
                 RuntimeBuilder::new(crate::api::config::Config(config))
@@ -965,6 +1003,13 @@ impl Harness {
 
     pub(crate) fn zid(&self) -> ZenohIdProto {
         self.zid
+    }
+
+    /// The runtime of this harness. Panics if it was built without one.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        self._runtime
+            .as_ref()
+            .expect("harness built without a runtime")
     }
 
     /// Compute the routing trees of every router region now. See
@@ -1155,6 +1200,44 @@ impl EstablishedConnection {
             }
 
             out
+        })
+    }
+
+    /// Forward the pending messages **from A to B** for which `keep` is true, and drop the
+    /// others, as an interceptor on the way would. Returns the number of dropped messages.
+    pub(crate) fn fwd_if(&mut self, keep: impl Fn(&Message) -> bool) -> usize {
+        self.a2b.recorder().with_messages(|msgs| {
+            let mut dropped = 0;
+
+            while let Some(msg) = msgs.get(self.nfwd) {
+                if keep(msg) {
+                    Self::inject(&self.b2a, msg);
+                } else {
+                    dropped += 1;
+                }
+                self.nfwd += 1;
+            }
+
+            dropped
+        })
+    }
+
+    /// Forward the pending messages **from B to A** for which `keep` is true, and drop the
+    /// others. Returns the number of dropped messages.
+    pub(crate) fn rev_fwd_if(&mut self, keep: impl Fn(&Message) -> bool) -> usize {
+        self.b2a.recorder().with_messages(|msgs| {
+            let mut dropped = 0;
+
+            while let Some(msg) = msgs.get(self.rev_nfwd) {
+                if keep(msg) {
+                    Self::inject(&self.a2b, msg);
+                } else {
+                    dropped += 1;
+                }
+                self.rev_nfwd += 1;
+            }
+
+            dropped
         })
     }
 

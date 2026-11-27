@@ -161,11 +161,21 @@ impl TransportUnicastUniversal {
             self.config.zid
         );
 
+        // Tell the callback at once that this transport is going away: everything awaited
+        // below (another deletion in progress, the close of the links and of their tasks) may
+        // take time.
+        if let Some(cb) = self.callback.get() {
+            cb.closing();
+        }
+
         // Mark the transport as no longer alive and keep the lock
         // to avoid concurrent new_transport and closing/closed notifications
         let mut status_guard = self.get_status().await;
         *status_guard = TransportStatus::Closed;
         let callback = self.callback.close();
+
+        #[cfg(feature = "test")]
+        crate::unicast::test_helpers::deletion_gate(&self.manager.config.zid).await;
 
         // Close all the links
         let mut links = zwrite!(self.links).take();
@@ -406,6 +416,10 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
 
     fn get_bound(&self) -> Option<Bound> {
         self.config.bound
+    }
+
+    fn get_local_whatami(&self) -> WhatAmI {
+        self.config.local_whatami
     }
 
     fn get_callback(&self) -> Option<Arc<dyn TransportPeerEventHandler>> {

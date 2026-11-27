@@ -17,6 +17,8 @@
 #[cfg(feature = "unstable")]
 mod gossip;
 #[cfg(feature = "unstable")]
+mod leaf;
+#[cfg(feature = "unstable")]
 mod scenario1;
 #[cfg(feature = "unstable")]
 mod scenario2;

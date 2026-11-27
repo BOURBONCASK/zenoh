@@ -862,6 +862,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
     let config = TransportConfigUnicast {
         zid: osyn_out.other_zid,
         whatami: osyn_out.other_whatami,
+        local_whatami: manager.config.whatami,
         bound: osyn_out.other_bound,
         sn_resolution: state.transport.resolution.get(Field::FrameSN),
         tx_initial_sn: oack_out.open_ack.initial_sn,

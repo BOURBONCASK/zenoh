@@ -29,7 +29,7 @@ use zenoh_protocol::{
     core::{Region, ZenohIdProto},
     network::{
         declare::{queryable::ext::QueryableInfoType, QueryableId, SubscriberId, TokenId},
-        interest::InterestId,
+        interest::{InterestId, InterestOptions},
         Oam,
     },
 };
@@ -47,7 +47,7 @@ use super::{
 use crate::net::{
     routing::{
         dispatcher::{interests::RemoteInterest, region::RegionMap},
-        gateway::{FaceContext, DEFAULT_NODE_ID},
+        gateway::{DefaultRoute, FaceContext, LogLimiter, DEFAULT_NODE_ID},
         hat::{DispatcherContext, Remote, UnregisterFaceEntitiesResult},
     },
     runtime::Runtime,
@@ -60,6 +60,57 @@ mod token;
 
 pub(crate) struct Hat {
     region: Region,
+    /// Interests declared to the north remote on behalf of this node (`gateway.north.interests`).
+    ///
+    /// A router subregion has no interest protocol: its gateway is expected to know the north
+    /// region's entities and to declare them into it. A client hat only learns what it asks for,
+    /// so a leaf router asks for what its subregions may need.
+    ///
+    /// Empty unless `gateway.north.interests` is set.
+    uplink_interests: Vec<(Arc<Resource>, InterestOptions)>,
+    /// What is sent to the north remote without a matching declaration, among the key
+    /// expressions that no configured interest includes (`gateway.north.default_route`).
+    ///
+    /// `None` (the default): all of them.
+    default_route: Option<Arc<DefaultRoute>>,
+    /// The errors about configured interests are logged once per interest and period: a
+    /// reconnection loop repeats them at each connection.
+    uplink_logs: LogLimiter,
+}
+
+/// State of a configured interest (`gateway.north.interests`) on a north face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UplinkInterestState {
+    /// Sent. The north remote has not said yet that it declared everything that matches.
+    Pending,
+    /// The north remote declared everything that matches, and keeps declaring what changes.
+    Finalized,
+    /// The north remote did not answer within the deadline: the interest was lost on the way, or
+    /// the remote does not answer interests.
+    Unanswered,
+    /// The interest did not leave this node: its access control denies it on egress, or the
+    /// link could not take it.
+    NotSent,
+}
+
+impl UplinkInterestState {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            UplinkInterestState::Pending => "pending",
+            UplinkInterestState::Finalized => "finalized",
+            UplinkInterestState::Unanswered => "unanswered",
+            UplinkInterestState::NotSent => "not_sent",
+        }
+    }
+}
+
+/// A configured interest declared to a north face. It lives as long as the face: it is not
+/// one of [`FaceState::local_interests`], which belong to the sessions that declared them.
+struct FaceUplinkInterest {
+    id: InterestId,
+    res: Arc<Resource>,
+    options: InterestOptions,
+    state: UplinkInterestState,
 }
 
 impl Debug for Hat {
@@ -73,7 +124,48 @@ impl Hat {
     pub(crate) fn new(region: Region) -> Self {
         debug_assert!(region.bound().is_north());
 
-        Self { region }
+        Self {
+            region,
+            uplink_interests: Vec::new(),
+            default_route: None,
+            uplink_logs: LogLimiter::default(),
+        }
+    }
+
+    pub(crate) fn set_default_route(&mut self, default_route: Arc<DefaultRoute>) {
+        self.default_route = Some(default_route);
+    }
+
+    pub(crate) fn default_route(&self) -> Option<&Arc<DefaultRoute>> {
+        self.default_route.as_ref()
+    }
+
+    pub(crate) fn set_uplink_interests(
+        &mut self,
+        interests: Vec<(Arc<Resource>, InterestOptions)>,
+    ) {
+        self.uplink_interests = interests;
+    }
+
+    /// The configured interests, with their state on the north face (`None` without one).
+    pub(crate) fn uplink_interests_info(
+        &self,
+        tables: &TablesData,
+    ) -> Vec<(String, InterestOptions, Option<UplinkInterestState>)> {
+        let face = self.owned_faces(tables).next();
+        self.uplink_interests
+            .iter()
+            .map(|(res, options)| {
+                let state = face.and_then(|face| {
+                    self.face_hat(face)
+                        .uplink_interests
+                        .iter()
+                        .find(|i| Arc::ptr_eq(&i.res, res) && i.options == *options)
+                        .map(|i| i.state)
+                });
+                (res.expr().to_string(), *options, state)
+            })
+            .collect()
     }
 
     pub(self) fn face_hat<'f>(&self, face_state: &'f Arc<FaceState>) -> &'f HatFace {
@@ -154,6 +246,9 @@ impl HatBaseTrait for Hat {
         debug_assert!(ctx.src_face.region.bound().is_north());
         debug_assert_eq!(self.owned_faces(ctx.tables).count(), 1);
 
+        if !self.uplink_interests.is_empty() {
+            self.propagate_uplink_interests(ctx.reborrow());
+        }
         self.repropagate_interests(ctx.reborrow(), &other_hats);
         self.repropagate_subscribers(ctx.reborrow(), &other_hats);
         self.repropagate_queryables(ctx.reborrow(), &other_hats);
@@ -176,6 +271,7 @@ impl HatBaseTrait for Hat {
         };
 
         hat_face.remote_interests.clear();
+        hat_face.uplink_interests.clear();
         hat_face.local_subs.clear();
         hat_face.local_qabls.clear();
         hat_face.local_tokens.clear();
@@ -248,6 +344,8 @@ impl HatContext {
 struct HatFace {
     next_id: AtomicU32, // @TODO: manage rollover and uniqueness
     remote_interests: HashMap<InterestId, RemoteInterest>,
+    /// The configured interests declared to this face. Empty unless the hat has some.
+    uplink_interests: Vec<FaceUplinkInterest>,
     local_subs: HashMap<Arc<Resource>, SubscriberId>,
     remote_subs: HashMap<SubscriberId, Arc<Resource>>,
     local_qabls: HashMap<Arc<Resource>, (QueryableId, QueryableInfoType)>,
@@ -261,6 +359,7 @@ impl HatFace {
         Self {
             next_id: AtomicU32::new(1),
             remote_interests: HashMap::new(),
+            uplink_interests: Vec::new(),
             local_subs: HashMap::new(),
             remote_subs: HashMap::new(),
             local_qabls: HashMap::new(),

@@ -83,6 +83,12 @@ impl TransportUnicastUniversal {
         // the transport. A close task for each of them would tear the transport down again
         // and again, and a late one could unregister the transport of a new connection
         // with the same peer.
+        #[cfg(feature = "test")]
+        let pushed = pushed
+            && !crate::unicast::test_helpers::push_fails(
+                &self.manager.config.zid,
+                &self.config.zid,
+            );
         if !pushed && !msg.is_droppable() && !self.unresponsive.swap(true, Ordering::Relaxed) {
             tracing::error!(
                 "Unable to push non droppable network message to {}. Closing transport!",
@@ -136,6 +142,14 @@ impl TransportUnicastUniversal {
     #[allow(clippy::let_and_return)] // When feature "stats" is not enabled
     #[inline(always)]
     pub(crate) fn internal_schedule(&self, mut msg: NetworkMessageMut) -> ZResult<bool> {
+        #[cfg(feature = "test")]
+        crate::unicast::test_helpers::held(
+            crate::unicast::test_helpers::HoldAt::Egress,
+            &self.manager.config.zid,
+            &self.config.zid,
+            zenoh_protocol::network::NetworkMessageExt::as_ref(&msg),
+        );
+
         let transport_links = self
             .links
             .read()

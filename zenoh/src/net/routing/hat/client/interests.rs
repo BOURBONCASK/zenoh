@@ -13,28 +13,35 @@
 //
 use std::{
     collections::{HashMap, HashSet},
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Weak},
+    time::Duration,
 };
 
-use zenoh_protocol::network::{
-    declare::queryable::ext::QueryableInfoType,
-    interest::{self, InterestId, InterestMode},
-    Interest,
+#[allow(unused_imports)]
+use zenoh_core::polyfill::*;
+use zenoh_keyexpr::keyexpr;
+use zenoh_protocol::{
+    core::Region,
+    network::{
+        declare::queryable::ext::QueryableInfoType,
+        interest::{self, InterestId, InterestMode, InterestOptions},
+        Interest,
+    },
 };
 use zenoh_sync::get_mut_unchecked;
 
-use super::Hat;
+use super::{FaceUplinkInterest, Hat, HatFace, UplinkInterestState};
 use crate::net::routing::{
     dispatcher::{
-        face::InterestState,
+        face::{FaceState, InterestState},
         interests::{
             CurrentInterest, CurrentInterestCleanup, PendingCurrentInterest, RemoteInterest,
         },
         region::RegionMap,
         resource::Resource,
-        tables::TablesData,
+        tables::{TablesData, TablesLock},
     },
-    gateway::SubscriberInfo,
+    gateway::{LogLimiter, SubscriberInfo},
     hat::{
         DispatcherContext, HatBaseTrait, HatInterestTrait, HatTrait, Remote,
         RouteCurrentDeclareResult, RouteInterestResult,
@@ -42,6 +49,180 @@ use crate::net::routing::{
     RoutingContext,
 };
 impl Hat {
+    /// Declares the configured interests to the new north face and starts their deadline.
+    #[tracing::instrument(level = "debug", skip_all, ret)]
+    pub(super) fn propagate_uplink_interests(&self, ctx: DispatcherContext) {
+        for (res, options) in &self.uplink_interests {
+            let id = self
+                .face_hat(ctx.src_face)
+                .next_id
+                .fetch_add(1, Ordering::SeqCst);
+            self.face_hat_mut(ctx.src_face)
+                .uplink_interests
+                .push(FaceUplinkInterest {
+                    id,
+                    res: res.clone(),
+                    options: *options,
+                    state: UplinkInterestState::Pending,
+                });
+            let wire_expr = Resource::decl_key(res, ctx.src_face);
+            tracing::debug!(dst = %ctx.src_face, expr = res.expr(), %options, "Uplink interest");
+            let sent = ctx
+                .src_face
+                .primitives
+                .send_interest(RoutingContext::with_expr(
+                    &mut Interest {
+                        id,
+                        mode: InterestMode::CurrentFuture,
+                        options: *options,
+                        wire_expr: Some(wire_expr),
+                        ext_qos: interest::ext::QoSType::INTEREST,
+                        ext_tstamp: None,
+                        ext_nodeid: interest::ext::NodeIdType::DEFAULT,
+                    },
+                    res.expr().to_string(),
+                ));
+            if !sent {
+                // NOTE: the two causes cannot be told apart here. On an uplink that stays
+                // connected it is the access control.
+                let message = format!(
+                    "Uplink interest '{}' ({}) was not sent to {}: the access control of this \
+                     node denies it on egress (an interest that asks for tokens is checked as \
+                     declare_liveliness_subscriber on its key expression), or the link was \
+                     closing. This node will miss the declarations it asks for",
+                    res.expr(),
+                    options,
+                    ctx.src_face.zid,
+                );
+                if self
+                    .uplink_logs
+                    .due(&format!("not sent {} {}", res.expr(), options))
+                {
+                    tracing::error!(
+                        "{message} (logged at most once per {:?} for this interest)",
+                        LogLimiter::PERIOD
+                    );
+                } else {
+                    tracing::debug!("{message}");
+                }
+                if let Some(interest) = self.face_hat_mut(ctx.src_face).uplink_interests.last_mut()
+                {
+                    interest.state = UplinkInterestState::NotSent;
+                }
+            }
+        }
+
+        UplinkInterestsDeadline::spawn(
+            ctx.src_face,
+            ctx.tables_lock,
+            self.region,
+            ctx.tables.interests_timeout,
+        );
+    }
+
+    /// Returns `true` if a publication (resp. a query) on `key_expr` is only sent to `face`, the
+    /// north face, towards a matching subscriber (resp. queryable) that the north remote
+    /// declared. `asks_for` tells if an interest asks for that kind of entity.
+    ///
+    /// With a default route (`gateway.north.default_route`), the default route alone decides
+    /// what is sent north without a declaration:
+    ///
+    /// + `key_expr` is not eligible to it: `true`, whatever the state of the configured
+    ///   interests. The keys that the default route excludes are those of this site: they never
+    ///   go north without a declared destination, not even while the interest that includes
+    ///   them is pending after a (re)connection. The declarations of the north remote are
+    ///   served as they arrive.
+    /// + `key_expr` is eligible: as without a default route, below.
+    ///
+    /// Without a default route:
+    ///
+    /// + A configured interest includes `key_expr`, asks for the kind and is no longer pending:
+    ///   `true`. Finalized, every matching entity of the north remote has been declared to this
+    ///   node. Not sent, or unanswered at its deadline, this node does not know the entities of
+    ///   the north remote, but south traffic must not flow to the uplink for as long as an
+    ///   interest stays without an answer.
+    /// + Such an interest is pending: `false`, the entities are not known yet. This is bounded
+    ///   by the deadline of the interest, and happens again at each connection.
+    /// + No configured interest includes `key_expr`: `false`.
+    ///
+    /// Without configured interests and default route, this returns `false`: the hat routes as
+    /// the one of any client.
+    pub(super) fn stays_south(
+        &self,
+        face: &FaceState,
+        key_expr: &keyexpr,
+        asks_for: impl Fn(&InterestOptions) -> bool,
+    ) -> bool {
+        if self.uplink_interests.is_empty() && self.default_route.is_none() {
+            return false;
+        }
+        let Some(hat_face) = face.hats[self.region].downcast_ref::<HatFace>() else {
+            return false;
+        };
+        if self
+            .default_route
+            .as_ref()
+            .is_some_and(|default_route| !default_route.is_eligible(key_expr))
+        {
+            return true;
+        }
+        hat_face
+            .uplink_interests
+            .iter()
+            .filter(|interest| {
+                asks_for(&interest.options)
+                    && interest
+                        .res
+                        .keyexpr()
+                        .is_some_and(|interest_ke| interest_ke.includes(key_expr))
+            })
+            .any(|interest| interest.state != UplinkInterestState::Pending)
+    }
+
+    /// Marks the configured interests of `face` that are still pending as unanswered.
+    pub(crate) fn expire_uplink_interests(
+        &mut self,
+        tables: &mut TablesData,
+        face: &mut Arc<FaceState>,
+        timeout: Duration,
+    ) {
+        let mut expired = false;
+        let mut unanswered = vec![];
+        let remote = face.zid;
+        for interest in &mut self.face_hat_mut(face).uplink_interests {
+            if interest.state == UplinkInterestState::Pending {
+                interest.state = UplinkInterestState::Unanswered;
+                expired = true;
+                let message = format!(
+                    "Uplink interest '{}' ({}) was not answered by {} within {:?}: this node may \
+                     miss declarations of its north region. Publications and queries on the keys \
+                     it includes are now only sent to the uplink towards the declarations received",
+                    interest.res.expr(),
+                    interest.options,
+                    remote,
+                    timeout,
+                );
+                unanswered.push((
+                    format!("unanswered {} {}", interest.res.expr(), interest.options),
+                    message,
+                ));
+            }
+        }
+        for (subject, message) in unanswered {
+            if self.uplink_logs.due(&subject) {
+                tracing::error!(
+                    "{message} (logged at most once per {:?} for this interest)",
+                    LogLimiter::PERIOD
+                );
+            } else {
+                tracing::debug!("{message}");
+            }
+        }
+        if expired {
+            self.disable_all_routes(tables);
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip_all, ret)]
     pub(super) fn repropagate_interests(
         &self,
@@ -80,6 +261,42 @@ impl Hat {
                         .unwrap_or_default(),
                 ));
         }
+    }
+}
+
+/// Deadline of the configured interests of a north face: those that are still pending when it
+/// fires become [`UplinkInterestState::Unanswered`].
+struct UplinkInterestsDeadline;
+
+impl UplinkInterestsDeadline {
+    fn spawn(
+        face: &Arc<FaceState>,
+        tables_ref: &Arc<TablesLock>,
+        region: Region,
+        timeout: Duration,
+    ) {
+        let tables_ref = tables_ref.clone();
+        let weak_face: Weak<FaceState> = Arc::downgrade(face);
+        let cancellation_token = face.task_controller.get_cancellation_token();
+        face.task_controller
+            .spawn_with_rt(zenoh_runtime::ZRuntime::Net, async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(timeout) => {}
+                    _ = cancellation_token.cancelled() => { return; }
+                }
+                let Some(mut face) = weak_face.upgrade() else {
+                    return;
+                };
+                let _ctrl_lock = zlock!(tables_ref.ctrl_lock);
+                let mut wtables = zwrite!(tables_ref.tables);
+                let tables = &mut *wtables;
+                if !tables.data.faces.contains_key(&face.id) {
+                    return;
+                }
+                if let Some(hat) = tables.hats[region].as_any_mut().downcast_mut::<Hat>() {
+                    hat.expire_uplink_interests(&mut tables.data, &mut face, timeout);
+                }
+            });
     }
 }
 
@@ -225,6 +442,56 @@ impl HatInterestTrait for Hat {
         debug_assert!(self.region().bound().is_north());
         debug_assert!(ctx.src_face.region.bound().is_north());
 
+        let remote = ctx.src_face.zid;
+        let mut answered_late = None;
+        let configured = match self
+            .face_hat_mut(ctx.src_face)
+            .uplink_interests
+            .iter_mut()
+            .find(|i| i.id == interest_id)
+        {
+            Some(interest) => {
+                match interest.state {
+                    UplinkInterestState::Pending => tracing::info!(
+                        "Uplink interest '{}' ({}) answered by {}",
+                        interest.res.expr(),
+                        interest.options,
+                        remote
+                    ),
+                    UplinkInterestState::Unanswered => {
+                        answered_late = Some((
+                            format!("late {} {}", interest.res.expr(), interest.options),
+                            format!(
+                                "Uplink interest '{}' ({}) answered by {} after its deadline",
+                                interest.res.expr(),
+                                interest.options,
+                                remote
+                            ),
+                        ))
+                    }
+                    UplinkInterestState::Finalized | UplinkInterestState::NotSent => {}
+                }
+                interest.state = UplinkInterestState::Finalized;
+                true
+            }
+            None => false,
+        };
+        // NOTE: an uplink that reconnects again and again to a remote that answers late would
+        // otherwise log this once per interest and connection.
+        if let Some((subject, message)) = answered_late {
+            if self.uplink_logs.due(&subject) {
+                tracing::warn!(
+                    "{message} (logged at most once per {:?} for this interest)",
+                    LogLimiter::PERIOD
+                );
+            } else {
+                tracing::debug!("{message}");
+            }
+        }
+        if configured {
+            return NoBreadcrumb;
+        }
+
         let has_local_interest = get_mut_unchecked(ctx.src_face)
             .local_interests
             .get_mut(&interest_id)
@@ -265,7 +532,12 @@ impl HatInterestTrait for Hat {
         debug_assert!(self.region().bound().is_north());
         debug_assert!(ctx.src_face.region.bound().is_north());
 
-        let has_local_interest = ctx.src_face.local_interests.contains_key(&interest_id);
+        let has_local_interest = ctx.src_face.local_interests.contains_key(&interest_id)
+            || self
+                .face_hat(ctx.src_face)
+                .uplink_interests
+                .iter()
+                .any(|i| i.id == interest_id);
 
         let breadcrumb = ctx
             .src_face

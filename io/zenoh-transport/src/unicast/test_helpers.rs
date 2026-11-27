@@ -13,7 +13,7 @@
 //
 use std::{
     fmt::{self, DebugStruct},
-    sync::Arc,
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 
@@ -23,7 +23,7 @@ use zenoh_core::zcondfeat;
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::{Bound, RegionName, WhatAmI, ZenohIdProto},
-    network::{NetworkBody, NetworkBodyMut, NetworkMessage, NetworkMessageMut},
+    network::{NetworkBody, NetworkBodyMut, NetworkMessage, NetworkMessageMut, NetworkMessageRef},
     transport::TransportSn,
 };
 use zenoh_result::ZResult;
@@ -74,6 +74,10 @@ impl TransportUnicastTrait for MockTransportUnicastInner {
 
     fn get_whatami(&self) -> WhatAmI {
         self.whatami
+    }
+
+    fn get_local_whatami(&self) -> WhatAmI {
+        unimplemented!("MockTransportUnicastInner::get_local_whatami")
     }
 
     fn get_callback(&self) -> Option<Arc<dyn TransportPeerEventHandler>> {
@@ -207,5 +211,241 @@ pub fn make_basic_transport_manager_builder(
     match lowlatency_transport {
         true => config.lowlatency(true).qos(false),
         false => config,
+    }
+}
+
+/// The deletions that tests hold back, by the Zenoh ID of the node that deletes.
+static DELETION_GATES: std::sync::Mutex<Vec<(ZenohIdProto, Arc<tokio::sync::Semaphore>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds back the deletion of the unicast transports of a node, see [`gate_deletions`].
+pub struct DeletionGate {
+    zid: ZenohIdProto,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl DeletionGate {
+    /// The number of deletions that are waiting at the gate.
+    pub fn waiting(&self) -> usize {
+        // each deletion that waits holds a clone, the registry holds one and `self` another
+        Arc::strong_count(&self.gate) - 2
+    }
+
+    /// Lets the deletions that wait, and the later ones, go on.
+    pub fn open(&self) {
+        DELETION_GATES
+            .lock()
+            .unwrap()
+            .retain(|(_, gate)| !Arc::ptr_eq(gate, &self.gate));
+        self.gate.close();
+    }
+}
+
+impl Drop for DeletionGate {
+    fn drop(&mut self) {
+        tracing::trace!("Deletions of the transports of {} go on", self.zid);
+        self.open();
+    }
+}
+
+/// From now on and until the returned gate is opened or dropped, the deletion of a unicast
+/// transport of the node `zid` stops after it has marked the transport closed and told its
+/// handler that it is closing, and before it closes the links and the tasks of the transport:
+/// a clean-up that takes as long as the test wants.
+pub fn gate_deletions(zid: ZenohIdProto) -> DeletionGate {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    DELETION_GATES.lock().unwrap().push((zid, gate.clone()));
+    DeletionGate { zid, gate }
+}
+
+/// Waits at the gate of the node `zid`, if tests have closed one.
+pub(crate) async fn deletion_gate(zid: &ZenohIdProto) {
+    let gate = DELETION_GATES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(gated, _)| gated == zid)
+        .map(|(_, gate)| gate.clone());
+    if let Some(gate) = gate {
+        // no permit is ever added: this returns when the gate is closed, which opens it
+        let _ = gate.acquire().await;
+    }
+}
+
+/// The pushes that tests make fail: (node, remote).
+static FAILING_PUSHES: std::sync::Mutex<Vec<(ZenohIdProto, ZenohIdProto)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the pushes of a node to a remote fail, see [`fail_pushes`].
+pub struct FailingPushes(ZenohIdProto, ZenohIdProto);
+
+impl Drop for FailingPushes {
+    fn drop(&mut self) {
+        FAILING_PUSHES
+            .lock()
+            .unwrap()
+            .retain(|(zid, remote)| (zid, remote) != (&self.0, &self.1));
+    }
+}
+
+/// From now on and until the returned value is dropped, the node `zid` takes each network message
+/// it sends to `remote` over a universal transport as one it could not enqueue, as when the
+/// queue towards a remote that no longer reads stays full. The first such message that cannot
+/// be dropped makes the node delete that transport, which is the deletion that does not go
+/// through the removal of its links.
+pub fn fail_pushes(zid: ZenohIdProto, remote: ZenohIdProto) -> FailingPushes {
+    FAILING_PUSHES.lock().unwrap().push((zid, remote));
+    FailingPushes(zid, remote)
+}
+
+pub(crate) fn push_fails(zid: &ZenohIdProto, remote: &ZenohIdProto) -> bool {
+    FAILING_PUSHES
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(z, r)| z == zid && r == remote)
+}
+
+/// Where a node stops a network message for tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldAt {
+    /// In a read task, with the handler of the transport in hand, before the message is given
+    /// to it.
+    Ingress,
+    /// In the thread that sends the message, before the transport takes it.
+    Egress,
+}
+
+#[derive(Default)]
+struct HoldState {
+    /// A message matched: the later ones pass.
+    taken: bool,
+    /// The thread that carries that message is stopped.
+    holding: bool,
+    released: bool,
+}
+
+struct HoldPoint {
+    at: HoldAt,
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: Box<dyn Fn(NetworkMessageRef) -> bool + Send + Sync>,
+    state: Mutex<HoldState>,
+    changed: Condvar,
+}
+
+/// The messages that tests hold back.
+static HOLD_POINTS: Mutex<Vec<Arc<HoldPoint>>> = Mutex::new(Vec::new());
+
+/// Holds back one network message of a node, see [`hold_ingress`] and [`hold_egress`].
+pub struct MessageHold(Arc<HoldPoint>);
+
+impl MessageHold {
+    /// Whether the message is there: the thread that carries it is stopped.
+    pub fn holding(&self) -> bool {
+        let state = self.0.state.lock().unwrap();
+        state.holding && !state.released
+    }
+
+    /// Whether a message was stopped, now or before it was released.
+    pub fn taken(&self) -> bool {
+        self.0.state.lock().unwrap().taken
+    }
+
+    /// Lets the message go on. No other message is stopped afterwards.
+    pub fn release(&self) {
+        HOLD_POINTS
+            .lock()
+            .unwrap()
+            .retain(|point| !Arc::ptr_eq(point, &self.0));
+        self.0.state.lock().unwrap().released = true;
+        self.0.changed.notify_all();
+    }
+}
+
+impl Drop for MessageHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn hold(
+    at: HoldAt,
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: impl Fn(NetworkMessageRef) -> bool + Send + Sync + 'static,
+) -> MessageHold {
+    let point = Arc::new(HoldPoint {
+        at,
+        zid,
+        remote,
+        matches: Box::new(matches),
+        state: Mutex::new(HoldState::default()),
+        changed: Condvar::new(),
+    });
+    HOLD_POINTS.lock().unwrap().push(point.clone());
+    MessageHold(point)
+}
+
+/// From now on, the first network message of `remote` for which `matches` is true stops in the
+/// read task of the node `zid` that received it, until the returned value is released or
+/// dropped. That task has taken the handler of the transport already and has not given it the
+/// message yet: a read callback that is acquired, and resumes as late as the test wants. The
+/// messages that follow on the same link wait behind it.
+pub fn hold_ingress(
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: impl Fn(NetworkMessageRef) -> bool + Send + Sync + 'static,
+) -> MessageHold {
+    hold(HoldAt::Ingress, zid, remote, matches)
+}
+
+/// From now on, the first network message that the node `zid` sends to `remote` and for which
+/// `matches` is true stops in the thread that sends it, before the transport takes it, until
+/// the returned value is released or dropped: when that thread is a read task that routes a
+/// message of another remote, it is stopped inside the routing of that message.
+pub fn hold_egress(
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: impl Fn(NetworkMessageRef) -> bool + Send + Sync + 'static,
+) -> MessageHold {
+    hold(HoldAt::Egress, zid, remote, matches)
+}
+
+/// Stops here if tests hold `msg` back, see [`hold_ingress`] and [`hold_egress`].
+pub(crate) fn held(at: HoldAt, zid: &ZenohIdProto, remote: &ZenohIdProto, msg: NetworkMessageRef) {
+    let point = {
+        let points = HOLD_POINTS.lock().unwrap();
+        if points.is_empty() {
+            return;
+        }
+        points
+            .iter()
+            .find(|point| {
+                point.at == at
+                    && &point.zid == zid
+                    && &point.remote == remote
+                    && (point.matches)(msg)
+                    && !std::mem::replace(&mut point.state.lock().unwrap().taken, true)
+            })
+            .cloned()
+    };
+    let Some(point) = point else {
+        return;
+    };
+    let wait = || {
+        let mut state = point.state.lock().unwrap();
+        state.holding = true;
+        while !state.released {
+            state = point.changed.wait(state).unwrap();
+        }
+        state.holding = false;
+    };
+    // this thread is a worker of a runtime: its other tasks must go on meanwhile
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
     }
 }

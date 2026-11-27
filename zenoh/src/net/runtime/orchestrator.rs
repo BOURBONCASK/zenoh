@@ -913,9 +913,20 @@ impl Runtime {
             period: ConnectionRetryPeriod,
             wait_time: Duration,
             cancellation_token: CancellationToken,
+            uplink_of: Option<Runtime>,
         ) -> Option<(EndPoint, ConnectionRetryPeriod)> {
+            let wait = async {
+                tokio::time::sleep(wait_time).await;
+                // NOTE(leaf): an endpoint that can only be an uplink is not dialed while
+                // another remote owns the north region of a leaf router: it would be refused
+                // once established, and its remote would see a client come and go at each
+                // retry.
+                if let Some(runtime) = &uplink_of {
+                    runtime.state.north.wait_vacant().await;
+                }
+            };
             tokio::select! {
-                _ = tokio::time::sleep(wait_time) => {
+                _ = wait => {
                     Some((peer, period))
                 }
                 _ = cancellation_token.cancelled() => {
@@ -923,6 +934,10 @@ impl Runtime {
                 }
             }
         }
+
+        let uplink_of = |peer: &EndPoint| {
+            super::region::is_uplink_endpoint(peer, &self.state.config.lock()).then(|| self.clone())
+        };
 
         let mut connected_peers = Vec::new();
 
@@ -932,11 +947,13 @@ impl Runtime {
         for peer in peers {
             let retry_config = self.get_connect_retry_config(&peer);
             let period = retry_config.period();
+            let uplink_of = uplink_of(&peer);
             tasks.push(wait_next_peer_retry(
                 peer,
                 period,
                 Duration::ZERO,
                 cancellation_token.clone(),
+                uplink_of,
             ));
         }
 
@@ -981,11 +998,13 @@ impl Runtime {
                             period.duration()
                         );
                         let wait_time = period.next_duration();
+                        let uplink_of = uplink_of(&peer);
                         tasks.push(wait_next_peer_retry(
                             peer,
                             period,
                             wait_time,
                             cancellation_token.clone(),
+                            uplink_of,
                         ));
                     }
                 }

@@ -191,6 +191,10 @@ impl TransportPeerEventHandler for DeMux {
 
                 let mut declares = vec![];
                 let ctrl_lock = zlock!(self.face.tables.ctrl_lock);
+                if self.face.state.is_closed() {
+                    tracing::debug!(src = %self.face, "OAM dropped: the face is closed");
+                    return Ok(());
+                }
                 let mut wtables = zwrite!(self.face.tables.tables);
                 let tables = &mut *wtables;
 

@@ -703,10 +703,17 @@ pub(crate) async fn open_link(
         };
     }
 
+    let mine_whatami = manager.config.whatami_on(|| {
+        zenoh_link_commons::Link::new_unicast(
+            &link_unicast.link,
+            link_unicast.config.priorities.clone(),
+            link_unicast.config.reliability,
+        )
+    });
     let isyn_in = SendInitSynIn {
         mine_version: manager.config.version,
         mine_zid: manager.config.zid,
-        mine_whatami: manager.config.whatami,
+        mine_whatami,
     };
     step!(
         fsm.send_init_syn((&mut link_unicast, &mut state, isyn_in))
@@ -756,6 +763,7 @@ pub(crate) async fn open_link(
     let config = TransportConfigUnicast {
         zid: iack_out.other_zid,
         whatami: iack_out.other_whatami,
+        local_whatami: mine_whatami,
         bound: oack_out.other_bound,
         sn_resolution: state.transport.resolution.get(Field::FrameSN),
         tx_initial_sn: osyn_out.mine_initial_sn,

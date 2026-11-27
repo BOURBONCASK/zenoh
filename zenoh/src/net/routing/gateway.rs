@@ -19,10 +19,14 @@ use std::{
 use arc_swap::ArcSwapOption;
 use uhlc::HLC;
 use zenoh_config::{
-    gateway::{GatewayPresetConf, GatewaySouthConf},
+    gateway::{GatewayDefaultRouteConf, GatewayPresetConf, GatewaySouthConf},
     ExpandedConfig,
 };
-use zenoh_protocol::core::{Bound, Region, WhatAmI, ZenohIdProto};
+use zenoh_keyexpr::{keyexpr, OwnedKeyExpr};
+use zenoh_protocol::{
+    core::{Bound, Region, WhatAmI, ZenohIdProto},
+    network::interest::InterestOptions,
+};
 use zenoh_result::ZResult;
 use zenoh_transport::{multicast::TransportMulticast, unicast::TransportUnicast, TransportPeer};
 
@@ -98,6 +102,10 @@ impl<'conf> GatewayBuilder<'conf> {
 
     pub fn build(self) -> ZResult<Gateway> {
         let mode = self.config.mode();
+        // NOTE(leaf): the mode this node takes in its north region; `gateway.north.mode` lets a
+        // router be a client of its north region while it remains a router for its subregions.
+        let north = self.config.gateway.north.as_ref();
+        let north_mode = north.and_then(|north| north.mode).unwrap_or(mode);
 
         let mut regions = vec![Region::North];
 
@@ -153,7 +161,7 @@ impl<'conf> GatewayBuilder<'conf> {
             .map(|region| -> (Region, Box<dyn HatTrait + Send + Sync>) {
                 (
                     region,
-                    match (region.bound(), region.mode().unwrap_or(mode)) {
+                    match (region.bound(), region.mode().unwrap_or(north_mode)) {
                         (Bound::North, WhatAmI::Client) => Box::new(hat::client::Hat::new(region)),
                         (Bound::South, WhatAmI::Client) => Box::new(hat::broker::Hat::new(region)),
                         (_, WhatAmI::Peer) => Box::new(hat::peer::Hat::new(region)),
@@ -188,13 +196,142 @@ impl<'conf> GatewayBuilder<'conf> {
             stats,
         )?;
 
+        let mut tables = Tables { data, hats };
+
+        // NOTE(leaf): the resources of the uplink interests live as long as the gateway.
+        let uplink_interests = north
+            .map(|north| north.interests.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|interest| {
+                let mut options = InterestOptions::KEYEXPRS;
+                if interest.subscribers {
+                    options += InterestOptions::SUBSCRIBERS;
+                }
+                if interest.queryables {
+                    options += InterestOptions::QUERYABLES;
+                }
+                if interest.tokens {
+                    options += InterestOptions::TOKENS;
+                }
+                if options == InterestOptions::KEYEXPRS {
+                    tracing::warn!(
+                        "gateway.north.interests: '{}' asks for nothing and is ignored",
+                        interest.key_expr
+                    );
+                    return None;
+                }
+                let mut root = tables.data.root_res.clone();
+                let res = match Resource::get_resource(&root, &interest.key_expr)
+                    .filter(|res| res.ctx.is_some())
+                {
+                    Some(res) => res,
+                    None => {
+                        let mut matches = Resource::get_matches(&tables.data, &interest.key_expr);
+                        let mut res =
+                            Resource::make_resource(&mut tables, &mut root, &interest.key_expr);
+                        matches.push(Arc::downgrade(&res));
+                        Resource::match_resource(&tables.data, &mut res, matches);
+                        res
+                    }
+                };
+                Some((res, options))
+            })
+            .collect::<Vec<_>>();
+        if !uplink_interests.is_empty() {
+            match tables.hats[Region::North]
+                .as_any_mut()
+                .downcast_mut::<hat::client::Hat>()
+            {
+                Some(hat) => hat.set_uplink_interests(uplink_interests),
+                None => bail!("gateway.north.interests requires gateway.north.mode to be 'client'"),
+            }
+        }
+
+        if let Some(conf) = north.and_then(|north| north.default_route.as_ref()) {
+            let default_route = Arc::new(DefaultRoute::new(conf));
+            let hat = tables.hats[Region::North].as_any_mut();
+            if let Some(hat) = hat.downcast_mut::<hat::client::Hat>() {
+                hat.set_default_route(default_route);
+            } else if let Some(hat) = hat.downcast_mut::<hat::router::Hat>() {
+                hat.set_default_route(default_route);
+            } else {
+                bail!("gateway.north.default_route only applies to a router")
+            }
+        }
+
         Ok(Gateway {
             tables: Arc::new(TablesLock {
-                tables: RwLock::new(Tables { data, hats }),
+                tables: RwLock::new(tables),
                 ctrl_lock: Mutex::new(()),
                 queries_lock: RwLock::new(()),
             }),
         })
+    }
+}
+
+/// The key expressions that are routed towards the north without a matching declaration
+/// (`gateway.north.default_route`).
+#[derive(Debug)]
+pub(crate) struct DefaultRoute {
+    key_exprs: Vec<OwnedKeyExpr>,
+    except: Vec<OwnedKeyExpr>,
+}
+
+impl DefaultRoute {
+    pub(crate) fn new(conf: &GatewayDefaultRouteConf) -> Self {
+        Self {
+            key_exprs: conf.key_exprs.clone(),
+            except: conf.except.clone(),
+        }
+    }
+
+    /// Whether a publication or a query on `key_expr` takes the default route.
+    ///
+    /// The whole key expression must be one that may have unknown destinations (inclusion in
+    /// `key_exprs`, not intersection: a wider wildcard is not eligible), and not one whose
+    /// destinations are all known (inclusion in `except`).
+    pub(crate) fn is_eligible(&self, key_expr: &keyexpr) -> bool {
+        self.key_exprs.iter().any(|ke| ke.includes(key_expr))
+            && !self.except.iter().any(|ke| ke.includes(key_expr))
+    }
+}
+
+impl DefaultRoute {
+    pub(crate) fn key_exprs(&self) -> &[OwnedKeyExpr] {
+        &self.key_exprs
+    }
+
+    pub(crate) fn except(&self) -> &[OwnedKeyExpr] {
+        &self.except
+    }
+}
+
+/// Limits how often a log that a retry loop can repeat is written at its level: once per
+/// subject and per [`LogLimiter::PERIOD`].
+#[derive(Default)]
+pub(crate) struct LogLimiter {
+    last: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl LogLimiter {
+    pub(crate) const PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Whether the log about `subject` is due: it was not written during the last period.
+    pub(crate) fn due(&self, subject: &str) -> bool {
+        self.due_at(subject, std::time::Instant::now())
+    }
+
+    fn due_at(&self, subject: &str, now: std::time::Instant) -> bool {
+        let mut last = self.last.lock().unwrap();
+        // forgets the subjects that are due again: the map stays as small as what repeats
+        last.retain(|_, at| now.saturating_duration_since(*at) < Self::PERIOD);
+        if last.contains_key(subject) {
+            false
+        } else {
+            last.insert(subject.to_string(), now);
+            true
+        }
     }
 }
 
@@ -464,5 +601,68 @@ impl Gateway {
             interceptor,
             this_zid,
         )))
+    }
+}
+
+#[cfg(test)]
+mod log_limiter_tests {
+    use super::LogLimiter;
+
+    #[test]
+    fn a_log_is_due_once_per_subject_and_period() {
+        let limiter = LogLimiter::default();
+        let start = std::time::Instant::now();
+        assert!(limiter.due_at("a", start));
+        assert!(!limiter.due_at("a", start + LogLimiter::PERIOD / 2));
+        assert!(limiter.due_at("b", start + LogLimiter::PERIOD / 2));
+        assert!(limiter.due_at("a", start + LogLimiter::PERIOD));
+        assert!(!limiter.due_at("b", start + LogLimiter::PERIOD));
+    }
+}
+
+#[cfg(test)]
+mod default_route_tests {
+    use zenoh_keyexpr::keyexpr;
+
+    use super::DefaultRoute;
+
+    fn eligible(default_route: &DefaultRoute, key_expr: &str) -> bool {
+        default_route.is_eligible(keyexpr::new(key_expr).unwrap())
+    }
+
+    #[test]
+    fn default_route_takes_the_fleet_keys_that_are_not_those_of_the_robot() {
+        let conf =
+            json5::from_str(r#"{ key_exprs: ["*/app/**", "*/bridge/**"], except: ["r1/**"] }"#)
+                .unwrap();
+        let default_route = DefaultRoute::new(&conf);
+
+        // another robot
+        assert!(eligible(&default_route, "r2/app/control"));
+        assert!(eligible(&default_route, "r2/bridge/rpc/a"));
+        assert!(eligible(&default_route, "r2/app/**"));
+        // the robot itself
+        assert!(!eligible(&default_route, "r1/app/control"));
+        assert!(!eligible(&default_route, "r1/app/**"));
+        assert!(!eligible(&default_route, "r1/**"));
+        // inside the keys of the fleet, wider than the robot
+        assert!(eligible(&default_route, "*/app/status"));
+        assert!(eligible(&default_route, "*/app/**"));
+        // outside or wider than the keys of the fleet
+        assert!(!eligible(&default_route, "r2/internal/joint"));
+        assert!(!eligible(&default_route, "app/unscoped"));
+        assert!(!eligible(&default_route, "rt/camera"));
+        assert!(!eligible(&default_route, "r2/**"));
+        assert!(!eligible(&default_route, "**"));
+        assert!(!eligible(&default_route, "*/**"));
+        assert!(!eligible(&default_route, "@/r2/app/control"));
+    }
+
+    #[test]
+    fn default_route_without_exception() {
+        let conf = json5::from_str(r#"{ key_exprs: ["fleet/**"] }"#).unwrap();
+        let default_route = DefaultRoute::new(&conf);
+        assert!(eligible(&default_route, "fleet/time"));
+        assert!(!eligible(&default_route, "local/time"));
     }
 }

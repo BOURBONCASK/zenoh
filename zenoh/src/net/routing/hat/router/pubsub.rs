@@ -285,6 +285,7 @@ impl HatPubSubTrait for Hat {
     ///
     /// ## This hat's state
     /// + `mres.router_subs` for all `mres` in `matches(res)`
+    /// + the default route (`gateway.north.default_route`) and the gateways of the region
     #[tracing::instrument(level = "debug", skip(tables, src_region), ret)]
     fn compute_data_route(
         &self,
@@ -363,6 +364,19 @@ impl HatPubSubTrait for Hat {
                 router_source,
                 &self.res_hat(&mres).router_subs,
             );
+        }
+
+        if let Some((face, source)) = self.default_route_face(tables, key_expr, src_region, node_id)
+        {
+            route.insert(face.id, || {
+                tracing::debug!(dst = %face, dst.is_default_gateway = true);
+                let wire_expr = expr.get_best_key(face.id);
+                Direction {
+                    dst_face: face.clone(),
+                    wire_expr: wire_expr.to_owned(),
+                    node_id: source,
+                }
+            });
         }
 
         Arc::new(route.build())

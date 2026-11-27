@@ -127,6 +127,11 @@ pub trait TransportPeerEventHandler: Send + Sync {
     fn handle_message(&self, msg: NetworkMessageMut) -> ZResult<()>;
     fn new_link(&self, src: Link);
     fn del_link(&self, link: Link);
+    /// The transport is being deleted, whatever the reason (a `Close` of the remote, a local
+    /// close, a message that could not be sent, an expired lease). Called before the clean-up
+    /// of its links and tasks is awaited, which may take time; [`Self::closed`] follows once
+    /// that is done. Must not block.
+    fn closing(&self) {}
     fn closed(&self);
     fn as_any(&self) -> &dyn Any;
 }

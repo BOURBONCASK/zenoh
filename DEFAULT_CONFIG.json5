@@ -274,6 +274,142 @@
   ///   - `interfaces`: a non-empty array of network interface names.
   ///   - `zids`: a non-empty array of Zenoh IDs.
   ///   - `region_names`: a non-empty array of region names.
+  ///
+  /// `gateway.north` (unset by default) makes a router a _leaf_ of its north region:
+  ///   - `mode`: `"client"`. The router announces itself as a client on its uplinks and takes the
+  ///     role of a client towards its north remote: no link state is exchanged with it, and it
+  ///     only receives the declarations it asks for. It remains a router for its south
+  ///     subregions. A leaf has one north remote at a time.
+  ///   - `uplinks` (required): which of the links this router opens are uplinks, as an array of
+  ///     filters with the keys `link_protocols` and `interfaces` (at least one per filter). A
+  ///     link is an uplink iff it matches all the keys of one filter. No link is an uplink by
+  ///     default, a link this router accepts never is, and a link whose interfaces cannot be
+  ///     resolved matches no `interfaces` filter. The mode is announced before the remote is
+  ///     known, so only properties of the link can be used. A remote that ends up in the north
+  ///     region over a link that is not an uplink, or in a south subregion over an uplink, is
+  ///     refused (logged at warn level, at most once a minute for a remote and a reason, at
+  ///     debug level in between).
+  ///   - `interests`: what the router asks its north remote for, each time an uplink is
+  ///     established, on behalf of its south router subregions: `key_expr` and any of
+  ///     `subscribers`, `queryables`, `tokens`. Only the declarations whose key expression
+  ///     intersects `key_expr` are received. These interests live as long as the uplink.
+  ///     An interest that asks for tokens is checked by the access control as
+  ///     `declare_liveliness_subscriber` on its `key_expr`, and an interest is dropped as a whole:
+  ///     ask for tokens in separate entries if the access control only allows some keys.
+  /// Example:
+  ///   north: {
+  ///     mode: "client",
+  ///     uplinks: [{ link_protocols: ["quic"] }],
+  ///     interests: [
+  ///       { key_expr: "robot1/**", subscribers: true, queryables: true },
+  ///       { key_expr: "robot1/alive/**", tokens: true },
+  ///     ],
+  ///   }
+  ///
+  /// The north remote must put the leaf in one of its south regions: a router does so with the
+  /// `auto` preset, or with a custom `south` entry that matches clients. Any other remote is
+  /// refused with an error.
+  ///
+  /// What is sent to the uplink: what the north remote declared a matching subscriber or
+  /// queryable for. In addition, a publication or a query for which it declared none is sent
+  ///   - without `default_route`:
+  ///       - if no interest includes its key and asks for subscribers (resp. queryables): the
+  ///         router does not know what the north has for such a key;
+  ///       - while an interest that includes its key is `pending`. This is bounded by
+  ///         `routing/interests/timeout` (10 s by default) and happens at each connection: for
+  ///         that time the local traffic on the keys of the interest goes north. Once the
+  ///         interest is `finalized`, `unanswered` or `not_sent`, it is not sent;
+  ///   - with `default_route`: iff it is eligible to the default route (see below), and only
+  ///     then. A key that the default route excludes never goes north without a declared
+  ///     destination, also while the interest that includes it is `pending`, `unanswered` or
+  ///     `not_sent`, and at each reconnection. The price: a subscriber or queryable of the
+  ///     north gets nothing of such a key before the north remote has declared it to this
+  ///     router, a few messages after the uplink is established.
+  ///
+  /// `gateway.north.default_route` (unset by default, routers only, with or without `mode`)
+  /// names the key expressions that may have destinations in the north that this router does
+  /// not know, so that sessions below it can reach them without any declaration:
+  ///   - `key_exprs` (at least one): the key expressions concerned;
+  ///   - `except`: those among them whose destinations this router knows, typically its own.
+  /// A publication or a query is eligible iff its key expression is included in one of
+  /// `key_exprs` and in none of `except`. The key expression is taken as a whole, it is never
+  /// split. With `key_exprs: ["*/app/**"]` and `except: ["robot1/**"]`:
+  ///   - `robot2/app/x`, `robot2/app/**`: eligible;
+  ///   - `robot1/app/x`, `robot1/app/*`: not eligible, they only cover keys of `except`;
+  ///   - `*/app/x`, `*/app/**`: eligible. Such a wildcard covers keys of `robot1` and of the
+  ///     others: the publication or the query goes whole to the matching subscribers and
+  ///     queryables of this site and, once, towards the north, which does not send it back;
+  ///   - `**`, `*/**`, `robot2/**`: not eligible, wider than `key_exprs`. They only reach the
+  ///     declared destinations.
+  /// An eligible message is sent, in addition to its declared destinations:
+  ///   - by a router whose north region is a router region: towards the gateway of that region.
+  ///     With several gateways it is the one with the greatest Zenoh ID, whether or not that
+  ///     gateway has a north remote: there is no election by uplink state, and the message is
+  ///     lost (a query is ended without reply) at a gateway that has none. Every router
+  ///     between the source and the gateway needs the option. A message that comes from the
+  ///     gateway is not sent back;
+  ///   - by a leaf (`mode: "client"`): to its north remote. With `default_route` set, a leaf
+  ///     does not send north the other keys that no interest includes: they only go north
+  ///     towards a declared subscriber or queryable.
+  /// A query sent this way keeps its target; it is ended by the first router on the way that
+  /// has no destination for it. Liveliness is not concerned: the tokens of the north are only
+  /// known through `interests`.
+  /// Example, on both routers of a robot `robot1` whose fleet uses the keys `<robot>/app/**`:
+  ///   north: {
+  ///     default_route: { key_exprs: ["*/app/**"], except: ["robot1/**"] },
+  ///   }
+  /// State of the default route, in the admin space at `@/<zid>/router/default_route` (JSON):
+  /// `key_exprs`, `except`, and `gateway`: the Zenoh ID of the gateway (of the north remote on a
+  /// leaf) that eligible messages are sent towards, or `null` when there is none: they then
+  /// only reach declared destinations. A router of a router region logs each change of its
+  /// gateway (info level, warn level when there is none left).
+  ///
+  /// State of the uplink, in the admin space at `@/<zid>/router/uplink` (JSON):
+  ///   - `state`: `connected`, `closing` (the uplink lost its link or its transport is being
+  ///     deleted: the next north remote is admitted without waiting for the end of that) or
+  ///     `disconnected`; `remote`: the
+  ///     Zenoh ID of the north remote. Logged at info level: `Uplink: <zid> admitted ...`,
+  ///     `... lost its last link`, `... takes over from ...`, `... closed`. A remote that is
+  ///     refused is logged at warn level with the reason.
+  ///   - `interests[].state`:
+  ///       `pending`: sent, not answered yet;
+  ///       `finalized`: the north remote declared everything that matches. A remote whose access
+  ///         control denies the interest also answers this way, with no declaration: this
+  ///         cannot be told apart from the leaf;
+  ///       `not_sent`: the interest did not leave this router. On an uplink that stays
+  ///         connected, its access control denies it on egress; it is also the state of an
+  ///         interest that a closing link could not take (error log);
+  ///       `unanswered`: no answer within `routing/interests/timeout` (error log);
+  ///       `none`: there is no north remote.
+  ///     The two error logs are written at most once a minute for an interest, at debug level
+  ///     in between: a reconnection loop repeats them at each connection.
+  /// With several endpoints that lead north, an endpoint that can only be an uplink (a filter
+  /// selects its protocol without `interfaces`, or selects the `iface` it is bound to) is not
+  /// dialed while another remote owns the north region.
+  /// When the next north remote takes over, everything the previous one declared is withdrawn,
+  /// and what that remote still sends on its old transport is dropped: declarations, interests,
+  /// publications, queries and replies alike. A message of the previous remote that is being
+  /// routed at that moment is routed to its end first; the take-over waits for that one
+  /// message, not for the transport.
+  ///
+  /// Limits of a leaf uplink:
+  ///   - One north remote at a time, with one link: the hand-over is defined, and tested, for
+  ///     an uplink that has a single link to its remote (`transport/unicast/max_links: 1`, the
+  ///     default).
+  ///   - The early take-over is for a remote with another Zenoh ID. A remote that comes back
+  ///     with the same Zenoh ID while the transport of its previous connection is still being
+  ///     cleaned up is admitted when that clean-up has ended, however long it takes: a node
+  ///     holds one transport per Zenoh ID. A router that restarts without a configured `id`
+  ///     comes back with a new one.
+  ///   - A default route goes to the gateway with the greatest Zenoh ID, whether or not it has
+  ///     an uplink (see above).
+  ///   - The north remote sees a leaf as a client, not as a router: the leaf is not in its
+  ///     link-state graph nor among its routers, and whatever identifies routers by their mode
+  ///     on that side (a consumer of its admin space, a plugin that reports the routers
+  ///     connected to it) must be told to accept clients before it sees a leaf.
+  ///   - A binary that does not know `gateway.north` does not start on a configuration that
+  ///     has it (`unknown field north`): a fallback binary of an earlier version needs its own
+  ///     configuration file, without that section.
   gateway: {
     /// The `auto` preset mode puts peers and clients south of routers and client south of peers.
     /// This is the only available preset.

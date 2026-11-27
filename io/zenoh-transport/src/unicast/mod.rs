@@ -53,6 +53,9 @@ use crate::unicast::establishment::ext::auth::UsrPwdId;
 pub(crate) struct TransportConfigUnicast {
     pub(crate) zid: ZenohIdProto,
     pub(crate) whatami: WhatAmI,
+    /// The mode this node announced to the remote. Every link of a transport announces the
+    /// same one.
+    pub(crate) local_whatami: WhatAmI,
     pub(crate) region_name: Option<RegionName>,
     pub(crate) bound: Option<Bound>,
     pub(crate) sn_resolution: Bits,
@@ -91,6 +94,13 @@ impl TransportUnicast {
     pub fn get_whatami(&self) -> ZResult<WhatAmI> {
         let transport = self.get_inner()?;
         Ok(transport.get_whatami())
+    }
+
+    /// The mode this node announced to the remote during establishment.
+    #[inline(always)]
+    pub fn get_local_whatami(&self) -> ZResult<WhatAmI> {
+        let transport = self.get_inner()?;
+        Ok(transport.get_local_whatami())
     }
 
     #[inline(always)]
