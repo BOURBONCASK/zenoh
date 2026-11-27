@@ -213,3 +213,95 @@ pub fn make_basic_transport_manager_builder(
         false => config,
     }
 }
+
+/// The deletions that tests hold back, by the Zenoh ID of the node that deletes.
+static DELETION_GATES: std::sync::Mutex<Vec<(ZenohIdProto, Arc<tokio::sync::Semaphore>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Holds back the deletion of the unicast transports of a node, see [`gate_deletions`].
+pub struct DeletionGate {
+    zid: ZenohIdProto,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl DeletionGate {
+    /// The number of deletions that are waiting at the gate.
+    pub fn waiting(&self) -> usize {
+        // each deletion that waits holds a clone, the registry holds one and `self` another
+        Arc::strong_count(&self.gate) - 2
+    }
+
+    /// Lets the deletions that wait, and the later ones, go on.
+    pub fn open(&self) {
+        DELETION_GATES
+            .lock()
+            .unwrap()
+            .retain(|(_, gate)| !Arc::ptr_eq(gate, &self.gate));
+        self.gate.close();
+    }
+}
+
+impl Drop for DeletionGate {
+    fn drop(&mut self) {
+        tracing::trace!("Deletions of the transports of {} go on", self.zid);
+        self.open();
+    }
+}
+
+/// From now on and until the returned gate is opened or dropped, the deletion of a unicast
+/// transport of the node `zid` stops after it has marked the transport closed and told its
+/// handler that it is closing, and before it closes the links and the tasks of the transport:
+/// a clean-up that takes as long as the test wants.
+pub fn gate_deletions(zid: ZenohIdProto) -> DeletionGate {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    DELETION_GATES.lock().unwrap().push((zid, gate.clone()));
+    DeletionGate { zid, gate }
+}
+
+/// Waits at the gate of the node `zid`, if tests have closed one.
+pub(crate) async fn deletion_gate(zid: &ZenohIdProto) {
+    let gate = DELETION_GATES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(gated, _)| gated == zid)
+        .map(|(_, gate)| gate.clone());
+    if let Some(gate) = gate {
+        // no permit is ever added: this returns when the gate is closed, which opens it
+        let _ = gate.acquire().await;
+    }
+}
+
+/// The pushes that tests make fail: (node, remote).
+static FAILING_PUSHES: std::sync::Mutex<Vec<(ZenohIdProto, ZenohIdProto)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the pushes of a node to a remote fail, see [`fail_pushes`].
+pub struct FailingPushes(ZenohIdProto, ZenohIdProto);
+
+impl Drop for FailingPushes {
+    fn drop(&mut self) {
+        FAILING_PUSHES
+            .lock()
+            .unwrap()
+            .retain(|(zid, remote)| (zid, remote) != (&self.0, &self.1));
+    }
+}
+
+/// From now on and until the returned value is dropped, the node `zid` takes each network message
+/// it sends to `remote` over a universal transport as one it could not enqueue, as when the
+/// queue towards a remote that no longer reads stays full. The first such message that cannot
+/// be dropped makes the node delete that transport, which is the deletion that does not go
+/// through the removal of its links.
+pub fn fail_pushes(zid: ZenohIdProto, remote: ZenohIdProto) -> FailingPushes {
+    FAILING_PUSHES.lock().unwrap().push((zid, remote));
+    FailingPushes(zid, remote)
+}
+
+pub(crate) fn push_fails(zid: &ZenohIdProto, remote: &ZenohIdProto) -> bool {
+    FAILING_PUSHES
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(z, r)| z == zid && r == remote)
+}
