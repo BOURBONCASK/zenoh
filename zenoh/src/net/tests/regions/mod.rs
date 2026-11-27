@@ -29,6 +29,7 @@ mod forwarding;
 mod interest;
 mod nodeidx_reuse;
 mod oam;
+mod undelivered;
 
 use std::{
     any::Any,
@@ -782,6 +783,11 @@ impl MockFace {
     }
 
     /// Access the recorder to inspect what the gateway has delivered to this face.
+    /// The mock transport of a remote face.
+    pub(crate) fn transport(&self) -> &MockTransportUnicastInner {
+        self._data.as_ref().expect("a remote face")
+    }
+
     pub(crate) fn recorder(&self) -> &RecordingPrimitives {
         &self.recorder
     }
@@ -800,6 +806,7 @@ pub(crate) struct HarnessBuilder {
     start_runtime: bool,
     start_adminspace: bool,
     manual_tree_computation: bool,
+    handover: bool,
 }
 
 impl HarnessBuilder {
@@ -811,7 +818,28 @@ impl HarnessBuilder {
             start_runtime: true,
             start_adminspace: false,
             manual_tree_computation: false,
+            handover: false,
         }
+    }
+
+    /// Give the configuration a rule that selects links for hand-over (default: none), as a
+    /// process has whose links can refuse a query.
+    pub(crate) fn handover(mut self, handover: bool) -> Self {
+        self.handover = handover;
+        self
+    }
+
+    fn base_config(&self) -> Config {
+        let mut config = Config::default();
+        if self.handover {
+            config
+                .insert_json5(
+                    "transport/link/tx/queue/handover",
+                    r#"{ links: [{ link_protocols: ["quic"] }] }"#,
+                )
+                .unwrap();
+        }
+        config
     }
 
     /// Set the [`WhatAmI`] mode of this harness.
@@ -870,7 +898,7 @@ impl HarnessBuilder {
 
     fn build_harness(self) -> Harness {
         if self.start_runtime {
-            let mut config = Config::default();
+            let mut config = self.base_config();
             if let Some(zid) = self.zid {
                 config.set_id(Some(zid)).unwrap();
             }
@@ -902,7 +930,7 @@ impl HarnessBuilder {
                 _runtime: Some(runtime),
             }
         } else {
-            let mut config = Config::default().expanded();
+            let mut config = self.base_config().expanded();
             if let Some(zid) = self.zid {
                 config.set_id(Some(zid)).unwrap();
             }

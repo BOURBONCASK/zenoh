@@ -35,12 +35,21 @@ use zenoh_result::{bail, zerror, ZResult};
 #[cfg(feature = "shared-memory")]
 use crate::common::shm::shm_context::UnicastTransportShmContext;
 use crate::{
-    common::priority::{TransportPriorityRx, TransportPriorityTx},
+    common::{
+        batch::BatchConfig,
+        priority::{TransportPriorityRx, TransportPriorityTx},
+    },
     unicast::{
         authentication::TransportAuthId,
         link::{LinkUnicastWithOpenAck, TransportLinkUnicastDirection},
         transport_unicast_inner::{AddLinkResult, TransportStatus, TransportUnicastTrait},
-        universal::link::TransportLinkUnicastUniversal,
+        universal::{
+            handover::{
+                ActivationRefusal, CloseReason, HandoverConf, HandoverStatus, RequestLifetime,
+                Sender,
+            },
+            link::{LinkTx, TransportLinkUnicastUniversal},
+        },
         TransportConfigUnicast,
     },
     TransportManager, TransportPeerEventHandler,
@@ -98,6 +107,8 @@ pub(crate) struct TransportUnicastUniversal {
     pub(super) status: Arc<AsyncMutex<TransportStatus>>,
     // Set by the first push that gives up on an unresponsive peer and starts the close task
     pub(super) unresponsive: Arc<AtomicBool>,
+    // The sender that owns the messages of this transport, when a hand-over rule selects its link
+    pub(super) handover: Arc<OnceLock<Arc<Sender>>>,
     // Transport statistics
     #[cfg(feature = "stats")]
     pub(super) stats: zenoh_stats::TransportStats,
@@ -142,6 +153,7 @@ impl TransportUnicastUniversal {
             callback: Arc::new(ClosableCallback::new()),
             status: Arc::new(AsyncMutex::new(TransportStatus::Uninitialized)),
             unresponsive: Arc::new(AtomicBool::new(false)),
+            handover: Arc::new(OnceLock::new()),
             #[cfg(feature = "stats")]
             stats,
             #[cfg(feature = "shared-memory")]
@@ -175,6 +187,14 @@ impl TransportUnicastUniversal {
 
         // Notify the callback that we have closed the transport
         if let Some(cb) = callback {
+            // The queries that the sender of this transport held and did not send end here,
+            // before the callback learns that the transport is closed.
+            if let Some(sender) = self.handover.get() {
+                let undelivered = sender.take_undelivered();
+                if !undelivered.is_empty() {
+                    cb.handle_undelivered(undelivered);
+                }
+            }
             cb.closed();
         }
         // Delete the transport on the manager - this should be the last step to ensure that no new transport to the same peer can be added while we are closing this transport.
@@ -184,6 +204,124 @@ impl TransportUnicastUniversal {
         // Every clone of this transport shares `config`, and no other transport does.
         let _ = self.manager.del_this_transport_unicast(&self.config).await;
         Ok(())
+    }
+
+    /// Decides whether a hand-over rule selects a link that is being added, and creates its
+    /// sender. `Ok(None)`: no rule selects the link.
+    fn activate_handover(
+        &self,
+        link: &LinkUnicastWithOpenAck,
+        existing_links: usize,
+    ) -> Result<Option<(Arc<Sender>, super::handover::SenderTask)>, ActivationRefusal> {
+        let Some(rules) = self.manager.config.handover.as_ref() else {
+            return Ok(None);
+        };
+        let refuse = |refusal: ActivationRefusal| {
+            rules.count_refusal(refusal);
+            Err(refusal)
+        };
+        let inner = &link.link.link;
+        let protocol = inner.get_dst().protocol();
+        let Some(rule) = rules.find(protocol.as_str(), &inner.get_interface_names()) else {
+            if self.handover.get().is_some() {
+                // A transport with a sender has one link.
+                return refuse(ActivationRefusal::Multilink);
+            }
+            return Ok(None);
+        };
+        if existing_links > 0
+            || self.handover.get().is_some()
+            || zcondfeat!(
+                "transport_multilink",
+                self.config.multilink.is_some(),
+                false
+            )
+        {
+            return refuse(ActivationRefusal::Multilink);
+        }
+        if zcondfeat!("shared-memory", self.config.shm.is_some(), false) {
+            return refuse(ActivationRefusal::Shm);
+        }
+        if !self.config.is_qos {
+            return refuse(ActivationRefusal::Qos);
+        }
+        let config = link.inner_config();
+        if !inner.is_reliable()
+            || !inner.is_streamed()
+            || link.associated_link.is_some()
+            || config.priorities.is_some()
+            || config.reliability.is_some()
+        {
+            return refuse(ActivationRefusal::Carrier);
+        }
+        let conf = HandoverConf {
+            batch: BatchConfig {
+                mtu: config.batch.mtu,
+                is_streamed: inner.is_streamed(),
+                #[cfg(feature = "transport_compression")]
+                is_compression: config.batch.is_compression,
+            },
+            is_qos: self.config.is_qos,
+            queue_size: self.manager.config.queue_size,
+            data_bytes: rule.data_bytes,
+            large_bytes: rule.large_bytes,
+            reserve_min_bytes: rule.reserve_min_bytes,
+            reserve_max_bytes: rule.reserve_max_bytes,
+            max_age: rule.max_age,
+            control_max_age: rule.control_max_age,
+            wait_before_close: rules.wait_before_close,
+            default_query_timeout: rules.default_query_timeout,
+        };
+        let Ok((sender, task)) = Sender::activate(conf, rules.pool.clone(), &self.priority_tx)
+        else {
+            return refuse(ActivationRefusal::ReserveUnavailable);
+        };
+        if self.handover.set(sender.clone()).is_err() {
+            task.abort();
+            return refuse(ActivationRefusal::Multilink);
+        }
+        tracing::info!(
+            "Link to {} with peer {}: selected by hand-over rule {:?} (streams per priority: {}, \
+             batch size: {}, close period: {:?}, age limit: {:?})",
+            inner.get_dst(),
+            self.config.zid,
+            rule.id,
+            inner.supports_priorities(),
+            config.batch.mtu,
+            rules.wait_before_close,
+            rule.max_age
+        );
+        Ok(Some((sender, task)))
+    }
+
+    /// What the sender of this transport holds and has done, when a rule selects its link.
+    pub(crate) fn handover_status(&self) -> Option<HandoverStatus> {
+        self.handover.get().map(|sender| sender.status())
+    }
+
+    /// The sender of this transport decided to close it.
+    pub(super) fn handover_closed(&self, reason: CloseReason) {
+        tracing::error!(
+            "Closing transport with {}: the sender of its link gave up ({})",
+            self.config.zid,
+            reason.as_str()
+        );
+        if let Some(rules) = self.manager.config.handover.as_ref() {
+            rules.count_close(reason);
+        }
+    }
+
+    /// Gives the callback the queries that a sender did not send.
+    pub(super) fn deliver_undelivered(&self, sender: &Sender) {
+        // Without a callback the records stay where they are: the deletion of the transport
+        // delivers them.
+        let Some(callback) = self.callback.get().cloned() else {
+            return;
+        };
+        let undelivered = sender.take_undelivered();
+        if !undelivered.is_empty() {
+            callback.handle_undelivered(undelivered);
+        }
     }
 
     pub(crate) async fn del_link(&self, link: Link) -> ZResult<()> {
@@ -331,10 +469,36 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
             }
         }
 
+        // A link selected by a hand-over rule gets the sender that owns its messages, or is
+        // refused: it never runs without it.
+        let handover = match self.activate_handover(&link, guard.get_links().len()) {
+            Ok(handover) => handover,
+            Err(refusal) => {
+                let e = zerror!(
+                    "Can not add Link {} with peer {}: selected by a hand-over rule and not \
+                     supported ({})",
+                    link,
+                    self.config.zid,
+                    refusal.as_str()
+                );
+                let (l, asl) = link.fail();
+                return Err((e.into(), l, asl, close::reason::UNSUPPORTED));
+            }
+        };
+
         // Wrap the link
         let (link, ack, associated_link) = link.unpack();
-        let (mut link, consumer) =
-            TransportLinkUnicastUniversal::new(self, link, &self.priority_tx);
+        let (mut link, consumer) = match handover {
+            Some((sender, task)) => (
+                TransportLinkUnicastUniversal::new_handover(self, link, sender),
+                Err(task),
+            ),
+            None => {
+                let (link, consumer) =
+                    TransportLinkUnicastUniversal::new(self, link, &self.priority_tx);
+                (link, Ok(consumer))
+            }
+        };
 
         // Handle associated link (if mixed-reliability link)
         let al_with_consumer =
@@ -354,7 +518,10 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
                 // Start the TX loop
                 let keep_alive = self.manager.config.unicast.lease
                     / self.manager.config.unicast.keep_alive as u32;
-                link.start_tx(transport.clone(), consumer, keep_alive);
+                match consumer {
+                    Ok(consumer) => link.start_tx(transport.clone(), consumer, keep_alive),
+                    Err(task) => link.start_handover_tx(transport.clone(), task, keep_alive),
+                }
                 if let Some((mut associated_link, al_consumer)) = al_with_consumer {
                     associated_link.start_tx(transport, al_consumer, keep_alive);
                 }
@@ -430,9 +597,22 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
         let mut pipelines = zread!(self.links)
             .get_links()
             .iter()
-            .map(|sl| sl.pipeline.clone())
+            .map(|sl| sl.tx.clone())
             .collect::<Vec<_>>();
         for p in pipelines.drain(..) {
+            let p = match p {
+                LinkTx::Pipeline(p) => p,
+                LinkTx::Handover(sender) => {
+                    // Nothing more is admitted; the sender writes what it was given and then
+                    // the Close message. When that does not end within the close period, what
+                    // is left is discarded by the deletion below.
+                    sender.seal_for_close(reason);
+                    let _ =
+                        tokio::time::timeout(self.manager.config.wait_before_close, sender.done())
+                            .await;
+                    continue;
+                }
+            };
             // Close message to be sent on all the links
             // session should always be true for user-triggered close. However, in case of
             // multiple links, it is safer to close all the links first. When no links are left,
@@ -479,7 +659,19 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
     /*                TX                 */
     /*************************************/
     fn schedule(&self, msg: NetworkMessageMut) -> ZResult<bool> {
-        self.internal_schedule(msg)
+        self.internal_schedule(msg, None)
+    }
+
+    fn schedule_request(
+        &self,
+        msg: NetworkMessageMut,
+        lifetime: &RequestLifetime,
+    ) -> ZResult<bool> {
+        self.internal_schedule(msg, Some(lifetime))
+    }
+
+    fn handover_status(&self) -> Option<HandoverStatus> {
+        TransportUnicastUniversal::handover_status(self)
     }
 
     fn add_debug_fields<'a, 'b: 'a, 'c>(

@@ -29,6 +29,10 @@ use std::{
 #[cfg(feature = "transport_multilink")]
 use establishment::ext::auth::ZPublicKey;
 pub use manager::*;
+pub use universal::handover::{
+    HandoverStatus, RequestLifetime, Rules as HandoverRules, RulesStatus as HandoverRulesStatus,
+    Undelivered, UndeliveredReason, QUERY_EXPIRED, QUERY_NOT_DELIVERED, REPLIES_DROPPED,
+};
 use zenoh_core::zcondfeat;
 use zenoh_link::Link;
 use zenoh_protocol::{
@@ -141,6 +145,27 @@ impl TransportUnicast {
     pub fn schedule(&self, message: NetworkMessageMut) -> ZResult<bool> {
         let transport = self.get_inner()?;
         transport.schedule(message)
+    }
+
+    /// What the owned sender of this transport holds and has done. `None` when no hand-over
+    /// rule selects its link.
+    pub fn get_handover_status(&self) -> ZResult<Option<HandoverStatus>> {
+        let transport = self.get_inner()?;
+        Ok(transport.handover_status())
+    }
+
+    /// Schedules a query with the end of its routing branch. A transport that owns its
+    /// messages does not start the query at or after that instant, and reports it through
+    /// [`TransportPeerEventHandler::handle_undelivered`](crate::TransportPeerEventHandler)
+    /// when it is not sent. On other transports this is [`TransportUnicast::schedule`].
+    #[inline(always)]
+    pub fn schedule_request(
+        &self,
+        message: NetworkMessageMut,
+        lifetime: &RequestLifetime,
+    ) -> ZResult<bool> {
+        let transport = self.get_inner()?;
+        transport.schedule_request(message, lifetime)
     }
 
     #[inline(always)]

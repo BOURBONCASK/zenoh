@@ -236,6 +236,41 @@ impl TransportLinkUnicastTx {
         Ok(())
     }
 
+    /// [`TransportLinkUnicastTx::send_batch`], telling after each part of the batch that the
+    /// link has taken. The caller sees that a slow link advances before the batch is through.
+    pub(crate) async fn send_batch_in_parts(
+        &mut self,
+        batch: &mut WBatch,
+        priority: Option<Priority>,
+        mut taken: impl FnMut(usize) + Send,
+    ) -> ZResult<()> {
+        const ERR: &str = "Write error on link: ";
+
+        let res = batch
+            .finalize(self.buffer.as_mut())
+            .map_err(|_| zerror!("{ERR}{self}"))?;
+
+        let mut bytes = match res {
+            Finalize::Batch => batch.as_slice(),
+            Finalize::Buffer => self
+                .buffer
+                .as_ref()
+                .ok_or_else(|| zerror!("Invalid buffer finalization"))?
+                .as_slice(),
+        };
+
+        while !bytes.is_empty() {
+            let n = self.inner.link.write(bytes, priority).await?;
+            if n == 0 {
+                return Err(zerror!("{ERR}{}: nothing written", self.inner).into());
+            }
+            bytes = &bytes[n..];
+            taken(n);
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn send(
         &mut self,
         msg: &TransportMessage,

@@ -78,10 +78,13 @@ use zenoh_uring::api::reader::{
     rx_buffer::RxBuffer,
 };
 
-use super::transport::TransportUnicastUniversal;
+use super::{
+    handover::{self, End, Sender, SenderTask, Sink},
+    transport::TransportUnicastUniversal,
+};
 use crate::{
     common::{
-        batch::{BatchConfig, RBatch},
+        batch::{BatchConfig, RBatch, WBatch},
         pipeline::{
             PipelineConsumer, TransmissionPipeline, TransmissionPipelineConf,
             TransmissionPipelineConsumer, TransmissionPipelineProducer,
@@ -91,12 +94,21 @@ use crate::{
     unicast::link::{TransportLinkUnicast, TransportLinkUnicastRx, TransportLinkUnicastTx},
 };
 
+/// Where the messages scheduled on a link go.
+#[derive(Clone)]
+pub(super) enum LinkTx {
+    /// Into the priority queues of the transmission pipeline.
+    Pipeline(TransmissionPipelineProducer),
+    /// To the sender that owns them: the link is selected by a hand-over rule.
+    Handover(Arc<Sender>),
+}
+
 #[derive(Clone)]
 pub(super) struct TransportLinkUnicastUniversal {
     // The underlying link
     pub(super) link: TransportLinkUnicast,
-    // The transmission pipeline
-    pub(super) pipeline: TransmissionPipelineProducer,
+    // The transmission pipeline, or the owned sender
+    pub(super) tx: LinkTx,
     // The task handling substruct
     task_controller: TaskController,
     #[cfg(feature = "unstable")]
@@ -129,6 +141,7 @@ impl TransportLinkUnicastUniversal {
             wait_before_drop: transport.manager.config.wait_before_drop,
             max_wait_before_drop_fragments: transport.manager.config.max_wait_before_drop_fragments,
             wait_before_close: transport.manager.config.wait_before_close,
+            disable_on_failed_block: true,
             batching_enabled: transport.manager.config.batching,
             batching_time_limit: transport.manager.config.queue_backoff,
             queue_alloc: transport.manager.config.queue_alloc,
@@ -138,6 +151,27 @@ impl TransportLinkUnicastUniversal {
         let (producer, consumer) =
             TransmissionPipeline::make(config, priority_tx, link.link.supports_priorities());
 
+        (
+            Self::with_tx(transport, link, LinkTx::Pipeline(producer)),
+            consumer,
+        )
+    }
+
+    /// A link whose messages are handed over to `sender`.
+    pub(super) fn new_handover(
+        transport: &TransportUnicastUniversal,
+        link: TransportLinkUnicast,
+        sender: Arc<Sender>,
+    ) -> Self {
+        Self::with_tx(transport, link, LinkTx::Handover(sender))
+    }
+
+    fn with_tx(
+        #[allow(unused_variables)] // Used when stats feature is enabled
+        transport: &TransportUnicastUniversal,
+        link: TransportLinkUnicast,
+        tx: LinkTx,
+    ) -> Self {
         // Use the complete src and dest locators including parameters
         #[cfg(feature = "stats")]
         let link_unicast = link.link();
@@ -159,9 +193,9 @@ impl TransportLinkUnicastUniversal {
             block_first_waiters.push(waiter);
         }
 
-        let result = Self {
+        Self {
             link,
-            pipeline: producer,
+            tx,
             task_controller: TaskController::default(),
             #[cfg(feature = "unstable")]
             block_first_notifiers: block_first_notifiers.try_into().ok().unwrap(),
@@ -169,9 +203,96 @@ impl TransportLinkUnicastUniversal {
             block_first_waiters: block_first_waiters.try_into().ok().unwrap(),
             #[cfg(feature = "stats")]
             stats,
-        };
+        }
+    }
 
-        (result, consumer)
+    /// The sender of the link, when a hand-over rule selects it.
+    pub(super) fn handover(&self) -> Option<&Arc<Sender>> {
+        match &self.tx {
+            LinkTx::Handover(sender) => Some(sender),
+            LinkTx::Pipeline(_) => None,
+        }
+    }
+
+    /// Makes the pushes to the pipeline of the link fail at once. A sender never makes its
+    /// callers wait: there is nothing to do for it.
+    pub(super) fn mark_tx_disabled(&self) {
+        if let LinkTx::Pipeline(pipeline) = &self.tx {
+            pipeline.mark_disabled();
+        }
+    }
+
+    /// Starts the task of the sender of a selected link, and the task that gives routing the
+    /// queries that were not sent.
+    pub(super) fn start_handover_tx(
+        &mut self,
+        transport: TransportUnicastUniversal,
+        task: SenderTask,
+        keep_alive: Duration,
+    ) {
+        let Some(sender) = self.handover().cloned() else {
+            return;
+        };
+        let tx = self.link.tx();
+        let ct = self.task_controller.get_cancellation_token();
+        let sink = LinkSink {
+            tx,
+            priority: None,
+            #[cfg(feature = "stats")]
+            stats: self.stats.clone(),
+        };
+        let link = self.link.link();
+        let run = {
+            let sender = sender.clone();
+            let transport = transport.clone();
+            async move {
+                let (end, task) = handover::run(task, sender.clone(), sink, keep_alive, ct).await;
+                // What was not sent is discarded here, before anyone learns that the task has
+                // ended: the queries among it are reported and can be claimed.
+                task.abort();
+                sender.mark_done();
+                match end {
+                    End::Flushed | End::Cancelled => {}
+                    End::Close(reason) => {
+                        transport.handover_closed(reason);
+                        // Spawn a task to avoid a deadlock waiting for this same task
+                        // to finish in the close() joining its handle
+                        zenoh_runtime::ZRuntime::Net.spawn(async move {
+                            if let Err(e) = transport.delete().await {
+                                tracing::error!(
+                                    "Error closing transport with {}: {}",
+                                    transport.config.zid,
+                                    e
+                                );
+                            }
+                        });
+                    }
+                    End::Failed(e) => {
+                        tracing::debug!("TX task failed: {}", e);
+                        zenoh_runtime::ZRuntime::Net
+                            .spawn(async move { transport.del_link(link).await });
+                    }
+                }
+            }
+        };
+        self.task_controller
+            .spawn_with_rt(zenoh_runtime::ZRuntime::TX, run);
+
+        let ct = self.task_controller.get_cancellation_token();
+        let completion = async move {
+            loop {
+                // When the link ends, what its sender reports from then on is delivered by
+                // the deletion of the transport, in front of `closed()`, and not from here.
+                tokio::select! {
+                    biased;
+                    _ = ct.cancelled() => break,
+                    _ = sender.completion_wake.notified() => {}
+                }
+                transport.deliver_undelivered(&sender);
+            }
+        };
+        self.task_controller
+            .spawn_with_rt(zenoh_runtime::ZRuntime::Net, completion);
     }
 
     pub(super) fn start_tx(
@@ -261,9 +382,65 @@ impl TransportLinkUnicastUniversal {
     pub(super) async fn close(self) -> ZResult<()> {
         tracing::trace!("{}: closing", self.link);
         self.task_controller.terminate_all_async().await;
-        self.pipeline.disable();
+        if let LinkTx::Pipeline(pipeline) = &self.tx {
+            pipeline.disable();
+        }
 
         self.link.close(None).await
+    }
+}
+
+/// The link as the sender of a selected transport writes to it: everything goes to the first
+/// stream of the link, in the order in which the sender gives it.
+struct LinkSink {
+    tx: TransportLinkUnicastTx,
+    /// `None`: the first stream of the link.
+    priority: Option<Priority>,
+    #[cfg(feature = "stats")]
+    stats: zenoh_stats::LinkStats,
+}
+
+impl Sink for LinkSink {
+    async fn send_batch(
+        &mut self,
+        batch: &mut WBatch,
+        progress: &handover::Progress,
+    ) -> ZResult<()> {
+        self.tx
+            .send_batch_in_parts(batch, self.priority, |_| progress.mark())
+            .await
+    }
+
+    /// A link with one stream per priority has streams that the sender does not use: a
+    /// KeepAlive can go on one of them while the first stream carries a batch.
+    fn beside(&self) -> Option<Self> {
+        self.tx.inner.link.supports_priorities().then(|| LinkSink {
+            tx: self.tx.clone(),
+            priority: Some(Priority::RealTime),
+            #[cfg(feature = "stats")]
+            stats: self.stats.clone(),
+        })
+    }
+
+    async fn send_message(&mut self, msg: &TransportMessage) -> ZResult<()> {
+        #[allow(unused_variables)] // Used when stats feature is enabled
+        let n = self.tx.send(msg, self.priority).await?;
+        #[cfg(feature = "stats")]
+        {
+            self.stats.inc_bytes(zenoh_stats::Tx, n as u64);
+            self.stats.inc_transport_message(zenoh_stats::Tx, 1);
+        }
+        Ok(())
+    }
+
+    #[allow(unused_variables)] // Used when stats feature is enabled
+    fn written(&mut self, bytes: usize, transport_messages: usize) {
+        #[cfg(feature = "stats")]
+        {
+            self.stats.inc_bytes(zenoh_stats::Tx, bytes as u64);
+            self.stats
+                .inc_transport_message(zenoh_stats::Tx, transport_messages as u64);
+        }
     }
 }
 

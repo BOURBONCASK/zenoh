@@ -100,6 +100,21 @@ pub(crate) trait TransportUnicastTrait: Send + Sync {
     /// Returns if the message has successfully been sent.
     fn schedule(&self, msg: NetworkMessageMut) -> ZResult<bool>;
 
+    /// Schedules a query with the end of its routing branch.
+    fn schedule_request(
+        &self,
+        msg: NetworkMessageMut,
+        _lifetime: &crate::unicast::RequestLifetime,
+    ) -> ZResult<bool> {
+        self.schedule(msg)
+    }
+
+    /// What the owned sender of the transport holds and has done. `None` when no hand-over
+    /// rule selects the link of the transport.
+    fn handover_status(&self) -> Option<crate::unicast::HandoverStatus> {
+        None
+    }
+
     /*************************************/
     /*            TERMINATION            */
     /*************************************/

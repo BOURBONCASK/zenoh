@@ -678,6 +678,9 @@ pub(crate) struct TransmissionPipelineConf {
     pub(crate) wait_before_drop: Duration,
     pub(crate) max_wait_before_drop_fragments: Duration,
     pub(crate) wait_before_close: Duration,
+    /// Unicast: a blocking message that finds no room means that the transport is closed, so the
+    /// pipeline disables itself before the next producer gets the queue.
+    pub(crate) disable_on_failed_block: bool,
     pub(crate) batching_enabled: bool,
     pub(crate) batching_time_limit: Duration,
     pub(crate) queue_alloc: QueueAllocConf,
@@ -700,6 +703,7 @@ impl TransmissionPipeline {
                 wait_before_drop: config.wait_before_drop,
                 max_wait_before_drop_fragments: config.max_wait_before_drop_fragments,
                 wait_before_close: config.wait_before_close,
+                disable_on_failed_block: config.disable_on_failed_block,
             },
         });
 
@@ -857,6 +861,7 @@ struct Waits {
     max_wait_before_drop_fragments: Duration,
 
     wait_before_close: Duration,
+    disable_on_failed_block: bool,
 }
 
 #[derive(Clone)]
@@ -886,11 +891,14 @@ impl TransmissionPipelineProducer {
         } else {
             (0, Priority::DEFAULT)
         };
+        // The congestion flag of the queue: the consumer clears it by queue index when it gives a
+        // batch back, so a single-queue pipeline must use the flag of index 0, not of `priority`.
+        let flag = Priority::try_from(idx as u8).unwrap_or(Priority::DEFAULT);
 
         // If message is droppable, compute a deadline after which the sample could be dropped
         let (wait_time, max_wait_time) = if msg.is_droppable() {
             // Checked if we are blocked on the priority queue and we drop directly the message
-            if self.status.is_congested(priority) {
+            if self.status.is_congested(flag) {
                 return Ok(false);
             }
             (
@@ -911,13 +919,13 @@ impl TransmissionPipelineProducer {
             return Err(TransportClosed);
         }
         // Check again for congestion in case it happens when blocking on the mutex.
-        if msg.is_droppable() && self.status.is_congested(priority) {
+        if msg.is_droppable() && self.status.is_congested(flag) {
             return Ok(false);
         }
         let mut sent = queue.push_network_message(msg, priority, &mut deadline)?;
         // If the message cannot be sent, mark the pipeline as congested.
         if !sent {
-            self.status.set_congested(priority, true);
+            self.status.set_congested(flag, true);
             // During the time between deadline wakeup and setting the congested flag,
             // all batches could have been refilled (especially if there is a single one),
             // so try again with the same already expired deadline.
@@ -927,7 +935,7 @@ impl TransmissionPipelineProducer {
             // so it is not possible that further messages see the congestion flag set
             // after this point.
             if sent {
-                self.status.set_congested(priority, false);
+                self.status.set_congested(flag, false);
             }
             // There is one edge case that is fortunately supported: if the message that
             // has been pushed again is fragmented, we might have some batches actually
@@ -935,6 +943,13 @@ impl TransmissionPipelineProducer {
             // congested flag in that case. However, if some batches were available,
             // that means that they would have still been pushed, so we can expect them to
             // be refilled, and they will eventually unset the congested flag.
+        }
+        // The caller closes the transport when a blocking message finds no room. Disable the
+        // pipeline now, while this producer still holds the queue: a producer waiting for the
+        // queue then fails as soon as it gets it, instead of starting a `wait_before_close` of
+        // its own before the caller had time to mark the pipeline disabled.
+        if !sent && self.status.waits.disable_on_failed_block && !msg.is_droppable() {
+            self.status.set_disabled(true);
         }
         Ok(sent)
     }
@@ -1199,6 +1214,7 @@ mod tests {
         wait_before_drop: Duration::from_millis(1),
         max_wait_before_drop_fragments: Duration::from_millis(1024),
         wait_before_close: Duration::from_secs(5),
+        disable_on_failed_block: false,
         batching_time_limit: Duration::from_micros(1),
         queue_alloc: QueueAllocConf {
             mode: QueueAllocMode::Init,
@@ -1217,6 +1233,7 @@ mod tests {
         wait_before_drop: Duration::from_millis(1),
         max_wait_before_drop_fragments: Duration::from_millis(1024),
         wait_before_close: Duration::from_secs(5),
+        disable_on_failed_block: false,
         batching_time_limit: Duration::from_micros(1),
         queue_alloc: QueueAllocConf {
             mode: QueueAllocMode::Init,
@@ -1539,6 +1556,87 @@ mod tests {
         Ok(())
     }
 
+    // Two producers of a unicast pipeline find its queue full. The one that waits for the queue
+    // while the other spends its `wait_before_close` must fail as soon as it gets the queue: the
+    // transport is being closed. Nothing but the pipeline itself disables it here, as nothing
+    // can between the return of the first push and the moment its caller reacts.
+    #[test]
+    fn queued_producer_does_not_wait_again_after_a_failed_block() -> ZResult<()> {
+        use std::sync::{mpsc, TryLockError};
+
+        const WBC: Duration = Duration::from_millis(500);
+        let config = TransmissionPipelineConf {
+            wait_before_close: WBC,
+            disable_on_failed_block: true,
+            ..CONFIG_NOT_STREAMED
+        };
+        let priorities = vec![TransportPriorityTx::make(Bits::from(TransportSn::MAX))?];
+        let (producer, _consumer) = TransmissionPipeline::make(config, &priorities, false);
+        let message = NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: ext::QoSType::new(Priority::DEFAULT, CongestionControl::Block, false),
+            ..Push::from(vec![0_u8; (CONFIG_NOT_STREAMED.batch.mtu / 2) as usize])
+        });
+        // Takes the only batch: nothing pulls it, so every later push finds the queue full.
+        assert!(producer.push_network_message(message.as_ref())?);
+
+        let first = {
+            let (producer, message) = (producer.clone(), message.clone());
+            std::thread::spawn(move || {
+                let r = producer.push_network_message(message.as_ref());
+                (r, Instant::now())
+            })
+        };
+        // Wait until the first producer holds the queue (it holds it for its whole wait).
+        let start = Instant::now();
+        while !matches!(
+            producer.stage_in[0].try_lock(),
+            Err(TryLockError::WouldBlock)
+        ) {
+            assert!(
+                start.elapsed() < TIMEOUT,
+                "the first producer never started"
+            );
+            std::thread::yield_now();
+        }
+        // The second producer reports, from inside `push_network_message`, after the entry
+        // check and before it asks for the queue, whether the first one still held the queue.
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let second = {
+            let (producer, message) = (producer.clone(), message.clone());
+            std::thread::spawn(move || {
+                let held = producer.clone();
+                AFTER_ENTRY_CHECK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let queue_is_held =
+                            matches!(held.stage_in[0].try_lock(), Err(TryLockError::WouldBlock));
+                        queued_tx.send(queue_is_held).unwrap();
+                    }));
+                });
+                let r = producer.push_network_message(message.as_ref());
+                (r, Instant::now())
+            })
+        };
+        assert!(
+            queued_rx.recv_timeout(TIMEOUT).unwrap(),
+            "the second producer did not pass the entry check while the first held the queue"
+        );
+        let (first, first_done) = first.join().unwrap();
+        assert!(matches!(first, Ok(false)), "first producer: {first:?}");
+        let (second, second_done) = second.join().unwrap();
+        // A producer that starts a wait of its own returns `Ok(false)` one period later.
+        assert!(
+            second.is_err(),
+            "the queued producer was let into a pipeline whose transport is being closed: {second:?}"
+        );
+        let after = second_done.saturating_duration_since(first_done);
+        assert!(
+            after < WBC,
+            "the queued producer ended {after:?} after the first, a second wait_before_close"
+        );
+        Ok(())
+    }
+
     // #1855 preserved: a Block (non-droppable) push on a full queue still waits its full
     // `wait_before_close` budget while the pipeline is enabled. The fail-fast path must
     // depend on the disabled flag only.
@@ -1572,6 +1670,34 @@ mod tests {
         assert!(
             elapsed >= WBC,
             "a Block push should wait its whole wait_before_close ({WBC:?}), waited {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    // A single-queue pipeline (no QoS) takes droppable messages again once its consumer gave a
+    // batch back. The producer used to set the congestion flag of `Priority::DEFAULT` while the
+    // consumer cleared the flag of queue 0: after one congestion drop, every later droppable
+    // message was dropped too, unless a blocking message cleared the flag.
+    #[test]
+    fn single_queue_congestion_clears_on_refill() -> ZResult<()> {
+        let priorities = vec![TransportPriorityTx::make(Bits::from(TransportSn::MAX))?];
+        let (producer, mut consumer) =
+            TransmissionPipeline::make(CONFIG_NOT_STREAMED, &priorities, false);
+        let msg = NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: ext::QoSType::new(Priority::DEFAULT, CongestionControl::Drop, false),
+            ..Push::from(vec![0_u8; (CONFIG_NOT_STREAMED.batch.mtu / 2) as usize])
+        });
+        assert!(producer.push_network_message(msg.as_ref())?);
+        assert!(
+            !producer.push_network_message(msg.as_ref())?,
+            "the queue is full"
+        );
+        let (batch, prio) = consumer.stage_pull().expect("a batch is ready");
+        consumer.refill(batch, prio);
+        assert!(
+            producer.push_network_message(msg.as_ref())?,
+            "a droppable message was dropped although the consumer gave a batch back"
         );
         Ok(())
     }

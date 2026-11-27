@@ -12,9 +12,10 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{
+    any::Any,
     ops::Not,
     sync::{Arc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -33,6 +34,7 @@ use zenoh_protocol::{
     zenoh::{self, ResponseBody},
 };
 use zenoh_sync::get_mut_unchecked;
+use zenoh_transport::unicast::{RequestLifetime, Undelivered, UndeliveredReason};
 use zenoh_util::Timed;
 
 use super::{
@@ -56,6 +58,9 @@ pub(crate) struct Query {
     src_face: Arc<FaceState>,
     src_qid: RequestId,
     src_qos: response::ext::QoSType,
+    /// The key expression of the query, kept only when a link of this process can refuse the
+    /// query (see `TablesData::handover`): the error reply that says so carries it.
+    src_key: Option<Arc<str>>,
 }
 
 impl Face {
@@ -225,10 +230,14 @@ impl Face {
 
                 let queries_lock = zwrite!(self.tables.queries_lock);
 
+                let handover = rtables.data.handover;
                 let query = Arc::new(Query {
                     src_face: self.state.clone(),
                     src_qid: msg.id,
                     src_qos: msg.ext_qos,
+                    src_key: handover
+                        .then(|| expr.key_expr().map(|key| Arc::from(key.as_str())))
+                        .flatten(),
                 });
 
                 let src_face = &self.state;
@@ -262,6 +271,14 @@ impl Face {
                     self.compute_final_route(msg.ext_target, &mut builder, &query, &qabls, filter);
                 }
 
+                // What identifies the branches of this query to a transport that owns its
+                // messages. A weak reference does not keep the query from being finalized.
+                let branch = handover.then(|| {
+                    let branch = Arc::downgrade(&query);
+                    let branch: Weak<dyn Any + Send + Sync> = branch;
+                    branch
+                });
+
                 // NOTE: it's important to drop the `Arc<Query>` object immediately otherwise
                 // a ResponseFinal from a local queryable won't finalize the query,
                 // this is because `Arc::strong_count(&query)` would always be > 1.
@@ -270,6 +287,11 @@ impl Face {
                 let timeout = msg
                     .ext_timeout
                     .unwrap_or(rtables.data.queries_default_timeout);
+                // Taken before the clean-up tasks are spawned: no branch outlives it.
+                let lifetime = branch.map(|branch| RequestLifetime {
+                    expiry: Instant::now() + timeout,
+                    branch: Some(branch),
+                });
 
                 #[cfg(feature = "unstable")]
                 let weak_runtime = rtables.data.runtime.clone();
@@ -337,8 +359,15 @@ impl Face {
                                 zenoh_protocol::network::timestamp_stack::interception_point::ROUTE,
                             );
                         }
-                        if dir.dst_face.primitives.send_request(msg) {
-                            #[cfg(feature = "stats")]
+                        #[allow(unused_variables)] // Used when stats feature is enabled
+                        let sent = match &lifetime {
+                            Some(lifetime) => {
+                                dir.dst_face.primitives.send_routed_request(msg, lifetime)
+                            }
+                            None => dir.dst_face.primitives.send_request(msg),
+                        };
+                        #[cfg(feature = "stats")]
+                        if sent {
                             payload_observer.observe_payload(zenoh_stats::Tx, &dir.dst_face, msg);
                         }
                     }
@@ -469,6 +498,24 @@ impl QueryCleanup {
                 });
         }
     }
+}
+
+/// Runs what the clean-up task of a pending query runs when its timeout fires.
+#[cfg(all(test, feature = "test"))]
+pub(crate) fn run_query_timeout(
+    tables: &Arc<TablesLock>,
+    face: &Arc<FaceState>,
+    qid: RequestId,
+    qos: response::ext::QoSType,
+) {
+    let mut cleanup = QueryCleanup {
+        tables: tables.clone(),
+        face: Arc::downgrade(face),
+        qid,
+        qos,
+        timeout: Duration::ZERO,
+    };
+    futures::executor::block_on(cleanup.run());
 }
 
 #[async_trait]
@@ -653,6 +700,99 @@ pub(crate) fn route_send_response_final(
             finalize_pending_query(query);
         }
         None => tracing::warn!("{}:{} Route final reply: Query not found!", face, qid),
+    }
+}
+
+/// A branch of a query that the transport of its face did not send, taken out of the pending
+/// queries of the face: nothing else ends it any more.
+pub(crate) struct ClaimedQuery {
+    query: (Arc<Query>, CancellationToken),
+    reason: UndeliveredReason,
+    responder: zenoh_protocol::core::ZenohIdProto,
+}
+
+/// Takes the branches that `undelivered` names out of the pending queries of `face`.
+///
+/// A record names a branch by the request id on this face and by the query that routing gave
+/// to the transport with the request. The branch is taken only when the pending query of
+/// that id is that query: when the branch has ended meanwhile (final, timeout, closed face),
+/// and also when its id is in use again for another query, the record does nothing.
+///
+/// Sends nothing: see [`complete_claimed_queries`].
+pub(crate) fn claim_undelivered_queries(
+    tables_ref: &TablesLock,
+    face: &mut Arc<FaceState>,
+    undelivered: Vec<Undelivered>,
+) -> Vec<ClaimedQuery> {
+    let responder = face.zid;
+    let mut claimed = Vec::new();
+    let queries_lock = zwrite!(tables_ref.queries_lock);
+    for record in undelivered {
+        let Some(branch) = record.branch else {
+            continue;
+        };
+        let pending = &mut get_mut_unchecked(face).pending_queries;
+        let is_this_query = pending.get(&record.rid).is_some_and(|(query, _)| {
+            std::ptr::eq(
+                Arc::as_ptr(query) as *const (),
+                branch.as_ptr() as *const (),
+            )
+        });
+        if is_this_query {
+            if let Some(query) = pending.remove(&record.rid) {
+                claimed.push(ClaimedQuery {
+                    query,
+                    reason: record.reason,
+                    responder,
+                });
+            }
+        }
+    }
+    drop(queries_lock);
+    claimed
+}
+
+/// Ends the claimed branches: an error reply that says why, then what ends any branch.
+pub(crate) fn complete_claimed_queries(claimed: Vec<ClaimedQuery>) {
+    for ClaimedQuery {
+        query,
+        reason,
+        responder,
+    } in claimed
+    {
+        tracing::debug!(
+            "{}:{} Query not sent by the transport: {}",
+            query.0.src_face,
+            query.0.src_qid,
+            reason.text()
+        );
+        query.0.src_face.primitives.send_response(&mut Response {
+            rid: query.0.src_qid,
+            // The form of the error reply of a queryable: with the key expression of the
+            // query. A session that has a namespace drops a reply whose key is not inside
+            // it, and the access control denies a reply without a key; this one passes where
+            // the replies of the query do.
+            wire_expr: match query.0.src_key.as_deref() {
+                Some(key) => WireExpr::empty().with_suffix(key).to_owned(),
+                None => WireExpr::empty(),
+            },
+            payload: ResponseBody::Err(zenoh::Err {
+                encoding: Encoding::default(),
+                ext_sinfo: None,
+                #[cfg(feature = "shared-memory")]
+                ext_shm: None,
+                ext_unknown: vec![],
+                payload: ZBuf::from(reason.text().as_bytes().to_vec()),
+            }),
+            ext_qos: query.0.src_qos,
+            ext_tstamp: None,
+            ext_respid: Some(response::ext::ResponderIdType {
+                zid: responder,
+                eid: 0,
+            }),
+            ext_ts_stack: None,
+        });
+        finalize_pending_query(query);
     }
 }
 

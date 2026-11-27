@@ -23,11 +23,17 @@ use zenoh_protocol::{
     },
 };
 use zenoh_result::ZResult;
-use zenoh_transport::{unicast::TransportUnicast, TransportPeerEventHandler};
+use zenoh_transport::{
+    unicast::{TransportUnicast, Undelivered},
+    TransportPeerEventHandler,
+};
 
 use super::Primitives;
 use crate::net::routing::{
-    dispatcher::face::Face,
+    dispatcher::{
+        face::Face,
+        queries::{claim_undelivered_queries, complete_claimed_queries},
+    },
     gateway::{InterceptorCacheValueType, Resource},
     hat::{DispatcherContext, HatTrait},
     interceptor::{has_interceptor, InterceptorContext, InterceptorTrait, InterceptorsChain},
@@ -230,6 +236,17 @@ impl TransportPeerEventHandler for DeMux {
 
     fn closed(&self) {
         self.face.send_close();
+    }
+
+    fn handle_undelivered(&self, undelivered: Vec<Undelivered>) {
+        // The branches are taken here, so that neither a timeout nor the close of the face
+        // ends them a second time. What is sent for them may wait for the transport of the
+        // face that asked: it is sent from a task of its own.
+        let claimed =
+            claim_undelivered_queries(&self.face.tables, &mut self.face.state.clone(), undelivered);
+        if !claimed.is_empty() {
+            zenoh_runtime::ZRuntime::Net.spawn(async move { complete_claimed_queries(claimed) });
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

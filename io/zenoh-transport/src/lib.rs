@@ -128,6 +128,11 @@ pub trait TransportPeerEventHandler: Send + Sync {
     fn new_link(&self, src: Link);
     fn del_link(&self, link: Link);
     fn closed(&self);
+    /// Queries scheduled with [`TransportUnicast::schedule_request`] that the transport did
+    /// not send, and will not send. Called from a task of the transport, never from the
+    /// caller of `schedule_request`; before [`TransportPeerEventHandler::closed`] when the
+    /// transport closes. Must not wait for a transport.
+    fn handle_undelivered(&self, _undelivered: Vec<unicast::Undelivered>) {}
     fn as_any(&self) -> &dyn Any;
 }
 

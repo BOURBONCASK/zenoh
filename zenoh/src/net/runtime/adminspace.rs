@@ -673,7 +673,8 @@ fn local_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
         let shm = transport.is_shm().unwrap_or_default();
         #[cfg(not(feature = "shared-memory"))]
         let shm = false;
-        let json = json!({
+        #[allow(unused_mut)]
+        let mut json = json!({
             "peer": transport.get_zid().map_or_else(|_| "unknown".to_string(), |p| p.to_string()),
             "whatami": transport.get_whatami().map_or_else(|_| "unknown".to_string(), |p| p.to_string()),
             "links": links,
@@ -681,6 +682,10 @@ fn local_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
             "shm": shm,
             "region": transport_unicast_to_region(transport).map_or_else(|| "unknown".to_string(), |r| r.to_string())
         });
+        // Only for a transport whose link is selected by a hand-over rule.
+        if let Ok(Some(status)) = transport.get_handover_status() {
+            json["handover"] = json!(status);
+        }
         json
     };
     let transport_multicast_peer_to_json =
@@ -730,6 +735,11 @@ fn local_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
         "sessions": transports,
         "plugins": plugins,
     });
+
+    // Only for a process with hand-over rules.
+    if let Some(rules) = transport_mgr.config.handover.as_ref() {
+        json["handover"] = json!(rules.status());
+    }
 
     #[cfg(feature = "stats")]
     if query

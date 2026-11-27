@@ -1223,6 +1223,10 @@ impl TransportPeerEventHandler for RuntimeSession {
         }
     }
 
+    fn handle_undelivered(&self, undelivered: Vec<zenoh_transport::unicast::Undelivered>) {
+        self.main_handler.handle_undelivered(undelivered)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
