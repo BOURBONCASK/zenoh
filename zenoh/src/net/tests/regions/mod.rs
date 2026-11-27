@@ -27,6 +27,7 @@ mod declare;
 mod expr_id;
 mod forwarding;
 mod interest;
+mod leaf_uplink;
 mod nodeidx_reuse;
 mod oam;
 
