@@ -70,7 +70,11 @@ const R2: &str = "robot2";
 fn leaf_conf(interests: &str) -> String {
     format!(
         r#"{{
-            north: {{ mode: "client", interests: [{interests}] }},
+            north: {{
+                mode: "client",
+                uplinks: [{{ link_protocols: ["quic"] }}],
+                interests: [{interests}],
+            }},
             south: [{{ filters: [{{ modes: ["router"] }}] }}],
         }}"#
     )

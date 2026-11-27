@@ -217,6 +217,9 @@ impl AdminSpace {
         add_handler!("querier", "**", queriers_data);
         add_handler!("token", "**", tokens_data);
         add_handler!("route/successor", "**", route_successor);
+        if super::region::is_leaf(config) {
+            add_handler!("uplink", uplink_data);
+        }
 
         #[cfg(feature = "plugins")]
         add_handler!("plugins", "**", plugins_data);
@@ -651,8 +654,13 @@ fn local_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
     let transport_unicast_to_region = move |transport: &TransportUnicast| -> Option<Region> {
         let peer = transport.get_peer().ok()?;
         let transient_remote_bound = transport.get_bound().ok()?;
-        let (region, _) =
-            region::compute_region_of(&peer, &config, transient_remote_bound.as_ref()).ok()?;
+        let (region, _) = region::compute_region_of(
+            &peer,
+            &config,
+            transient_remote_bound.as_ref(),
+            transport.get_local_whatami().ok()?,
+        )
+        .ok()?;
         Some(region)
     };
     // transports info
@@ -898,6 +906,55 @@ fn linkstate_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
         {
             tracing::error!("Error sending AdminSpace reply: {:?}", e);
         }
+    }
+}
+
+/// State of the uplink of a leaf router (`gateway.north.mode: "client"`): its north remote and
+/// its configured interests.
+#[tracing::instrument(level = "trace", skip_all)]
+fn uplink_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
+    use crate::net::routing::hat::client::Hat as ClientHat;
+
+    let owner = context.runtime.state.north.owner();
+    let tables = &context.runtime.state.router.tables;
+    // NOTE: collect under the lock, drop the guard, then reply.
+    let interests = {
+        let rtables = zread!(tables.tables);
+        rtables.hats[Region::North]
+            .as_any()
+            .downcast_ref::<ClientHat>()
+            .map(|hat| hat.uplink_interests_info(&rtables.data))
+            .unwrap_or_default()
+    };
+    let interests: Vec<serde_json::Value> = interests
+        .into_iter()
+        .map(|(key_expr, options, state)| {
+            json!({
+                "key_expr": key_expr,
+                "subscribers": options.subscribers(),
+                "queryables": options.queryables(),
+                "tokens": options.tokens(),
+                // "none": there is no north remote to declare it to
+                "state": state.map_or("none", |s| s.as_str()),
+            })
+        })
+        .collect();
+    let json = json!({
+        "mode": super::region::north_mode(&context.runtime.config().lock()).to_str(),
+        "remote": owner.map(|o| o.zid.to_string()),
+        "state": match owner {
+            None => "disconnected",
+            Some(o) if o.closing => "closing",
+            Some(_) => "connected",
+        },
+        "interests": interests,
+    });
+    if let Err(e) = query
+        .reply(prefix, serde_json::to_vec(&json).unwrap())
+        .encoding(Encoding::APPLICATION_JSON)
+        .wait()
+    {
+        tracing::error!("Error sending AdminSpace reply: {:?}", e);
     }
 }
 

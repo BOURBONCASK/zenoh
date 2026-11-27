@@ -20,6 +20,7 @@
 mod adminspace;
 pub mod orchestrator;
 mod region;
+mod uplink;
 
 #[cfg(all(feature = "unstable", feature = "shared-memory"))]
 use std::future::IntoFuture;
@@ -59,7 +60,7 @@ use zenoh_protocol::{
     core::{Locator, Region, WhatAmI, ZenohIdProto},
     network::NetworkMessageMut,
 };
-use zenoh_result::{bail, ZResult};
+use zenoh_result::{bail, zerror, ZResult};
 use zenoh_runtime::ZRuntime;
 #[cfg(feature = "shared-memory")]
 use zenoh_shm::api::{
@@ -189,6 +190,8 @@ pub(crate) struct RuntimeState {
     start_conditions: Arc<StartConditions>,
     pending_connections: tokio::sync::Mutex<HashSet<ZenohIdProto>>,
     namespace: Option<OwnedNonWildKeyExpr>,
+    /// Which remote owns the north region of a leaf router. Not used otherwise.
+    north: uplink::NorthAdmission<Weak<RuntimeSession>>,
     #[cfg(feature = "stats")]
     stats: zenoh_stats::StatsRegistry,
     span: tracing::Span,
@@ -842,6 +845,7 @@ impl RuntimeBuilder {
                 start_conditions: Arc::new(StartConditions::default()),
                 pending_connections: tokio::sync::Mutex::new(HashSet::new()),
                 namespace,
+                north: uplink::NorthAdmission::default(),
                 #[cfg(feature = "stats")]
                 stats,
                 span,
@@ -1072,18 +1076,32 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
         match zread!(self.runtime).upgrade().as_ref() {
             Some(runtime) => {
                 let _span = runtime.state.span.enter();
-                let slave_handlers: Vec<Arc<dyn TransportPeerEventHandler>> =
-                    zread!(runtime.state.transport_handlers)
-                        .iter()
-                        .filter_map(|handler| {
-                            handler.new_unicast(peer.clone(), transport.clone()).ok()
-                        })
-                        .collect();
 
                 let config = runtime.config().lock().clone();
 
-                let (region, remote_bound) =
-                    region::compute_region_of(&peer, &config, transport.get_bound()?.as_ref())?;
+                // NOTE: every check that can refuse the remote runs before the other handlers
+                // (plugins, connectivity events) are told of it: they are only told of a
+                // closed transport if this handler accepted it.
+                let announced_mode = transport.get_local_whatami()?;
+                let (region, remote_bound) = match region::compute_region_of(
+                    &peer,
+                    &config,
+                    transport.get_bound()?.as_ref(),
+                    announced_mode,
+                ) {
+                    Ok(relationship) => relationship,
+                    Err(e) => {
+                        if region::is_leaf(&config) {
+                            tracing::warn!(
+                                "Remote {} refused, it was announced the '{}' mode: {}",
+                                peer.zid,
+                                announced_mode,
+                                e
+                            );
+                        }
+                        return Err(e);
+                    }
+                };
 
                 fn north_bound_transport_peer_count(
                     runtime: &Runtime,
@@ -1105,7 +1123,9 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                                     return false;
                                 };
 
-                                let Ok(remote_bound) = transport.get_bound() else {
+                                let (Ok(remote_bound), Ok(announced_mode)) =
+                                    (transport.get_bound(), transport.get_local_whatami())
+                                else {
                                     tracing::error!(
                                         "Could not get transport remote bound \
                                         while computing north-bound transport count. \
@@ -1124,6 +1144,7 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                                     &peer,
                                     &runtime.config().lock(),
                                     remote_bound.as_ref(),
+                                    announced_mode,
                                 ) else {
                                     tracing::error!(
                                         zid = %peer.zid.short(),
@@ -1141,29 +1162,100 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     })
                 }
 
-                region::check_announced_mode(&peer, &config, &region)?;
-
-                // NOTE(leaf): a leaf router reconnects as soon as a link is deleted, which is
-                // before its transport is closed. The client hat has a single north face, so the
-                // new north remote is refused until the previous one is gone; the connector
-                // retries.
-                if region.bound().is_north()
-                    && region::north_mode(&config) == WhatAmI::Client
-                    && north_bound_transport_peer_count(runtime, &peer) > 0
-                {
-                    bail!("Client runtimes only accept one north-bound transport");
+                if let Err(e) = region::check_leaf_relationship(
+                    &peer,
+                    &config,
+                    &region,
+                    &remote_bound,
+                    announced_mode,
+                ) {
+                    tracing::warn!("{e}");
+                    return Err(e);
                 }
 
-                Ok(Arc::new(RuntimeSession {
+                // NOTE(leaf): the hat of a client north region has a single north face. A
+                // leaf router reconnects as soon as a link is deleted, which is before its
+                // transport is closed, and may have several endpoints that lead north: which
+                // remote owns the north region is decided by `NorthAdmission`.
+                let north_ticket = if region.bound().is_north() && region::is_leaf(&config) {
+                    match runtime.state.north.admit(peer.zid) {
+                        Ok(granted) => {
+                            if let Some(previous) =
+                                granted.previous.as_ref().and_then(Weak::upgrade)
+                            {
+                                tracing::info!(
+                                    "Uplink: {} takes over from {}, whose transport is closing",
+                                    peer.zid,
+                                    previous.main_handler.face.state.zid
+                                );
+                                previous.close_main_handler();
+                            }
+                            Some(granted.ticket)
+                        }
+                        Err(owner) => {
+                            let e = zerror!(
+                                "Uplink: {} refused, {} owns the north region of this leaf \
+                                 (one north remote at a time)",
+                                peer.zid,
+                                owner.zid
+                            );
+                            tracing::warn!("{e}");
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    if region.bound().is_north()
+                        && runtime.whatami() == WhatAmI::Client
+                        && north_bound_transport_peer_count(runtime, &peer) > 0
+                    {
+                        bail!("Client runtimes only accept one north-bound transport");
+                    }
+                    None
+                };
+
+                let slave_handlers: Vec<Arc<dyn TransportPeerEventHandler>> =
+                    zread!(runtime.state.transport_handlers)
+                        .iter()
+                        .filter_map(|handler| {
+                            handler.new_unicast(peer.clone(), transport.clone()).ok()
+                        })
+                        .collect();
+
+                let main_handler = match runtime.state.router.new_transport_unicast(
+                    transport.clone(),
+                    region,
+                    remote_bound,
+                ) {
+                    Ok(main_handler) => main_handler,
+                    Err(e) => {
+                        // the other handlers were told of this transport: balance it
+                        for handler in &slave_handlers {
+                            handler.closed();
+                        }
+                        if let Some(ticket) = north_ticket {
+                            runtime.state.north.release(ticket);
+                        }
+                        return Err(e);
+                    }
+                };
+
+                let session = Arc::new(RuntimeSession {
                     runtime: runtime.clone(),
                     endpoints: std::sync::RwLock::new(HashSet::new()),
-                    main_handler: runtime
-                        .state
-                        .router
-                        .new_transport_unicast(transport, region, remote_bound)
-                        .unwrap(),
+                    main_handler,
+                    main_handler_closed: std::sync::Mutex::new(false),
+                    transport,
+                    north_ticket,
                     slave_handlers,
-                }))
+                });
+                if let Some(ticket) = north_ticket {
+                    runtime.state.north.bind(ticket, Arc::downgrade(&session));
+                    tracing::info!(
+                        "Uplink: {} admitted as the north remote of this leaf",
+                        peer.zid
+                    );
+                }
+                Ok(session)
             }
             None => bail!("Runtime not yet ready!"),
         }
@@ -1203,7 +1295,25 @@ pub(super) struct RuntimeSession {
     pub(super) runtime: Runtime,
     pub(super) endpoints: std::sync::RwLock<HashSet<EndPoint>>,
     pub(super) main_handler: Arc<DeMux>,
+    /// Whether [`Self::main_handler`] was closed. Locked while it is being closed.
+    main_handler_closed: std::sync::Mutex<bool>,
+    transport: TransportUnicast,
+    /// The admission of this remote as the north remote of a leaf router, if it is.
+    north_ticket: Option<uplink::NorthTicket>,
     pub(super) slave_handlers: Vec<Arc<dyn TransportPeerEventHandler>>,
+}
+
+impl RuntimeSession {
+    /// Closes the routing face of this transport, once. Returns when the face is closed,
+    /// whoever closes it: a leaf router closes the face of an uplink that lost its link before
+    /// it admits the next one, without waiting for the close of the transport.
+    fn close_main_handler(&self) {
+        let mut closed = self.main_handler_closed.lock().unwrap();
+        if !*closed {
+            self.main_handler.closed();
+            *closed = true;
+        }
+    }
 }
 
 impl TransportPeerEventHandler for RuntimeSession {
@@ -1225,12 +1335,31 @@ impl TransportPeerEventHandler for RuntimeSession {
         for handler in &self.slave_handlers {
             handler.del_link(link.clone());
         }
+        if let Some(ticket) = self.north_ticket {
+            // NOTE(leaf): without a link this uplink is closing: the next north remote may
+            // take over, and the connector started below may be the one that brings it.
+            if self.transport.get_links().map_or(true, |l| l.is_empty()) {
+                tracing::info!(
+                    "Uplink: {} lost its last link",
+                    self.main_handler.face.state.zid
+                );
+                self.runtime.state.north.link_lost(ticket);
+            }
+        }
         Runtime::closed_link(self, link.dst.to_endpoint());
     }
 
     fn closed(&self) {
         let _span = self.runtime.state.span.enter();
-        self.main_handler.closed();
+        self.close_main_handler();
+        if let Some(ticket) = self.north_ticket {
+            if self.runtime.state.north.release(ticket) {
+                tracing::info!(
+                    "Uplink: {} closed, this leaf has no north remote",
+                    self.main_handler.face.state.zid
+                );
+            }
+        }
         Runtime::closed_session(self);
         for handler in &self.slave_handlers {
             handler.closed();

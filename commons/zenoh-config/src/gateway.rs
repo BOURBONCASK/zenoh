@@ -41,23 +41,27 @@ pub struct GatewayNorthConf {
     /// The mode this node takes in its north region, and announces on its uplinks. Only
     /// `"client"` differs from the default, which is the mode of the node.
     pub mode: Option<WhatAmI>,
-    /// Which links are uplinks. A link is an uplink iff it matches _any_ of the filters; if
-    /// [`None`], every link is. The mode is announced before the remote is known, so only
-    /// properties of the link itself can be used.
-    pub uplinks: Option<Vec<GatewayUplinkFilterConf>>,
+    /// Which of the links this node opens are uplinks. A link is an uplink iff it matches
+    /// _any_ of the filters; no link is an uplink by default, and a link this node accepts
+    /// never is. Required with `mode: "client"`. The mode is announced before the remote is
+    /// known, so only properties of the link itself can be used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uplinks: Vec<GatewayUplinkFilterConf>,
     /// Declarations requested from the north remote each time an uplink is established, on
     /// behalf of the south router subregions, which have no interest protocol of their own.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interests: Vec<GatewayNorthInterestConf>,
 }
 
-/// Uplink filter. A link matches iff it matches _all_ of the given fields.
+/// Uplink filter. A link matches iff it matches _all_ of the given fields; at least one is
+/// required.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayUplinkFilterConf {
     /// Link protocols (e.g. `"quic"`).
     pub link_protocols: Option<NEVec<String>>,
-    /// Network interfaces: every interface of the link must be one of them.
+    /// Network interfaces: every interface of the link must be one of them. A link whose
+    /// interfaces cannot be resolved does not match.
     pub interfaces: Option<NEVec<Interface>>,
 }
 
@@ -144,7 +148,7 @@ mod tests {
         .unwrap();
         let north = conf.north.unwrap();
         assert_eq!(north.mode, Some(WhatAmI::Client));
-        assert_eq!(north.uplinks.unwrap().len(), 2);
+        assert_eq!(north.uplinks.len(), 2);
         assert_eq!(north.interests.len(), 2);
         assert!(north.interests[0].subscribers && north.interests[0].queryables);
         assert!(!north.interests[0].tokens && north.interests[1].tokens);
@@ -154,6 +158,8 @@ mod tests {
     fn north_section_is_optional_and_strict() {
         let conf: GatewayConf = json5::from_str("{}").unwrap();
         assert!(conf.north.is_none());
+        let conf: GatewayConf = json5::from_str(r#"{ north: { mode: "client" } }"#).unwrap();
+        assert!(conf.north.unwrap().uplinks.is_empty());
         assert!(json5::from_str::<GatewayConf>(r#"{ north: { uplink: [] } }"#).is_err());
         assert!(json5::from_str::<GatewayConf>(
             r#"{ north: { interests: [{ subscribers: true }] } }"#

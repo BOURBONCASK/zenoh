@@ -17,8 +17,8 @@ use zenoh_config::{
 };
 #[allow(unused_imports)]
 use zenoh_core::polyfill::*;
-use zenoh_link::Link;
-use zenoh_protocol::core::{Bound, Region};
+use zenoh_link::{Link, BIND_INTERFACE};
+use zenoh_protocol::core::{Bound, EndPoint, Region};
 use zenoh_result::ZResult;
 use zenoh_transport::TransportPeer;
 
@@ -35,13 +35,18 @@ pub(crate) fn compute_transient_bound_of(
 }
 
 /// Computes the [`Region`] and _remote_ [`Bound`] of a remote.
+///
+/// `announced_mode` is the mode this node announced to that remote. It is the mode of the node,
+/// except on the uplinks of a leaf router (see [`announced_mode_on`]). The relationship is
+/// inferred from what the remote was told, since this is what the remote infers it from.
 #[tracing::instrument(level = "debug", skip(peer, config), fields(peer.zid = %peer.zid.short(), peer.mode = %peer.whatami), ret)]
 pub(crate) fn compute_region_of(
     peer: &TransportPeer,
     config: &ExpandedConfig,
     transient_remote_bound: Option<&Bound>,
+    announced_mode: WhatAmI,
 ) -> ZResult<(Region, Bound)> {
-    let mode = config.mode();
+    let mode = announced_mode;
     let remote_mode = peer.whatami;
     let transient_region = compute_transient_region_of(peer, config)?;
 
@@ -105,79 +110,174 @@ pub(crate) fn is_leaf(config: &ExpandedConfig) -> bool {
 
 /// Checks the `gateway.north` section against the mode of the node.
 pub(crate) fn check_north_config(config: &ExpandedConfig) -> ZResult<()> {
-    if let Some(north) = &config.gateway.north {
-        if is_leaf(config) && !(config.mode().is_router() && north_mode(config).is_client()) {
+    let Some(north) = &config.gateway.north else {
+        return Ok(());
+    };
+    if !is_leaf(config) {
+        if !north.uplinks.is_empty() || !north.interests.is_empty() {
             bail!(
-                "gateway.north.mode '{}' is not supported in '{}' mode: only a router can be a \
-                 client of its north region",
-                north_mode(config),
-                config.mode()
+                "gateway.north.uplinks and gateway.north.interests only apply to a router whose \
+                 gateway.north.mode is 'client' (mode is '{}', gateway.north.mode is '{}')",
+                config.mode(),
+                north_mode(config)
             )
         }
-        if !is_leaf(config) && !north.interests.is_empty() {
-            bail!("gateway.north.interests requires gateway.north.mode to be 'client'")
+        return Ok(());
+    }
+    if !(config.mode().is_router() && north_mode(config).is_client()) {
+        bail!(
+            "gateway.north.mode '{}' is not supported in '{}' mode: only a router can be a \
+             client of its north region",
+            north_mode(config),
+            config.mode()
+        )
+    }
+    if north.uplinks.is_empty() {
+        bail!(
+            "gateway.north.uplinks is required when gateway.north.mode is 'client': it tells on \
+             which of the links this router opens it announces itself as a client. No link is an \
+             uplink by default"
+        )
+    }
+    for (i, filter) in north.uplinks.iter().enumerate() {
+        if filter.link_protocols.is_none() && filter.interfaces.is_none() {
+            bail!(
+                "gateway.north.uplinks[{i}] has neither link_protocols nor interfaces: it would \
+                 match every link"
+            )
+        }
+    }
+    for interest in &north.interests {
+        if !(interest.subscribers || interest.queryables || interest.tokens) {
+            bail!(
+                "gateway.north.interests: '{}' asks for nothing: set subscribers, queryables \
+                 or tokens",
+                interest.key_expr
+            )
         }
     }
     Ok(())
 }
 
-/// Returns `true` if `link` is an uplink according to `gateway.north.uplinks`.
+/// Returns `true` if `link`, opened by this node, is an uplink according to
+/// `gateway.north.uplinks`.
 #[allow(clippy::incompatible_msrv)]
 fn is_uplink(link: &Link, config: &ExpandedConfig) -> bool {
     let Some(north) = &config.gateway.north else {
         return false;
     };
-    north.uplinks.as_ref().is_none_or(|filters| {
-        filters.iter().any(|filter| {
-            filter.link_protocols.as_ref().is_none_or(|protocols| {
-                protocols
-                    .iter()
-                    .any(|p| p.as_str() == link.dst.protocol().as_str())
-            }) && filter.interfaces.as_ref().is_none_or(|ifaces| {
-                link.interfaces
+    north.uplinks.iter().any(|filter| {
+        filter.link_protocols.as_ref().is_none_or(|protocols| {
+            protocols
+                .iter()
+                .any(|p| p.as_str() == link.dst.protocol().as_str())
+        }) && filter.interfaces.as_ref().is_none_or(|ifaces| {
+            // NOTE: `all` is true on an empty list. A link whose interfaces could not be
+            // resolved must not match an interface filter.
+            !link.interfaces.is_empty()
+                && link
+                    .interfaces
                     .iter()
                     .all(|iface| ifaces.contains(&Interface(iface.to_owned())))
-            })
         })
     })
 }
 
-/// The mode this node announces on `link` when it differs from its own: a leaf announces its
-/// north mode on its uplinks. The mode is sent before the remote is known, hence the decision
-/// only looks at the link.
+/// Returns `true` if a link opened to `endpoint` is an uplink whatever its interfaces turn out
+/// to be: a filter of `gateway.north.uplinks` selects its protocol and no interface, or selects
+/// the interface the endpoint is bound to (`iface`).
+#[allow(clippy::incompatible_msrv)]
+pub(crate) fn is_uplink_endpoint(endpoint: &EndPoint, config: &ExpandedConfig) -> bool {
+    let Some(north) = config.gateway.north.as_ref().filter(|_| is_leaf(config)) else {
+        return false;
+    };
+    let protocol = endpoint.protocol();
+    let endpoint_config = endpoint.config();
+    let iface = endpoint_config.get(BIND_INTERFACE);
+    north.uplinks.iter().any(|filter| {
+        filter.link_protocols.as_ref().is_none_or(|protocols| {
+            protocols.iter().any(|p| p.as_str() == protocol.as_str())
+        }) && match (&filter.interfaces, iface) {
+            (None, _) => filter.link_protocols.is_some(),
+            (Some(ifaces), Some(iface)) => ifaces.contains(&Interface(iface.to_owned())),
+            (Some(_), None) => false,
+        }
+    })
+}
+
+/// The mode this node announces on `link`, which it opens, when it differs from its own: a
+/// leaf announces its north mode on its uplinks. The mode is sent before the remote is known,
+/// hence the decision only looks at the link.
 pub(crate) fn announced_mode_on(link: &Link, config: &ExpandedConfig) -> Option<WhatAmI> {
     (is_leaf(config) && is_uplink(link, config)).then(|| north_mode(config))
 }
 
-/// Refuses a remote of a leaf whose region disagrees with the mode announced on its links: a
-/// north remote that was told this node is a router would handle it as one, and a south remote
-/// that was told it is a client would not exchange link state with it.
-pub(crate) fn check_announced_mode(
+/// Refuses a remote of a leaf whose relationship disagrees with the mode it was announced.
+///
+/// + A north remote must have been announced the north mode of this leaf (otherwise it handles
+///   this node as a router), and must put this node south of itself: the hat of a `client`
+///   north region requires it.
+/// + A south remote must have been announced the mode of the node (otherwise it would not
+///   exchange link state with it).
+///
+/// These are errors in release builds too: nothing else stops a face with the wrong relationship
+/// from being created.
+pub(crate) fn check_leaf_relationship(
     peer: &TransportPeer,
     config: &ExpandedConfig,
     region: &Region,
+    remote_bound: &Bound,
+    announced_mode: WhatAmI,
 ) -> ZResult<()> {
     if !is_leaf(config) {
         return Ok(());
     }
-    let over_uplink = !peer.links.is_empty() && peer.links.iter().all(|l| is_uplink(l, config));
-    match (region.bound(), over_uplink) {
-        (Bound::North, true) | (Bound::South, false) => Ok(()),
-        (Bound::North, false) => bail!(
-            "Remote {} is in the north region of this leaf but none of gateway.north.uplinks \
-             matches its link(s): it was announced the '{}' mode instead of '{}'",
-            peer.zid,
-            config.mode(),
-            north_mode(config)
-        ),
-        (Bound::South, true) => bail!(
-            "Remote {} is in the south region {} of this leaf but its link(s) match \
-             gateway.north.uplinks: it was announced the '{}' mode instead of '{}'",
-            peer.zid,
-            region,
-            north_mode(config),
-            config.mode()
-        ),
+    let links = || {
+        peer.links
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match region.bound() {
+        Bound::North => {
+            if announced_mode != north_mode(config) {
+                bail!(
+                    "Remote {} is in the north region of this leaf but was announced the '{}' \
+                     mode instead of '{}': its link ({}) is not an uplink. An uplink is a link \
+                     this node opens and that matches gateway.north.uplinks",
+                    peer.zid,
+                    announced_mode,
+                    north_mode(config),
+                    links()
+                )
+            }
+            if !remote_bound.is_south() {
+                bail!(
+                    "Remote {} is in the north region of this leaf but does not put this node \
+                     south of itself: a '{}' north region needs a remote that handles this node \
+                     as one of its south '{}' nodes",
+                    peer.zid,
+                    north_mode(config),
+                    north_mode(config)
+                )
+            }
+            Ok(())
+        }
+        Bound::South => {
+            if announced_mode != config.mode() {
+                bail!(
+                    "Remote {} is in the south region {} of this leaf but was announced the \
+                     '{}' mode instead of '{}': its link ({}) matches gateway.north.uplinks",
+                    peer.zid,
+                    region,
+                    announced_mode,
+                    config.mode(),
+                    links()
+                )
+            }
+            Ok(())
+        }
     }
 }
 
@@ -289,4 +389,230 @@ fn is_match(filter: Option<&[GatewayFiltersConf]>, peer: &TransportPeer) -> bool
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use zenoh_protocol::core::ZenohIdProto;
+
+    use super::*;
+
+    /// A router with `gateway.north.mode: "client"` and a south router subregion.
+    fn leaf() -> ExpandedConfig {
+        let mut config = zenoh_config::Config::default().expanded();
+        config.set_mode(Some(WhatAmI::Router)).unwrap();
+        config.gateway = json5::from_str(
+            r#"{
+                north: { mode: "client", uplinks: [{ link_protocols: ["quic"] }] },
+                south: [{ filters: [{ modes: ["router"], zids: ["5100"] }] }],
+            }"#,
+        )
+        .unwrap();
+        config
+    }
+
+    fn remote(mode: WhatAmI, zid: &str) -> TransportPeer {
+        TransportPeer {
+            zid: zid.parse::<ZenohIdProto>().unwrap(),
+            whatami: mode,
+            links: vec![],
+            is_qos: false,
+            #[cfg(feature = "shared-memory")]
+            is_shm: false,
+            region_name: None,
+        }
+    }
+
+    /// The relationship with `cloud`, a router that sent `bound`, when this leaf announced
+    /// `announced` to it, and whether the leaf accepts it.
+    fn relationship(bound: Option<Bound>, announced: WhatAmI) -> ZResult<(Region, Bound)> {
+        let (config, cloud) = (leaf(), remote(WhatAmI::Router, "c10d"));
+        let (region, remote_bound) =
+            compute_region_of(&cloud, &config, bound.as_ref(), announced)?;
+        check_leaf_relationship(&cloud, &config, &region, &remote_bound, announced)?;
+        Ok((region, remote_bound))
+    }
+
+    /// A router that uses the `auto` gateway preset, or that does not send the bound extension,
+    /// sends no bound. It was told that this node is a client, so it put it south: the leaf
+    /// infers the same from the mode it announced, not from its own mode.
+    #[test]
+    fn north_relationship_is_inferred_from_the_announced_mode() {
+        assert_eq!(
+            relationship(None, WhatAmI::Client).unwrap(),
+            (Region::North, Bound::South)
+        );
+    }
+
+    /// A router with a custom configuration that puts clients south says so.
+    #[test]
+    fn north_remote_that_puts_the_leaf_south_is_accepted() {
+        assert_eq!(
+            relationship(Some(Bound::South), WhatAmI::Client).unwrap(),
+            (Region::North, Bound::South)
+        );
+    }
+
+    /// A router whose custom configuration leaves the leaf in its north region is refused:
+    /// the hat of a client north region needs a remote that put this node south.
+    #[test]
+    fn north_remote_that_keeps_the_leaf_north_is_refused() {
+        let e = relationship(Some(Bound::North), WhatAmI::Client).unwrap_err();
+        assert!(e.to_string().contains("North-north"), "{e}");
+    }
+
+    /// The north remote was reached over a link that is not an uplink: it was told that this
+    /// node is a router. Whatever it answers, it is refused.
+    #[test]
+    fn north_remote_that_was_announced_the_mode_of_the_node_is_refused() {
+        for bound in [None, Some(Bound::North), Some(Bound::South)] {
+            let e = relationship(bound, WhatAmI::Router).unwrap_err();
+            assert!(e.to_string().contains("not an uplink"), "{bound:?}: {e}");
+        }
+    }
+
+    /// A router of a south subregion keeps the relationship routers have, and is refused if it
+    /// was reached over an uplink, i.e. told that this node is a client.
+    #[test]
+    fn south_relationship_needs_the_mode_of_the_node() {
+        let (config, south) = (leaf(), remote(WhatAmI::Router, "5100"));
+        let check = |announced| {
+            let (region, remote_bound) = compute_region_of(&south, &config, None, announced)?;
+            check_leaf_relationship(&south, &config, &region, &remote_bound, announced)?;
+            Ok::<_, zenoh_result::Error>((region, remote_bound))
+        };
+
+        let (region, remote_bound) = check(WhatAmI::Router).unwrap();
+        assert!(region.bound().is_south() && remote_bound.is_north());
+        let e = check(WhatAmI::Client).unwrap_err();
+        assert!(e.to_string().contains("matches gateway.north.uplinks"), "{e}");
+    }
+
+    /// A release build has no assertion to stop a client north face whose remote is not south
+    /// of it: the check is explicit.
+    #[test]
+    fn client_north_face_requires_a_south_remote() {
+        let (config, cloud) = (leaf(), remote(WhatAmI::Router, "c10d"));
+        let e = check_leaf_relationship(
+            &cloud,
+            &config,
+            &Region::North,
+            &Bound::North,
+            WhatAmI::Client,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("does not put this node south"), "{e}");
+    }
+
+    fn link(protocol: &str, interfaces: &[&str]) -> Link {
+        Link {
+            src: format!("{protocol}/127.0.0.1:1").parse().unwrap(),
+            dst: format!("{protocol}/127.0.0.1:2").parse().unwrap(),
+            group: None,
+            mtu: 1500,
+            is_streamed: false,
+            interfaces: interfaces.iter().map(|i| i.to_string()).collect(),
+            auth_identifier: zenoh_link::LinkAuthId::Tcp,
+            priorities: None,
+            reliability: None,
+        }
+    }
+
+    fn with_uplinks(uplinks: &str) -> ExpandedConfig {
+        let mut config = leaf();
+        config.gateway.north = Some(
+            json5::from_str(&format!(r#"{{ mode: "client", uplinks: {uplinks} }}"#)).unwrap(),
+        );
+        config
+    }
+
+    /// An interface filter does not match a link whose interfaces could not be resolved.
+    #[test]
+    fn interface_filter_does_not_match_unresolved_interfaces() {
+        let config = with_uplinks(r#"[{ interfaces: ["wwan0"] }]"#);
+
+        assert_eq!(
+            announced_mode_on(&link("tcp", &["wwan0"]), &config),
+            Some(WhatAmI::Client)
+        );
+        assert_eq!(announced_mode_on(&link("tcp", &["eth0"]), &config), None);
+        assert_eq!(announced_mode_on(&link("tcp", &[]), &config), None);
+        assert_eq!(
+            announced_mode_on(&link("tcp", &["wwan0", "eth0"]), &config),
+            None
+        );
+    }
+
+    /// A filter matches a link iff all its criteria do.
+    #[test]
+    fn uplink_filter_criteria_are_combined() {
+        let config =
+            with_uplinks(r#"[{ link_protocols: ["quic"], interfaces: ["wwan0"] }, { link_protocols: ["tls"] }]"#);
+
+        assert!(announced_mode_on(&link("quic", &["wwan0"]), &config).is_some());
+        assert!(announced_mode_on(&link("quic", &["eth0"]), &config).is_none());
+        assert!(announced_mode_on(&link("quic", &[]), &config).is_none());
+        assert!(announced_mode_on(&link("tls", &[]), &config).is_some());
+        assert!(announced_mode_on(&link("tcp", &["wwan0"]), &config).is_none());
+    }
+
+    /// Without `gateway.north`, no link is announced another mode.
+    #[test]
+    fn nothing_is_an_uplink_without_the_north_section() {
+        let mut config = leaf();
+        config.gateway.north = None;
+
+        assert_eq!(announced_mode_on(&link("quic", &["wwan0"]), &config), None);
+        assert!(!is_leaf(&config));
+        assert!(check_north_config(&config).is_ok());
+    }
+
+    /// The `gateway.north` section is checked when the node starts.
+    #[test]
+    fn north_section_is_checked() {
+        let check = |mode: WhatAmI, north: &str| {
+            let mut config = leaf();
+            config.set_mode(Some(mode)).unwrap();
+            config.gateway.north = Some(json5::from_str(north).unwrap());
+            check_north_config(&config).map_err(|e| e.to_string())
+        };
+        let (router, quic) = (WhatAmI::Router, r#"uplinks: [{ link_protocols: ["quic"] }]"#);
+
+        assert!(check(router, &format!(r#"{{ mode: "client", {quic} }}"#)).is_ok());
+        // `uplinks` omitted or empty does not mean every link
+        let e = check(router, r#"{ mode: "client" }"#).unwrap_err();
+        assert!(e.contains("gateway.north.uplinks is required"), "{e}");
+        let e = check(router, r#"{ mode: "client", uplinks: [] }"#).unwrap_err();
+        assert!(e.contains("gateway.north.uplinks is required"), "{e}");
+        // a filter without a criterion would match every link
+        let e = check(router, r#"{ mode: "client", uplinks: [{}] }"#).unwrap_err();
+        assert!(e.contains("would match every link"), "{e}");
+        // an interest must ask for something
+        let nothing = format!(r#"{{ mode: "client", {quic}, interests: [{{ key_expr: "a/**" }}] }}"#);
+        let e = check(router, &nothing).unwrap_err();
+        assert!(e.contains("asks for nothing"), "{e}");
+        // only a router can be a leaf, and only a leaf has uplinks and interests
+        let e = check(WhatAmI::Peer, &format!(r#"{{ mode: "client", {quic} }}"#)).unwrap_err();
+        assert!(e.contains("only a router"), "{e}");
+        let e = check(router, &format!("{{ {quic} }}")).unwrap_err();
+        assert!(e.contains("only apply to a router"), "{e}");
+        let interests = r#"{ interests: [{ key_expr: "a/**", subscribers: true }] }"#;
+        let e = check(router, interests).unwrap_err();
+        assert!(e.contains("only apply to a router"), "{e}");
+    }
+
+    /// An endpoint is known to be an uplink before it is dialed only when no interface has to be
+    /// resolved for it.
+    #[test]
+    fn uplink_endpoints_are_recognised_without_guessing_interfaces() {
+        let by_protocol = with_uplinks(r#"[{ link_protocols: ["quic"] }]"#);
+        let by_interface = with_uplinks(r#"[{ interfaces: ["wwan0"] }]"#);
+        let endpoint = |e: &str| e.parse::<EndPoint>().unwrap();
+
+        assert!(is_uplink_endpoint(&endpoint("quic/cloud:443"), &by_protocol));
+        assert!(!is_uplink_endpoint(&endpoint("tcp/192.168.1.2:7447"), &by_protocol));
+        assert!(!is_uplink_endpoint(&endpoint("tcp/cloud:443"), &by_interface));
+        assert!(is_uplink_endpoint(&endpoint("tcp/cloud:443#iface=wwan0"), &by_interface));
+        assert!(!is_uplink_endpoint(&endpoint("tcp/cloud:443#iface=eth0"), &by_interface));
+    }
 }
