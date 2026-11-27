@@ -886,11 +886,14 @@ impl TransmissionPipelineProducer {
         } else {
             (0, Priority::DEFAULT)
         };
+        // The congestion flag of the queue: the consumer clears it by queue index when it gives a
+        // batch back, so a single-queue pipeline must use the flag of index 0, not of `priority`.
+        let flag = Priority::try_from(idx as u8).unwrap_or(Priority::DEFAULT);
 
         // If message is droppable, compute a deadline after which the sample could be dropped
         let (wait_time, max_wait_time) = if msg.is_droppable() {
             // Checked if we are blocked on the priority queue and we drop directly the message
-            if self.status.is_congested(priority) {
+            if self.status.is_congested(flag) {
                 return Ok(false);
             }
             (
@@ -911,13 +914,13 @@ impl TransmissionPipelineProducer {
             return Err(TransportClosed);
         }
         // Check again for congestion in case it happens when blocking on the mutex.
-        if msg.is_droppable() && self.status.is_congested(priority) {
+        if msg.is_droppable() && self.status.is_congested(flag) {
             return Ok(false);
         }
         let mut sent = queue.push_network_message(msg, priority, &mut deadline)?;
         // If the message cannot be sent, mark the pipeline as congested.
         if !sent {
-            self.status.set_congested(priority, true);
+            self.status.set_congested(flag, true);
             // During the time between deadline wakeup and setting the congested flag,
             // all batches could have been refilled (especially if there is a single one),
             // so try again with the same already expired deadline.
@@ -927,7 +930,7 @@ impl TransmissionPipelineProducer {
             // so it is not possible that further messages see the congestion flag set
             // after this point.
             if sent {
-                self.status.set_congested(priority, false);
+                self.status.set_congested(flag, false);
             }
             // There is one edge case that is fortunately supported: if the message that
             // has been pushed again is fragmented, we might have some batches actually
@@ -1572,6 +1575,34 @@ mod tests {
         assert!(
             elapsed >= WBC,
             "a Block push should wait its whole wait_before_close ({WBC:?}), waited {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    // A single-queue pipeline (no QoS) takes droppable messages again once its consumer gave a
+    // batch back. The producer used to set the congestion flag of `Priority::DEFAULT` while the
+    // consumer cleared the flag of queue 0: after one congestion drop, every later droppable
+    // message was dropped too, unless a blocking message cleared the flag.
+    #[test]
+    fn single_queue_congestion_clears_on_refill() -> ZResult<()> {
+        let priorities = vec![TransportPriorityTx::make(Bits::from(TransportSn::MAX))?];
+        let (producer, mut consumer) =
+            TransmissionPipeline::make(CONFIG_NOT_STREAMED, &priorities, false);
+        let msg = NetworkMessage::from(Push {
+            wire_expr: "test".into(),
+            ext_qos: ext::QoSType::new(Priority::DEFAULT, CongestionControl::Drop, false),
+            ..Push::from(vec![0_u8; (CONFIG_NOT_STREAMED.batch.mtu / 2) as usize])
+        });
+        assert!(producer.push_network_message(msg.as_ref())?);
+        assert!(
+            !producer.push_network_message(msg.as_ref())?,
+            "the queue is full"
+        );
+        let (batch, prio) = consumer.stage_pull().expect("a batch is ready");
+        consumer.refill(batch, prio);
+        assert!(
+            producer.push_network_message(msg.as_ref())?,
+            "a droppable message was dropped although the consumer gave a batch back"
         );
         Ok(())
     }
