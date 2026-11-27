@@ -29,7 +29,7 @@ use zenoh_protocol::{
     core::{Region, ZenohIdProto},
     network::{
         declare::{queryable::ext::QueryableInfoType, QueryableId, SubscriberId, TokenId},
-        interest::InterestId,
+        interest::{InterestId, InterestOptions},
         Oam,
     },
 };
@@ -60,6 +60,12 @@ mod token;
 
 pub(crate) struct Hat {
     region: Region,
+    /// Interests declared to the north remote on behalf of this node (`gateway.north.interests`).
+    ///
+    /// A router subregion has no interest protocol: its gateway is expected to know the north
+    /// region's entities and to declare them into it. A client hat only learns what it asks for,
+    /// so a leaf router asks for what its subregions may need.
+    uplink_interests: Vec<(Arc<Resource>, InterestOptions)>,
 }
 
 impl Debug for Hat {
@@ -73,7 +79,14 @@ impl Hat {
     pub(crate) fn new(region: Region) -> Self {
         debug_assert!(region.bound().is_north());
 
-        Self { region }
+        Self {
+            region,
+            uplink_interests: Vec::new(),
+        }
+    }
+
+    pub(crate) fn set_uplink_interests(&mut self, interests: Vec<(Arc<Resource>, InterestOptions)>) {
+        self.uplink_interests = interests;
     }
 
     pub(self) fn face_hat<'f>(&self, face_state: &'f Arc<FaceState>) -> &'f HatFace {
@@ -154,6 +167,7 @@ impl HatBaseTrait for Hat {
         debug_assert!(ctx.src_face.region.bound().is_north());
         debug_assert_eq!(self.owned_faces(ctx.tables).count(), 1);
 
+        self.propagate_uplink_interests(ctx.reborrow());
         self.repropagate_interests(ctx.reborrow(), &other_hats);
         self.repropagate_subscribers(ctx.reborrow(), &other_hats);
         self.repropagate_queryables(ctx.reborrow(), &other_hats);

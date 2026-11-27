@@ -123,6 +123,7 @@ impl HatPubSubTrait for Hat {
     /// + `mres.owned_face_ctx.subs` for all matching resources `mres`.
     /// + `mres.owned_face_ctx.subscriber_interest_finalized` for all matching resources `mres`.
     /// + `owned_face.initial_interest_finalized` for all owned faces.
+    /// + `owned_face.local_interests` (finalized ones) for all owned faces.
     #[tracing::instrument(level = "debug", skip(tables, src_region, _node_id), ret)]
     fn compute_data_route(
         &self,
@@ -167,10 +168,13 @@ impl HatPubSubTrait for Hat {
                 .find(|f| f.region.bound().is_north())
             {
                 route.try_insert(face.id, || {
+                    // NOTE(leaf): an interest for a key expression that includes this one is
+                    // as good as one for this very resource (e.g. an uplink interest).
                     let has_interest_finalized = expr
                         .resource()
                         .and_then(|res| res.face_ctxs.get(&face.id))
-                        .is_some_and(|ctx| ctx.subscriber_interest_finalized);
+                        .is_some_and(|ctx| ctx.subscriber_interest_finalized)
+                        || self.has_finalized_interest(face, key_expr, |o| o.subscribers());
                     (!has_interest_finalized).then(|| {
                         tracing::debug!(dst = %face, dst.has_unfinalized_subscriber_interest = true);
                         let wire_expr = expr.get_best_key(face.id);

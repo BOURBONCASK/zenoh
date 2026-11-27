@@ -22,7 +22,10 @@ use zenoh_config::{
     gateway::{GatewayPresetConf, GatewaySouthConf},
     ExpandedConfig,
 };
-use zenoh_protocol::core::{Bound, Region, WhatAmI, ZenohIdProto};
+use zenoh_protocol::{
+    core::{Bound, Region, WhatAmI, ZenohIdProto},
+    network::interest::InterestOptions,
+};
 use zenoh_result::ZResult;
 use zenoh_transport::{multicast::TransportMulticast, unicast::TransportUnicast, TransportPeer};
 
@@ -98,6 +101,10 @@ impl<'conf> GatewayBuilder<'conf> {
 
     pub fn build(self) -> ZResult<Gateway> {
         let mode = self.config.mode();
+        // NOTE(leaf): the mode this node takes in its north region; `gateway.north.mode` lets a
+        // router be a client of its north region while it remains a router for its subregions.
+        let north = self.config.gateway.north.as_ref();
+        let north_mode = north.and_then(|north| north.mode).unwrap_or(mode);
 
         let mut regions = vec![Region::North];
 
@@ -153,7 +160,7 @@ impl<'conf> GatewayBuilder<'conf> {
             .map(|region| -> (Region, Box<dyn HatTrait + Send + Sync>) {
                 (
                     region,
-                    match (region.bound(), region.mode().unwrap_or(mode)) {
+                    match (region.bound(), region.mode().unwrap_or(north_mode)) {
                         (Bound::North, WhatAmI::Client) => Box::new(hat::client::Hat::new(region)),
                         (Bound::South, WhatAmI::Client) => Box::new(hat::broker::Hat::new(region)),
                         (_, WhatAmI::Peer) => Box::new(hat::peer::Hat::new(region)),
@@ -188,9 +195,61 @@ impl<'conf> GatewayBuilder<'conf> {
             stats,
         )?;
 
+        let mut tables = Tables { data, hats };
+
+        // NOTE(leaf): the resources of the uplink interests live as long as the gateway.
+        let uplink_interests = north
+            .map(|north| north.interests.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|interest| {
+                let mut options = InterestOptions::KEYEXPRS;
+                if interest.subscribers {
+                    options += InterestOptions::SUBSCRIBERS;
+                }
+                if interest.queryables {
+                    options += InterestOptions::QUERYABLES;
+                }
+                if interest.tokens {
+                    options += InterestOptions::TOKENS;
+                }
+                if options == InterestOptions::KEYEXPRS {
+                    tracing::warn!(
+                        "gateway.north.interests: '{}' asks for nothing and is ignored",
+                        interest.key_expr
+                    );
+                    return None;
+                }
+                let mut root = tables.data.root_res.clone();
+                let res = match Resource::get_resource(&root, &interest.key_expr)
+                    .filter(|res| res.ctx.is_some())
+                {
+                    Some(res) => res,
+                    None => {
+                        let mut matches = Resource::get_matches(&tables.data, &interest.key_expr);
+                        let mut res =
+                            Resource::make_resource(&mut tables, &mut root, &interest.key_expr);
+                        matches.push(Arc::downgrade(&res));
+                        Resource::match_resource(&tables.data, &mut res, matches);
+                        res
+                    }
+                };
+                Some((res, options))
+            })
+            .collect::<Vec<_>>();
+        if !uplink_interests.is_empty() {
+            match tables.hats[Region::North]
+                .as_any_mut()
+                .downcast_mut::<hat::client::Hat>()
+            {
+                Some(hat) => hat.set_uplink_interests(uplink_interests),
+                None => bail!("gateway.north.interests requires gateway.north.mode to be 'client'"),
+            }
+        }
+
         Ok(Gateway {
             tables: Arc::new(TablesLock {
-                tables: RwLock::new(Tables { data, hats }),
+                tables: RwLock::new(tables),
                 ctrl_lock: Mutex::new(()),
                 queries_lock: RwLock::new(()),
             }),

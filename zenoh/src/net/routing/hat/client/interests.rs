@@ -16,9 +16,12 @@ use std::{
     sync::{atomic::Ordering, Arc},
 };
 
+#[allow(unused_imports)]
+use zenoh_core::polyfill::*;
+use zenoh_keyexpr::keyexpr;
 use zenoh_protocol::network::{
     declare::queryable::ext::QueryableInfoType,
-    interest::{self, InterestId, InterestMode},
+    interest::{self, InterestId, InterestMode, InterestOptions},
     Interest,
 };
 use zenoh_sync::get_mut_unchecked;
@@ -26,7 +29,7 @@ use zenoh_sync::get_mut_unchecked;
 use super::Hat;
 use crate::net::routing::{
     dispatcher::{
-        face::InterestState,
+        face::{FaceState, InterestState},
         interests::{
             CurrentInterest, CurrentInterestCleanup, PendingCurrentInterest, RemoteInterest,
         },
@@ -42,6 +45,58 @@ use crate::net::routing::{
     RoutingContext,
 };
 impl Hat {
+    /// Declares the uplink interests to the new north face.
+    #[tracing::instrument(level = "debug", skip_all, ret)]
+    pub(super) fn propagate_uplink_interests(&self, ctx: DispatcherContext) {
+        for (res, options) in &self.uplink_interests {
+            let id = self
+                .face_hat(ctx.src_face)
+                .next_id
+                .fetch_add(1, Ordering::SeqCst);
+            let face_id = ctx.src_face.id;
+            get_mut_unchecked(ctx.src_face).local_interests.insert(
+                id,
+                InterestState::new(face_id, *options, Some(res.clone()), false),
+            );
+            let wire_expr = Resource::decl_key(res, ctx.src_face);
+            tracing::debug!(dst = %ctx.src_face, expr = res.expr(), %options, "Uplink interest");
+            ctx.src_face
+                .primitives
+                .send_interest(RoutingContext::with_expr(
+                    &mut Interest {
+                        id,
+                        mode: InterestMode::CurrentFuture,
+                        options: *options,
+                        wire_expr: Some(wire_expr),
+                        ext_qos: interest::ext::QoSType::INTEREST,
+                        ext_tstamp: None,
+                        ext_nodeid: interest::ext::NodeIdType::DEFAULT,
+                    },
+                    res.expr().to_string(),
+                ));
+        }
+    }
+
+    /// Returns `true` if a finalized interest of `face` tells that every entity of the north
+    /// remote that matches `key_expr` has been declared to this node: either the interest was
+    /// declared for exactly that resource, or for a key expression that includes it.
+    #[allow(clippy::incompatible_msrv)]
+    pub(super) fn has_finalized_interest(
+        &self,
+        face: &FaceState,
+        key_expr: &keyexpr,
+        asks_for: impl Fn(&InterestOptions) -> bool,
+    ) -> bool {
+        face.local_interests.values().any(|interest| {
+            interest.finalized
+                && asks_for(&interest.options)
+                && interest.res.as_ref().is_none_or(|res| {
+                    res.keyexpr()
+                        .is_some_and(|interest_ke| interest_ke.includes(key_expr))
+                })
+        })
+    }
+
     #[tracing::instrument(level = "debug", skip_all, ret)]
     pub(super) fn repropagate_interests(
         &self,

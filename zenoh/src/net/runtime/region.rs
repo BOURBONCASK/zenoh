@@ -19,6 +19,7 @@ use zenoh_config::{
 use zenoh_core::polyfill::*;
 use zenoh_protocol::core::{Bound, Region};
 use zenoh_result::ZResult;
+use zenoh_link::Link;
 use zenoh_transport::TransportPeer;
 
 /// Computes the _transient_ [`Bound`] of a remote.
@@ -83,6 +84,100 @@ pub(crate) fn compute_region_of(
         (Some(Bound::North), Some(Bound::South)) | (Some(Bound::South), Some(Bound::North)) => {
             Ok((transient_region.unwrap(), *transient_remote_bound.unwrap()))
         }
+    }
+}
+
+/// The mode this node takes in its north region: `gateway.north.mode`, or its own mode.
+pub(crate) fn north_mode(config: &ExpandedConfig) -> WhatAmI {
+    config
+        .gateway
+        .north
+        .as_ref()
+        .and_then(|north| north.mode)
+        .unwrap_or(config.mode())
+}
+
+/// Returns `true` if this node is a leaf of its north region, i.e. takes another mode there
+/// than its own.
+pub(crate) fn is_leaf(config: &ExpandedConfig) -> bool {
+    north_mode(config) != config.mode()
+}
+
+/// Checks the `gateway.north` section against the mode of the node.
+pub(crate) fn check_north_config(config: &ExpandedConfig) -> ZResult<()> {
+    if let Some(north) = &config.gateway.north {
+        if is_leaf(config) && !(config.mode().is_router() && north_mode(config).is_client()) {
+            bail!(
+                "gateway.north.mode '{}' is not supported in '{}' mode: only a router can be a \
+                 client of its north region",
+                north_mode(config),
+                config.mode()
+            )
+        }
+        if !is_leaf(config) && !north.interests.is_empty() {
+            bail!("gateway.north.interests requires gateway.north.mode to be 'client'")
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` if `link` is an uplink according to `gateway.north.uplinks`.
+#[allow(clippy::incompatible_msrv)]
+fn is_uplink(link: &Link, config: &ExpandedConfig) -> bool {
+    let Some(north) = &config.gateway.north else {
+        return false;
+    };
+    north.uplinks.as_ref().is_none_or(|filters| {
+        filters.iter().any(|filter| {
+            filter.link_protocols.as_ref().is_none_or(|protocols| {
+                protocols
+                    .iter()
+                    .any(|p| p.as_str() == link.dst.protocol().as_str())
+            }) && filter.interfaces.as_ref().is_none_or(|ifaces| {
+                link.interfaces
+                    .iter()
+                    .all(|iface| ifaces.contains(&Interface(iface.to_owned())))
+            })
+        })
+    })
+}
+
+/// The mode this node announces on `link` when it differs from its own: a leaf announces its
+/// north mode on its uplinks. The mode is sent before the remote is known, hence the decision
+/// only looks at the link.
+pub(crate) fn announced_mode_on(link: &Link, config: &ExpandedConfig) -> Option<WhatAmI> {
+    (is_leaf(config) && is_uplink(link, config)).then(|| north_mode(config))
+}
+
+/// Refuses a remote of a leaf whose region disagrees with the mode announced on its links: a
+/// north remote that was told this node is a router would handle it as one, and a south remote
+/// that was told it is a client would not exchange link state with it.
+pub(crate) fn check_announced_mode(
+    peer: &TransportPeer,
+    config: &ExpandedConfig,
+    region: &Region,
+) -> ZResult<()> {
+    if !is_leaf(config) {
+        return Ok(());
+    }
+    let over_uplink = !peer.links.is_empty() && peer.links.iter().all(|l| is_uplink(l, config));
+    match (region.bound(), over_uplink) {
+        (Bound::North, true) | (Bound::South, false) => Ok(()),
+        (Bound::North, false) => bail!(
+            "Remote {} is in the north region of this leaf but none of gateway.north.uplinks \
+             matches its link(s): it was announced the '{}' mode instead of '{}'",
+            peer.zid,
+            config.mode(),
+            north_mode(config)
+        ),
+        (Bound::South, true) => bail!(
+            "Remote {} is in the south region {} of this leaf but its link(s) match \
+             gateway.north.uplinks: it was announced the '{}' mode instead of '{}'",
+            peer.zid,
+            region,
+            north_mode(config),
+            config.mode()
+        ),
     }
 }
 

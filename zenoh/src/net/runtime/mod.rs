@@ -746,6 +746,7 @@ impl RuntimeBuilder {
         tracing::info!("Using ZID: {}", zid);
 
         let whatami = config.mode();
+        region::check_north_config(&config)?;
 
         #[cfg(feature = "stats")]
         let stats = zenoh_stats::StatsRegistry::new(zid, whatami, &*crate::LONG_VERSION);
@@ -787,6 +788,13 @@ impl RuntimeBuilder {
                 let config = config.clone();
                 move |p| region::compute_transient_bound_of(&p, &config)
             });
+        let transport_manager_builder = if region::is_leaf(&config) {
+            let config = config.clone();
+            transport_manager_builder
+                .link_whatami_callback(move |link| region::announced_mode_on(link, &config))
+        } else {
+            transport_manager_builder
+        };
 
         #[cfg(feature = "shared-memory")]
         let transport_manager_builder =
@@ -1133,8 +1141,14 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     })
                 }
 
+                region::check_announced_mode(&peer, &config, &region)?;
+
+                // NOTE(leaf): a leaf router reconnects as soon as a link is deleted, which is
+                // before its transport is closed. The client hat has a single north face, so the
+                // new north remote is refused until the previous one is gone; the connector
+                // retries.
                 if region.bound().is_north()
-                    && runtime.whatami() == WhatAmI::Client
+                    && region::north_mode(&config) == WhatAmI::Client
                     && north_bound_transport_peer_count(runtime, &peer) > 0
                 {
                     bail!("Client runtimes only accept one north-bound transport");
