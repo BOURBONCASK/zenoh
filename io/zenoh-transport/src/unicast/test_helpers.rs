@@ -13,7 +13,7 @@
 //
 use std::{
     fmt::{self, DebugStruct},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -23,7 +23,7 @@ use zenoh_core::zcondfeat;
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::{Bound, RegionName, WhatAmI, ZenohIdProto},
-    network::{NetworkBody, NetworkBodyMut, NetworkMessage, NetworkMessageMut},
+    network::{NetworkBody, NetworkBodyMut, NetworkMessage, NetworkMessageMut, RequestId},
     transport::TransportSn,
 };
 use zenoh_result::ZResult;
@@ -33,7 +33,7 @@ use crate::{
         authentication::TransportAuthId,
         link::LinkUnicastWithOpenAck,
         transport_unicast_inner::{AddLinkResult, TransportStatus, TransportUnicastTrait},
-        TransportConfigUnicast, TransportManagerBuilderUnicast, TransportUnicast,
+        RequestLifetime, TransportConfigUnicast, TransportManagerBuilderUnicast, TransportUnicast,
     },
     TransportManager, TransportPeerEventHandler,
 };
@@ -48,6 +48,14 @@ pub struct MockTransportUnicastInner {
     zid: ZenohIdProto,
     whatami: WhatAmI,
     on_schedule: Arc<dyn Fn(NetworkMessage) + Send + Sync>,
+    request_lifetimes: Mutex<Vec<(RequestId, RequestLifetime)>>,
+}
+
+impl MockTransportUnicastInner {
+    /// The queries scheduled with the end of their routing branch, in order.
+    pub fn request_lifetimes(&self) -> Vec<(RequestId, RequestLifetime)> {
+        self.request_lifetimes.lock().unwrap().clone()
+    }
 }
 
 impl fmt::Debug for MockTransportUnicastInner {
@@ -140,6 +148,20 @@ impl TransportUnicastTrait for MockTransportUnicastInner {
         Ok(true)
     }
 
+    fn schedule_request(
+        &self,
+        msg: NetworkMessageMut,
+        lifetime: &RequestLifetime,
+    ) -> ZResult<bool> {
+        if let NetworkBodyMut::Request(request) = &msg.body {
+            self.request_lifetimes
+                .lock()
+                .unwrap()
+                .push((request.id, lifetime.clone()));
+        }
+        self.schedule(msg)
+    }
+
     async fn close(&self, _reason: u8) -> ZResult<()> {
         Ok(())
     }
@@ -174,6 +196,7 @@ pub fn mock_transport_unicast(
         zid,
         whatami,
         on_schedule,
+        request_lifetimes: Mutex::new(Vec::new()),
     });
     let erased: Arc<dyn TransportUnicastTrait> = inner.clone();
     let transport = TransportUnicast::from(&erased);
