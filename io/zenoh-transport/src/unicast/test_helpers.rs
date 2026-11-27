@@ -76,6 +76,10 @@ impl TransportUnicastTrait for MockTransportUnicastInner {
         self.whatami
     }
 
+    fn get_local_whatami(&self) -> WhatAmI {
+        unimplemented!("MockTransportUnicastInner::get_local_whatami")
+    }
+
     fn get_callback(&self) -> Option<Arc<dyn TransportPeerEventHandler>> {
         unimplemented!("MockTransportUnicastInner::get_callback")
     }

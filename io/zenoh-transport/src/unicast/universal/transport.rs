@@ -408,6 +408,10 @@ impl TransportUnicastTrait for TransportUnicastUniversal {
         self.config.bound
     }
 
+    fn get_local_whatami(&self) -> WhatAmI {
+        self.config.local_whatami
+    }
+
     fn get_callback(&self) -> Option<Arc<dyn TransportPeerEventHandler>> {
         self.callback.get().cloned()
     }

@@ -67,7 +67,7 @@ fn duration_from_i64us(us: i64) -> Duration {
 }
 
 pub type RemoteBoundCallback = Arc<dyn Fn(TransportPeer) -> ZResult<Option<Bound>> + Send + Sync>;
-/// Chooses the mode announced on a link during establishment. `None` means the mode of the node.
+/// Chooses the mode announced on a link this node opens. `None` means the mode of the node.
 pub type LinkWhatAmICallback = Arc<dyn Fn(&Link) -> Option<WhatAmI> + Send + Sync>;
 
 /// # Examples
@@ -149,12 +149,13 @@ pub struct TransportManagerConfig {
 }
 
 impl TransportManagerConfig {
-    /// The mode this node announces on `link` during establishment.
-    pub(crate) fn whatami_on(&self, link: &Link) -> WhatAmI {
-        self.link_whatami_callback
-            .as_ref()
-            .and_then(|callback| callback(link))
-            .unwrap_or(self.whatami)
+    /// The mode this node announces on a link it opens. `link` is only called, and the
+    /// [`Link`] only built, when a callback is installed.
+    pub(crate) fn whatami_on(&self, link: impl FnOnce() -> Link) -> WhatAmI {
+        match &self.link_whatami_callback {
+            Some(callback) => callback(&link()).unwrap_or(self.whatami),
+            None => self.whatami,
+        }
     }
 }
 
@@ -425,8 +426,9 @@ impl TransportManagerBuilder {
         self
     }
 
-    /// Sets the callback that chooses the mode announced on each link. Without it, or when it
-    /// returns `None`, the mode of the node is announced.
+    /// Sets the callback that chooses the mode announced on each link this node opens. Without
+    /// it, or when it returns `None`, the mode of the node is announced. The mode of the node is
+    /// always announced on the links this node accepts.
     pub fn link_whatami_callback(
         mut self,
         callback: impl Fn(&Link) -> Option<WhatAmI> + Send + Sync + 'static,
@@ -799,5 +801,31 @@ impl TransportManager {
         let mut lsm = zenoh_runtime::ZRuntime::Net.block_in_place(self.get_locators_multicast());
         lsu.append(&mut lsm);
         lsu
+    }
+}
+
+#[cfg(all(test, feature = "test"))]
+mod tests {
+    use std::sync::Arc;
+
+    use zenoh_protocol::core::WhatAmI;
+
+    use super::TransportManager;
+    use crate::DummyTransportEventHandler;
+
+    /// Without a per-link mode callback, establishment announces the mode of the node and does
+    /// not build the description of the link (which resolves its network interfaces).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn mode_of_the_node_is_announced_without_building_the_link() {
+        let manager = TransportManager::builder()
+            .whatami(WhatAmI::Router)
+            .build_test(Arc::new(DummyTransportEventHandler))
+            .unwrap();
+
+        let announced = manager
+            .config
+            .whatami_on(|| panic!("no callback is installed: the link must not be built"));
+
+        assert_eq!(announced, WhatAmI::Router);
     }
 }

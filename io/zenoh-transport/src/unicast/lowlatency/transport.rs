@@ -233,6 +233,10 @@ impl TransportUnicastTrait for TransportUnicastLowlatency {
         self.config.bound
     }
 
+    fn get_local_whatami(&self) -> WhatAmI {
+        self.config.local_whatami
+    }
+
     fn get_callback(&self) -> Option<Arc<dyn TransportPeerEventHandler>> {
         zread!(self.callback).clone()
     }
