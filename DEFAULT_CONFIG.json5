@@ -386,6 +386,30 @@
   /// With several endpoints that lead north, an endpoint that can only be an uplink (a filter
   /// selects its protocol without `interfaces`, or selects the `iface` it is bound to) is not
   /// dialed while another remote owns the north region.
+  /// When the next north remote takes over, everything the previous one declared is withdrawn,
+  /// and what that remote still sends on its old transport is dropped: declarations, interests,
+  /// publications, queries and replies alike. A message of the previous remote that is being
+  /// routed at that moment is routed to its end first; the take-over waits for that one
+  /// message, not for the transport.
+  ///
+  /// Limits of a leaf uplink:
+  ///   - One north remote at a time, with one link: the hand-over is defined, and tested, for
+  ///     an uplink that has a single link to its remote (`transport/unicast/max_links: 1`, the
+  ///     default).
+  ///   - The early take-over is for a remote with another Zenoh ID. A remote that comes back
+  ///     with the same Zenoh ID while the transport of its previous connection is still being
+  ///     cleaned up is admitted when that clean-up has ended, however long it takes: a node
+  ///     holds one transport per Zenoh ID. A router that restarts without a configured `id`
+  ///     comes back with a new one.
+  ///   - A default route goes to the gateway with the greatest Zenoh ID, whether or not it has
+  ///     an uplink (see above).
+  ///   - The north remote sees a leaf as a client, not as a router: the leaf is not in its
+  ///     link-state graph nor among its routers, and whatever identifies routers by their mode
+  ///     on that side (a consumer of its admin space, a plugin that reports the routers
+  ///     connected to it) must be told to accept clients before it sees a leaf.
+  ///   - A binary that does not know `gateway.north` does not start on a configuration that
+  ///     has it (`unknown field north`): a fallback binary of an earlier version needs its own
+  ///     configuration file, without that section.
   gateway: {
     /// The `auto` preset mode puts peers and clients south of routers and client south of peers.
     /// This is the only available preset.
