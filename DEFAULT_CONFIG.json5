@@ -280,17 +280,21 @@
   ///     role of a client towards its north remote: no link state is exchanged with it, and it
   ///     only receives the declarations it asks for. It remains a router for its south
   ///     subregions. A leaf has one north remote at a time.
-  ///   - `uplinks`: which links are uplinks, as an array of filters with the optional keys
-  ///     `link_protocols` and `interfaces`. The mode is announced before the remote is known, so
-  ///     only properties of the link can be used. If unset, every link is an uplink. A remote
-  ///     that ends up in the north region over a link that is not an uplink (or in a south
-  ///     subregion over an uplink) is refused.
+  ///   - `uplinks` (required): which of the links this router opens are uplinks, as an array of
+  ///     filters with the keys `link_protocols` and `interfaces` (at least one per filter). A
+  ///     link is an uplink iff it matches all the keys of one filter. No link is an uplink by
+  ///     default, a link this router accepts never is, and a link whose interfaces cannot be
+  ///     resolved matches no `interfaces` filter. The mode is announced before the remote is
+  ///     known, so only properties of the link can be used. A remote that ends up in the north
+  ///     region over a link that is not an uplink, or in a south subregion over an uplink, is
+  ///     refused (logged at warn level at each attempt).
   ///   - `interests`: what the router asks its north remote for, each time an uplink is
   ///     established, on behalf of its south router subregions: `key_expr` and any of
   ///     `subscribers`, `queryables`, `tokens`. Only the declarations whose key expression
-  ///     intersects `key_expr` are received. Publications and queries on keys included in a
-  ///     `key_expr` are then only sent to the uplink when a matching subscriber or queryable was
-  ///     received.
+  ///     intersects `key_expr` are received. These interests live as long as the uplink.
+  ///     An interest that asks for tokens is checked by the access control as
+  ///     `declare_liveliness_subscriber` on its `key_expr`, and an interest is denied as a whole:
+  ///     ask for tokens in separate entries if the access control only allows some keys.
   /// Example:
   ///   north: {
   ///     mode: "client",
@@ -300,6 +304,36 @@
   ///       { key_expr: "robot1/alive/**", tokens: true },
   ///     ],
   ///   }
+  ///
+  /// The north remote must put the leaf in one of its south regions: a router does so with the
+  /// `auto` preset, or with a custom `south` entry that matches clients. Any other remote is
+  /// refused with an error.
+  ///
+  /// What is sent to the uplink: what the north remote declared a matching subscriber or
+  /// queryable for. In addition, a publication or a query for which it declared none is sent
+  ///   - if no interest includes its key and asks for subscribers (resp. queryables): the router
+  ///     does not know what the north has for such a key;
+  ///   - while an interest that includes its key is `pending`, which is bounded by
+  ///     `routing/interests/timeout` (10 s by default).
+  /// Once such an interest is `finalized`, `unanswered` or `denied`, it is not sent.
+  ///
+  /// State of the uplink, in the admin space at `@/<zid>/router/uplink` (JSON):
+  ///   - `state`: `connected`, `closing` (the uplink lost its link, the next north remote is
+  ///     admitted without waiting for its transport to close) or `disconnected`; `remote`: the
+  ///     Zenoh ID of the north remote. Logged at info level: `Uplink: <zid> admitted ...`,
+  ///     `... lost its last link`, `... takes over from ...`, `... closed`. A remote that is
+  ///     refused is logged at warn level with the reason.
+  ///   - `interests[].state`:
+  ///       `pending`: sent, not answered yet;
+  ///       `finalized`: the north remote declared everything that matches. A remote whose access
+  ///         control denies the interest also answers this way, with no declaration: this
+  ///         cannot be told apart from the leaf;
+  ///       `denied`: not sent, the access control of this router denies it on egress (error log);
+  ///       `unanswered`: no answer within `routing/interests/timeout` (error log);
+  ///       `none`: there is no north remote.
+  /// With several endpoints that lead north, an endpoint that can only be an uplink (a filter
+  /// selects its protocol without `interfaces`, or selects the `iface` it is bound to) is not
+  /// dialed while another remote owns the north region.
   gateway: {
     /// The `auto` preset mode puts peers and clients south of routers and client south of peers.
     /// This is the only available preset.
