@@ -128,6 +128,10 @@ pub(crate) struct TablesData {
     pub(crate) drop_future_timestamp: bool,
     pub(crate) queries_default_timeout: Duration,
     pub(crate) interests_timeout: Duration,
+    /// A rule of the configuration selects links whose messages are handed over to a sender
+    /// (`transport/link/tx/queue/handover`). A query is then routed with what such a sender
+    /// needs to end it; without a rule it is routed as it always was.
+    pub(crate) handover: bool,
 
     pub(crate) root_res: Arc<Resource>,
 
@@ -199,6 +203,14 @@ impl TablesData {
             drop_future_timestamp,
             queries_default_timeout,
             interests_timeout,
+            handover: !config
+                .transport()
+                .link()
+                .tx()
+                .queue()
+                .handover()
+                .links()
+                .is_empty(),
             root_res: Resource::root(),
             interceptors: interceptor_factories(config)?,
             next_interceptor_version: AtomicUsize::new(0),

@@ -25,7 +25,10 @@ use zenoh_protocol::{
         Push, Request, Response, ResponseFinal,
     },
 };
-use zenoh_transport::{multicast::TransportMulticast, unicast::TransportUnicast};
+use zenoh_transport::{
+    multicast::TransportMulticast,
+    unicast::{RequestLifetime, TransportUnicast},
+};
 
 use super::{EPrimitives, Primitives};
 use crate::net::routing::{
@@ -184,25 +187,11 @@ impl EPrimitives for Mux {
     }
 
     fn send_request(&self, msg: &mut Request) -> bool {
-        let qos = msg.ext_qos;
-        let request_id = msg.id;
-        let mut msg = NetworkMessageMut {
-            body: NetworkBodyMut::Request(msg),
-            reliability: Reliability::Reliable,
-        };
-        if self.can_schedule(&mut msg) {
-            self.handler.schedule(msg).unwrap_or(false)
-        } else {
-            match self.face.get().and_then(|f| f.upgrade()) {
-                Some(face) => face.send_response_final(&mut ResponseFinal {
-                    rid: request_id,
-                    ext_qos: qos,
-                    ext_tstamp: None,
-                }),
-                None => tracing::error!("Uninitialized multiplexer!"),
-            }
-            false
-        }
+        self.schedule_request(msg, None)
+    }
+
+    fn send_routed_request(&self, msg: &mut Request, lifetime: &RequestLifetime) -> bool {
+        self.schedule_request(msg, Some(lifetime))
     }
 
     fn send_response(&self, msg: &mut Response) -> bool {
@@ -223,6 +212,34 @@ impl EPrimitives for Mux {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+impl Mux {
+    fn schedule_request(&self, msg: &mut Request, lifetime: Option<&RequestLifetime>) -> bool {
+        let qos = msg.ext_qos;
+        let request_id = msg.id;
+        let mut msg = NetworkMessageMut {
+            body: NetworkBodyMut::Request(msg),
+            reliability: Reliability::Reliable,
+        };
+        if self.can_schedule(&mut msg) {
+            match lifetime {
+                Some(lifetime) => self.handler.schedule_request(msg, lifetime),
+                None => self.handler.schedule(msg),
+            }
+            .unwrap_or(false)
+        } else {
+            match self.face.get().and_then(|f| f.upgrade()) {
+                Some(face) => face.send_response_final(&mut ResponseFinal {
+                    rid: request_id,
+                    ext_qos: qos,
+                    ext_tstamp: None,
+                }),
+                None => tracing::error!("Uninitialized multiplexer!"),
+            }
+            false
+        }
     }
 }
 

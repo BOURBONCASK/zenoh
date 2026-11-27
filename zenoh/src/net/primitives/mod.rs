@@ -22,6 +22,7 @@ use zenoh_protocol::{
     core::Reliability,
     network::{interest::Interest, Declare, Push, Request, Response, ResponseFinal},
 };
+use zenoh_transport::unicast::RequestLifetime;
 
 use super::routing::RoutingContext;
 
@@ -59,6 +60,13 @@ pub(crate) trait EPrimitives: Send + Sync {
     fn send_push(&self, msg: &mut Push, reliability: Reliability) -> bool;
 
     fn send_request(&self, msg: &mut Request) -> bool;
+
+    /// [`EPrimitives::send_request`] for a query that routing forwards: `lifetime` says when
+    /// its routing branch ends and identifies the branch. A transport that owns its messages
+    /// does not start the query after that, and tells when it did not send it.
+    fn send_routed_request(&self, msg: &mut Request, _lifetime: &RequestLifetime) -> bool {
+        self.send_request(msg)
+    }
 
     fn send_response(&self, msg: &mut Response) -> bool;
 

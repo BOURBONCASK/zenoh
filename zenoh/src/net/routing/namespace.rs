@@ -275,6 +275,15 @@ impl EPrimitives for ENamespace {
         self.handle_namespace_ingress(&mut msg.wire_expr, None) && self.primitives.send_request(msg)
     }
 
+    fn send_routed_request(
+        &self,
+        msg: &mut Request,
+        lifetime: &zenoh_transport::unicast::RequestLifetime,
+    ) -> bool {
+        self.handle_namespace_ingress(&mut msg.wire_expr, None)
+            && self.primitives.send_routed_request(msg, lifetime)
+    }
+
     fn send_response(&self, msg: &mut Response) -> bool {
         self.handle_namespace_ingress(&mut msg.wire_expr, None)
             && self.primitives.send_response(msg)
