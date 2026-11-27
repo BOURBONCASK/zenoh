@@ -1222,6 +1222,25 @@ impl EstablishedConnection {
         })
     }
 
+    /// Forward the pending messages **from B to A** for which `keep` is true, and drop the
+    /// others. Returns the number of dropped messages.
+    pub(crate) fn rev_fwd_if(&mut self, keep: impl Fn(&Message) -> bool) -> usize {
+        self.b2a.recorder().with_messages(|msgs| {
+            let mut dropped = 0;
+
+            while let Some(msg) = msgs.get(self.rev_nfwd) {
+                if keep(msg) {
+                    Self::inject(&self.a2b, msg);
+                } else {
+                    dropped += 1;
+                }
+                self.rev_nfwd += 1;
+            }
+
+            dropped
+        })
+    }
+
     /// Forward one pending message in the reverse direction, i.e. **from B to A**.
     pub(crate) fn rev_fwd(&mut self) -> Vec<Message> {
         self.b2a.recorder().with_messages(|msgs| {

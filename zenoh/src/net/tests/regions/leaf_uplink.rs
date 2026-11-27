@@ -52,7 +52,10 @@ use super::{
 };
 use crate::net::{
     primitives::Primitives,
-    routing::hat::client::{Hat as ClientHat, UplinkInterestState},
+    routing::hat::{
+        client::{Hat as ClientHat, UplinkInterestState},
+        router::Hat as RouterHat,
+    },
 };
 
 /// On a bridge: the subregion of its south router.
@@ -1473,21 +1476,145 @@ fn local_publications_are_not_pulled_towards_the_uplink() {
     assert_eq!(a_sent(&r1.tether).pushes, Vec::<String>::new());
 }
 
-/// A key of the robot is still sent north while its configured interest is pending: the default
-/// route does not change what the bridge does with the keys of its interests.
+/// The default gateway that the north hat of a router reaches, if it has one.
+fn default_gateway(router: &Harness) -> Option<String> {
+    let tables = router.gateway.tables.tables.read().unwrap();
+    tables.hats[Region::North]
+        .as_any()
+        .downcast_ref::<RouterHat>()
+        .expect("the north hat of a south router is the router hat")
+        .reachable_default_gateway()
+        .map(|zid| zid.to_string())
+}
+
+/// With a default route, a key of the robot never goes north without a declared destination,
+/// whatever the state of the interest that includes it: pending on a first connection and on
+/// a reconnection, then unanswered. That holds for a stream of the south router that a
+/// subscriber of the bridge pulls to the bridge, for a session of the bridge and for a query.
+/// The keys of the other robots keep going north, and a subscriber that the cloud declares is
+/// served as soon as it is declared, before the interest is finalized.
 #[test]
-fn the_default_route_leaves_the_keys_of_a_pending_interest_alone() {
+fn local_keys_do_not_go_north_while_their_interest_is_pending() {
     try_init_tracing_subscriber();
     let c = cloud();
-    let r1 = robot_with_default_route(R1);
+    let phone = client(&c, CLIENTS);
+    let (camera, foreign) = (format!("{R1}/app/camera"), format!("{R2}/app/control"));
+    phone.declare_subscriber(None, 1, camera.clone());
+    let mut r1 = Robot::with(
+        leaf_bridge_with_default_route(R1)
+            .config(
+                "routing/interests/timeout",
+                &DEADLINE.as_millis().to_string(),
+            )
+            .build(),
+        south_router_with_default_route(R1),
+    );
     let local = r1.bridge.new_session();
-    // not forwarded: the cloud has not received the interests yet
-    let up1 = leaf_uplink(&r1.bridge, &c);
+    // a recorder on the bridge: the south router sends it the stream of the application
+    local.declare_subscriber(None, 1, format!("{R1}/app/**"));
+    r1.tether.bi_fwd();
 
-    local.put(format!("{R1}/app/camera"), vec![1]);
-    local.put("rt/camera", vec![2]);
+    let mut round = 0;
+    let mut local_traffic = |r1: &mut Robot| {
+        round += 1;
+        r1.app.put(camera.clone(), vec![1]);
+        local.put(format!("{R1}/app/state"), vec![2]);
+        r1.app.query(round, format!("{R1}/app/srv"));
+        local.query(round, format!("{R1}/app/srv"));
+        r1.app.put(foreign.clone(), vec![3]);
+        r1.tether.bi_fwd();
+        // the recorder got the stream, and both queries ended without a reply
+        assert_eq!(
+            seen(&local).pushes.iter().filter(|k| **k == camera).count(),
+            round as usize
+        );
+        assert_eq!(seen(&r1.app).response_finals, round as usize);
+        assert_eq!(seen(&local).response_finals, round as usize);
+    };
 
-    assert_eq!(a_sent(&up1).pushes, [format!("{R1}/app/camera")]);
+    // a connection, then a reconnection: the interest is pending, the cloud has not got it
+    for _ in 0..2 {
+        let up = leaf_uplink(&r1.bridge, &c);
+        assert_eq!(
+            interest_states(&r1.bridge),
+            [Some(UplinkInterestState::Pending)]
+        );
+        local_traffic(&mut r1);
+        assert_eq!(a_sent(&up).pushes, std::slice::from_ref(&foreign));
+        assert_eq!(a_sent(&up).requests, vec![]);
+        up.disconnect();
+    }
+
+    // unanswered
+    let up = leaf_uplink(&r1.bridge, &c);
+    wait_for_the_deadline(&r1.bridge, &[Some(UplinkInterestState::Unanswered)]);
+    local_traffic(&mut r1);
+    assert_eq!(a_sent(&up).pushes, std::slice::from_ref(&foreign));
+    assert_eq!(a_sent(&up).requests, vec![]);
+    up.disconnect();
+
+    // the cloud declares its subscriber and the final is still on its way: the declared
+    // subscriber is served, the rest of the robot's keys still stays south
+    let mut up = leaf_uplink(&r1.bridge, &c);
+    up.fwd();
+    let held = up.rev_fwd_if(|msg| {
+        !matches!(msg, Message::Declare(declare) if matches!(declare.body, DeclareBody::DeclareFinal(_)))
+    });
+    assert_eq!(held, 1);
+    assert_eq!(
+        interest_states(&r1.bridge),
+        [Some(UplinkInterestState::Pending)]
+    );
+    r1.tether.bi_fwd();
+    local_traffic(&mut r1);
+    up.fwd();
+    let mut north = a_sent(&up).pushes;
+    north.sort();
+    assert_eq!(north, [camera.clone(), foreign.clone()]);
+    assert_eq!(a_sent(&up).requests, vec![]);
+    assert_eq!(seen(&phone).pushes, [camera]);
+}
+
+/// Wildcard publications. One that is inside the keys of the fleet and wider than the robot is
+/// delivered to the subscribers of the robot and sent north whole, once: the other robot gets it
+/// and the cloud does not send it back. One that only covers keys of the robot stays on the
+/// robot. One that is wider than the keys of the fleet is not eligible: it only reaches the
+/// declared subscribers.
+#[test]
+fn a_wildcard_publication_inside_the_fleet_keys_reaches_local_and_remote_subscribers() {
+    try_init_tracing_subscriber();
+    let c = cloud();
+    let (mut r1, mut r2) = (robot_with_default_route(R1), Robot::new(leaf_bridge(R2)));
+    let neighbour = app(&r1.south);
+    let mut up1 = leaf_uplink(&r1.bridge, &c);
+    let mut up2 = leaf_uplink(&r2.bridge, &c);
+    neighbour.declare_subscriber(None, 1, format!("{R1}/app/status"));
+    r2.app
+        .declare_subscriber(None, 1, format!("{R2}/app/status"));
+    settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
+
+    // inside the keys of the fleet, the robot's own and the others'
+    r1.app.put("*/app/status", vec![1]);
+    settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
+    assert_eq!(seen(&neighbour).pushes, ["*/app/status"]);
+    assert_eq!(seen(&r2.app).pushes, ["*/app/status"]);
+    assert_eq!(a_sent(&up1).pushes, ["*/app/status"]);
+    assert_eq!(b_sent(&up1).pushes, Vec::<String>::new());
+
+    // only keys of the robot
+    r1.app.put(format!("{R1}/app/*"), vec![2]);
+    settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
+    assert_eq!(seen(&neighbour).pushes.len(), 2);
+    assert_eq!(b_sent(&r1.tether).pushes.len(), 1);
+
+    // wider than the keys of the fleet
+    r1.app.put("**", vec![3]);
+    r1.app.put("*/**", vec![4]);
+    settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
+    assert_eq!(seen(&neighbour).pushes.len(), 4);
+    assert_eq!(b_sent(&r1.tether).pushes.len(), 1);
+    assert_eq!(a_sent(&up1).pushes.len(), 1);
+    assert_eq!(seen(&r2.app).pushes.len(), 1);
 }
 
 /// Wildcard queries. One that is inside the keys of the fleet and wider than the robot reaches
@@ -1529,6 +1656,14 @@ fn a_wildcard_query_inside_the_fleet_keys_reaches_local_and_remote_queryables() 
     assert_eq!(seen(&neighbour).requests.len(), 3);
     assert_eq!(seen(&r2.app).requests.len(), 1);
     assert_eq!(b_sent(&r1.tether).requests.len(), 1);
+
+    // only keys of the robot: excluded
+    r1.app.query(6, format!("{R1}/app/*"));
+    settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
+    assert_eq!(seen(&neighbour).requests.len(), 4);
+    assert_eq!(seen(&r2.app).requests.len(), 1);
+    assert_eq!(b_sent(&r1.tether).requests.len(), 1);
+    assert_eq!(a_sent(&up1).requests.len(), 1);
 }
 
 /// A publication that comes down from the gateway does not take the default route back, even
@@ -1587,10 +1722,14 @@ fn the_default_route_follows_the_gateway() {
     r1.app.put(key.clone(), vec![1]);
     settle(&mut [&mut r1.tether, &mut up1]);
     assert_eq!(a_sent(&up1).pushes.len(), 1);
+    // what the south router reports as its default gateway
+    let bridge = Some(r1.bridge.zid().to_string());
+    assert_eq!(default_gateway(&r1.south), bridge);
 
     r1.tether.disconnect();
     r1.app.put(key.clone(), vec![2]);
     assert_eq!(b_sent(&r1.tether).pushes.len(), 1);
+    assert_eq!(default_gateway(&r1.south), None);
 
     let mut again = tether(&r1.bridge, &r1.south);
     settle(&mut [&mut again, &mut up1]);
@@ -1598,6 +1737,69 @@ fn the_default_route_follows_the_gateway() {
     settle(&mut [&mut again, &mut up1]);
     assert_eq!(b_sent(&again).pushes, [key]);
     assert_eq!(a_sent(&up1).pushes.len(), 2);
+    assert_eq!(default_gateway(&r1.south), bridge);
+}
+
+/// The default gateway is chosen by its ZID, not by what it can reach. Two gateways in the
+/// region of the south router, and only the one with the smallest ZID has an uplink:
+/// publications and queries for another robot go to the other one and end there. They take the
+/// gateway with the uplink while the greatest one is away, and go back to the greatest one
+/// when it returns, also on keys whose routes were already computed.
+#[test]
+fn the_default_gateway_is_the_greatest_one_even_without_an_uplink() {
+    try_init_tracing_subscriber();
+    let c = cloud();
+    let phone = client(&c, CLIENTS);
+    let key = format!("{R2}/app/control");
+    phone.declare_subscriber(None, 1, key.clone());
+    phone.declare_queryable(None, 2, key.clone(), complete());
+    let low = leaf_bridge_with_default_route(R1)
+        .zid("b1".parse().unwrap())
+        .build();
+    let high = leaf_bridge_with_default_route(R1)
+        .zid("b2".parse().unwrap())
+        .build();
+    let south = south_router_with_default_route(R1);
+    let (mut to_low, mut to_high) = (tether(&low, &south), tether(&high, &south));
+    let app = app(&south);
+    let mut up_low = leaf_uplink(&low, &c);
+    settle(&mut [&mut to_low, &mut to_high, &mut up_low]);
+    assert_eq!(default_gateway(&south), Some(high.zid().to_string()));
+
+    // the greatest gateway has no uplink: lost there, and the query ends without a reply
+    app.put(key.clone(), vec![1]);
+    app.query(1, key.clone());
+    settle(&mut [&mut to_low, &mut to_high, &mut up_low]);
+    assert_eq!(b_sent(&to_high).pushes, std::slice::from_ref(&key));
+    assert_eq!(b_sent(&to_high).requests.len(), 1);
+    assert_eq!(b_sent(&to_low).pushes, Vec::<String>::new());
+    assert_eq!(b_sent(&to_low).requests, vec![]);
+    assert_eq!(seen(&phone).pushes, Vec::<String>::new());
+    assert_eq!(seen(&phone).requests, vec![]);
+    assert_eq!(seen(&app).response_finals, 1);
+
+    // it goes away: the other gateway, which has an uplink, becomes the default one
+    to_high.disconnect();
+    settle(&mut [&mut to_low, &mut up_low]);
+    assert_eq!(default_gateway(&south), Some(low.zid().to_string()));
+    app.put(key.clone(), vec![2]);
+    app.query(2, key.clone());
+    settle(&mut [&mut to_low, &mut up_low]);
+    assert_eq!(seen(&phone).pushes, std::slice::from_ref(&key));
+    assert_eq!(seen(&phone).requests.len(), 1);
+
+    // it returns, still without an uplink: it is the default gateway again
+    let mut back = tether(&high, &south);
+    settle(&mut [&mut to_low, &mut back, &mut up_low]);
+    assert_eq!(default_gateway(&south), Some(high.zid().to_string()));
+    app.put(key.clone(), vec![3]);
+    app.query(3, key.clone());
+    settle(&mut [&mut to_low, &mut back, &mut up_low]);
+    assert_eq!(b_sent(&back).pushes, std::slice::from_ref(&key));
+    assert_eq!(b_sent(&back).requests.len(), 1);
+    assert_eq!(seen(&phone).pushes.len(), 1);
+    assert_eq!(seen(&phone).requests.len(), 1);
+    assert_eq!(b_sent(&to_low).pushes.len(), 1);
 }
 
 /// Two gateways in the region of the south router: the default gateway is the one with the
