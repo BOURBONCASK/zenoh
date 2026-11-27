@@ -24,14 +24,15 @@ use zenoh_core::ztimeout;
 use zenoh_link::{EndPoint, Link};
 use zenoh_protocol::{
     core::{WhatAmI, ZenohIdProto},
-    network::NetworkMessageMut,
+    network::{NetworkMessage, NetworkMessageMut, Push},
+    zenoh::Put,
 };
 use zenoh_result::ZResult;
 use zenoh_test::get_free_tcp_port;
 use zenoh_transport::{
     multicast::TransportMulticast,
     unicast::{
-        test_helpers::{gate_deletions, make_basic_transport_manager_builder},
+        test_helpers::{gate_deletions, hold_ingress, make_basic_transport_manager_builder},
         TransportUnicast,
     },
     TransportEventHandler, TransportManager, TransportMulticastEventHandler, TransportPeer,
@@ -68,6 +69,7 @@ impl TransportEventHandler for Recorder {
 
 impl TransportPeerEventHandler for Recorder {
     fn handle_message(&self, _message: NetworkMessageMut) -> ZResult<()> {
+        self.events.lock().unwrap().push("message");
         Ok(())
     }
 
@@ -194,4 +196,102 @@ async fn closing_precedes_the_clean_up_of_a_low_latency_transport_when_the_remot
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closing_precedes_the_clean_up_of_a_low_latency_transport_when_the_node_closes() {
     closing_is_notified_before_the_clean_up([0xc7, 0xc8], true, Closes::Local).await;
+}
+
+/// A read task took the handler of the transport and has not given it its message yet when the
+/// node deletes the transport. The handler is told that the transport is closing at once: the
+/// message comes after that notification, whenever the read task goes on. It is told that the
+/// transport is closed only once the read tasks have stopped: no message comes after that one.
+///
+/// So a handler that acts on `closing` must expect messages afterwards, and a handler that acts
+/// on `closed` only, as a router does for the face of the transport, gets none on that face.
+async fn closed_waits_for_a_read_task_that_holds_the_handler(ids: [u8; 2], lowlatency: bool) {
+    zenoh_util::init_log_from_env_or("error");
+
+    let port = get_free_tcp_port();
+    let endpoint: EndPoint = format!("tcp/127.0.0.1:{port}").parse().unwrap();
+    let listener_zid = ZenohIdProto::try_from([ids[0]]).unwrap();
+    let listener = manager(ids[0], lowlatency, Arc::new(Recorder::default()));
+    ztimeout!(listener.add_listener(endpoint.clone())).unwrap();
+
+    let events = Arc::new(Mutex::new(vec![]));
+    let node_zid = ZenohIdProto::try_from([ids[1]]).unwrap();
+    let node = manager(
+        ids[1],
+        lowlatency,
+        Arc::new(Recorder {
+            events: events.clone(),
+        }),
+    );
+    let transport = ztimeout!(node.open_transport_unicast(endpoint)).unwrap();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let remote = loop {
+        if let Some(remote) = listener.get_transport_unicast(&node_zid).await {
+            break remote;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no transport");
+        tokio::time::sleep(SLEEP).await;
+    };
+
+    // a message of the remote stops in the read task of the node, handler in hand
+    let hold = hold_ingress(node_zid, listener_zid, |_| true);
+    let mut message = NetworkMessage::from(Push::from(Put::default()));
+    remote.schedule(message.as_mut()).unwrap();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !hold.holding() {
+        assert!(tokio::time::Instant::now() < deadline, "no message held");
+        tokio::time::sleep(SLEEP).await;
+    }
+    assert!(events.lock().unwrap().is_empty());
+
+    // the node deletes the transport
+    let closer = tokio::spawn(async move {
+        let _ = transport.close().await;
+    });
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !events.lock().unwrap().contains(&"closing") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the transport is not being deleted"
+        );
+        tokio::time::sleep(SLEEP).await;
+    }
+    tokio::time::sleep(10 * SLEEP).await;
+    let seen = events.lock().unwrap().clone();
+    assert!(
+        !seen.contains(&"closed") && !seen.contains(&"message"),
+        "low latency {lowlatency}: while the read task is held: {seen:?}"
+    );
+
+    hold.release();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !events.lock().unwrap().contains(&"closed") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the transport is not closed"
+        );
+        tokio::time::sleep(SLEEP).await;
+    }
+    tokio::time::sleep(10 * SLEEP).await;
+    let seen = events.lock().unwrap().clone();
+    let position = |event| seen.iter().position(|e| *e == event).unwrap();
+    assert!(
+        position("closing") < position("message") && position("message") < position("closed"),
+        "low latency {lowlatency}: {seen:?}"
+    );
+    assert_eq!(seen.last(), Some(&"closed"), "{seen:?}");
+
+    ztimeout!(closer).unwrap();
+    ztimeout!(listener.close());
+    ztimeout!(node.close());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_waits_for_a_read_task_that_holds_the_handler_and_closing_does_not() {
+    closed_waits_for_a_read_task_that_holds_the_handler([0xc9, 0xca], false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_waits_for_a_read_task_of_a_low_latency_transport_and_closing_does_not() {
+    closed_waits_for_a_read_task_that_holds_the_handler([0xcb, 0xcc], true).await;
 }

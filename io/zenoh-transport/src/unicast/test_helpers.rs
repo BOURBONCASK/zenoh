@@ -13,7 +13,7 @@
 //
 use std::{
     fmt::{self, DebugStruct},
-    sync::Arc,
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 
@@ -23,7 +23,7 @@ use zenoh_core::zcondfeat;
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::{Bound, RegionName, WhatAmI, ZenohIdProto},
-    network::{NetworkBody, NetworkBodyMut, NetworkMessage, NetworkMessageMut},
+    network::{NetworkBody, NetworkBodyMut, NetworkMessage, NetworkMessageMut, NetworkMessageRef},
     transport::TransportSn,
 };
 use zenoh_result::ZResult;
@@ -304,4 +304,148 @@ pub(crate) fn push_fails(zid: &ZenohIdProto, remote: &ZenohIdProto) -> bool {
         .unwrap()
         .iter()
         .any(|(z, r)| z == zid && r == remote)
+}
+
+/// Where a node stops a network message for tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldAt {
+    /// In a read task, with the handler of the transport in hand, before the message is given
+    /// to it.
+    Ingress,
+    /// In the thread that sends the message, before the transport takes it.
+    Egress,
+}
+
+#[derive(Default)]
+struct HoldState {
+    /// A message matched: the later ones pass.
+    taken: bool,
+    /// The thread that carries that message is stopped.
+    holding: bool,
+    released: bool,
+}
+
+struct HoldPoint {
+    at: HoldAt,
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: Box<dyn Fn(NetworkMessageRef) -> bool + Send + Sync>,
+    state: Mutex<HoldState>,
+    changed: Condvar,
+}
+
+/// The messages that tests hold back.
+static HOLD_POINTS: Mutex<Vec<Arc<HoldPoint>>> = Mutex::new(Vec::new());
+
+/// Holds back one network message of a node, see [`hold_ingress`] and [`hold_egress`].
+pub struct MessageHold(Arc<HoldPoint>);
+
+impl MessageHold {
+    /// Whether the message is there: the thread that carries it is stopped.
+    pub fn holding(&self) -> bool {
+        let state = self.0.state.lock().unwrap();
+        state.holding && !state.released
+    }
+
+    /// Whether a message was stopped, now or before it was released.
+    pub fn taken(&self) -> bool {
+        self.0.state.lock().unwrap().taken
+    }
+
+    /// Lets the message go on. No other message is stopped afterwards.
+    pub fn release(&self) {
+        HOLD_POINTS
+            .lock()
+            .unwrap()
+            .retain(|point| !Arc::ptr_eq(point, &self.0));
+        self.0.state.lock().unwrap().released = true;
+        self.0.changed.notify_all();
+    }
+}
+
+impl Drop for MessageHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn hold(
+    at: HoldAt,
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: impl Fn(NetworkMessageRef) -> bool + Send + Sync + 'static,
+) -> MessageHold {
+    let point = Arc::new(HoldPoint {
+        at,
+        zid,
+        remote,
+        matches: Box::new(matches),
+        state: Mutex::new(HoldState::default()),
+        changed: Condvar::new(),
+    });
+    HOLD_POINTS.lock().unwrap().push(point.clone());
+    MessageHold(point)
+}
+
+/// From now on, the first network message of `remote` for which `matches` is true stops in the
+/// read task of the node `zid` that received it, until the returned value is released or
+/// dropped. That task has taken the handler of the transport already and has not given it the
+/// message yet: a read callback that is acquired, and resumes as late as the test wants. The
+/// messages that follow on the same link wait behind it.
+pub fn hold_ingress(
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: impl Fn(NetworkMessageRef) -> bool + Send + Sync + 'static,
+) -> MessageHold {
+    hold(HoldAt::Ingress, zid, remote, matches)
+}
+
+/// From now on, the first network message that the node `zid` sends to `remote` and for which
+/// `matches` is true stops in the thread that sends it, before the transport takes it, until
+/// the returned value is released or dropped: when that thread is a read task that routes a
+/// message of another remote, it is stopped inside the routing of that message.
+pub fn hold_egress(
+    zid: ZenohIdProto,
+    remote: ZenohIdProto,
+    matches: impl Fn(NetworkMessageRef) -> bool + Send + Sync + 'static,
+) -> MessageHold {
+    hold(HoldAt::Egress, zid, remote, matches)
+}
+
+/// Stops here if tests hold `msg` back, see [`hold_ingress`] and [`hold_egress`].
+pub(crate) fn held(at: HoldAt, zid: &ZenohIdProto, remote: &ZenohIdProto, msg: NetworkMessageRef) {
+    let point = {
+        let points = HOLD_POINTS.lock().unwrap();
+        if points.is_empty() {
+            return;
+        }
+        points
+            .iter()
+            .find(|point| {
+                point.at == at
+                    && &point.zid == zid
+                    && &point.remote == remote
+                    && (point.matches)(msg)
+                    && !std::mem::replace(&mut point.state.lock().unwrap().taken, true)
+            })
+            .cloned()
+    };
+    let Some(point) = point else {
+        return;
+    };
+    let wait = || {
+        let mut state = point.state.lock().unwrap();
+        state.holding = true;
+        while !state.released {
+            state = point.changed.wait(state).unwrap();
+        }
+        state.holding = false;
+    };
+    // this thread is a worker of a runtime: its other tasks must go on meanwhile
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
 }

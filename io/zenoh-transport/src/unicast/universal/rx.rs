@@ -63,6 +63,14 @@ impl TransportUnicastUniversal {
             }
         }
 
+        #[cfg(feature = "test")]
+        crate::unicast::test_helpers::held(
+            crate::unicast::test_helpers::HoldAt::Ingress,
+            &self.manager.config.zid,
+            &self.config.zid,
+            zenoh_protocol::network::NetworkMessageExt::as_ref(&msg),
+        );
+
         callback.handle_message(msg)
     }
 
