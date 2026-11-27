@@ -274,6 +274,32 @@
   ///   - `interfaces`: a non-empty array of network interface names.
   ///   - `zids`: a non-empty array of Zenoh IDs.
   ///   - `region_names`: a non-empty array of region names.
+  ///
+  /// `gateway.north` (unset by default) makes a router a _leaf_ of its north region:
+  ///   - `mode`: `"client"`. The router announces itself as a client on its uplinks and takes the
+  ///     role of a client towards its north remote: no link state is exchanged with it, and it
+  ///     only receives the declarations it asks for. It remains a router for its south
+  ///     subregions. A leaf has one north remote at a time.
+  ///   - `uplinks`: which links are uplinks, as an array of filters with the optional keys
+  ///     `link_protocols` and `interfaces`. The mode is announced before the remote is known, so
+  ///     only properties of the link can be used. If unset, every link is an uplink. A remote
+  ///     that ends up in the north region over a link that is not an uplink (or in a south
+  ///     subregion over an uplink) is refused.
+  ///   - `interests`: what the router asks its north remote for, each time an uplink is
+  ///     established, on behalf of its south router subregions: `key_expr` and any of
+  ///     `subscribers`, `queryables`, `tokens`. Only the declarations whose key expression
+  ///     intersects `key_expr` are received. Publications and queries on keys included in a
+  ///     `key_expr` are then only sent to the uplink when a matching subscriber or queryable was
+  ///     received.
+  /// Example:
+  ///   north: {
+  ///     mode: "client",
+  ///     uplinks: [{ link_protocols: ["quic"] }],
+  ///     interests: [
+  ///       { key_expr: "robot1/**", subscribers: true, queryables: true },
+  ///       { key_expr: "robot1/alive/**", tokens: true },
+  ///     ],
+  ///   }
   gateway: {
     /// The `auto` preset mode puts peers and clients south of routers and client south of peers.
     /// This is the only available preset.
