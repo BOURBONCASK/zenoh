@@ -18,3 +18,5 @@ pub(crate) mod priority;
 pub(crate) mod seq_num;
 #[cfg(feature = "shared-memory")]
 pub mod shm;
+#[cfg(test)]
+pub(crate) mod test_receiver;

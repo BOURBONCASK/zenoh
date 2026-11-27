@@ -13,6 +13,8 @@
 //
 pub(crate) mod transport;
 
+// The sender that owns the messages of a link selected by a hand-over rule.
+pub(crate) mod handover;
 mod link;
 mod rx;
 mod tx;
