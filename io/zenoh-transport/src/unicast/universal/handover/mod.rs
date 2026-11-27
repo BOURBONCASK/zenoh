@@ -51,10 +51,12 @@ use zenoh_protocol::{
 
 use crate::common::{batch::BatchConfig, priority::TransportPriorityTx};
 
+mod driver;
 mod task;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use driver::{run, End, Progress, Sink};
 pub(crate) use task::{SenderTask, Step};
 
 /// The text of the error reply that ends a query which was not sent.
