@@ -297,6 +297,44 @@ impl DefaultRoute {
     }
 }
 
+impl DefaultRoute {
+    pub(crate) fn key_exprs(&self) -> &[OwnedKeyExpr] {
+        &self.key_exprs
+    }
+
+    pub(crate) fn except(&self) -> &[OwnedKeyExpr] {
+        &self.except
+    }
+}
+
+/// Limits how often a log that a retry loop can repeat is written at its level: once per
+/// subject and per [`LogLimiter::PERIOD`].
+#[derive(Default)]
+pub(crate) struct LogLimiter {
+    last: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl LogLimiter {
+    pub(crate) const PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Whether the log about `subject` is due: it was not written during the last period.
+    pub(crate) fn due(&self, subject: &str) -> bool {
+        self.due_at(subject, std::time::Instant::now())
+    }
+
+    fn due_at(&self, subject: &str, now: std::time::Instant) -> bool {
+        let mut last = self.last.lock().unwrap();
+        // forgets the subjects that are due again: the map stays as small as what repeats
+        last.retain(|_, at| now.saturating_duration_since(*at) < Self::PERIOD);
+        if last.contains_key(subject) {
+            false
+        } else {
+            last.insert(subject.to_string(), now);
+            true
+        }
+    }
+}
+
 pub struct Gateway {
     // whatami: WhatAmI,
     pub tables: Arc<TablesLock>,
@@ -563,6 +601,22 @@ impl Gateway {
             interceptor,
             this_zid,
         )))
+    }
+}
+
+#[cfg(test)]
+mod log_limiter_tests {
+    use super::LogLimiter;
+
+    #[test]
+    fn a_log_is_due_once_per_subject_and_period() {
+        let limiter = LogLimiter::default();
+        let start = std::time::Instant::now();
+        assert!(limiter.due_at("a", start));
+        assert!(!limiter.due_at("a", start + LogLimiter::PERIOD / 2));
+        assert!(limiter.due_at("b", start + LogLimiter::PERIOD / 2));
+        assert!(limiter.due_at("a", start + LogLimiter::PERIOD));
+        assert!(!limiter.due_at("b", start + LogLimiter::PERIOD));
     }
 }
 

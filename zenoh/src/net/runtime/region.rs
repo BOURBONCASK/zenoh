@@ -108,6 +108,15 @@ pub(crate) fn is_leaf(config: &ExpandedConfig) -> bool {
     north_mode(config) != config.mode()
 }
 
+/// Returns `true` if this node has a default route (`gateway.north.default_route`).
+pub(crate) fn has_default_route(config: &ExpandedConfig) -> bool {
+    config
+        .gateway
+        .north
+        .as_ref()
+        .is_some_and(|north| north.default_route.is_some())
+}
+
 /// Checks the `gateway.north` section against the mode of the node.
 pub(crate) fn check_north_config(config: &ExpandedConfig) -> ZResult<()> {
     let Some(north) = &config.gateway.north else {

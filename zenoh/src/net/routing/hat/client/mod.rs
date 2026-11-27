@@ -47,7 +47,7 @@ use super::{
 use crate::net::{
     routing::{
         dispatcher::{interests::RemoteInterest, region::RegionMap},
-        gateway::{DefaultRoute, FaceContext, DEFAULT_NODE_ID},
+        gateway::{DefaultRoute, FaceContext, LogLimiter, DEFAULT_NODE_ID},
         hat::{DispatcherContext, Remote, UnregisterFaceEntitiesResult},
     },
     runtime::Runtime,
@@ -73,6 +73,9 @@ pub(crate) struct Hat {
     ///
     /// `None` (the default): all of them.
     default_route: Option<Arc<DefaultRoute>>,
+    /// The errors about configured interests are logged once per interest and period: a
+    /// reconnection loop repeats them at each connection.
+    uplink_logs: LogLimiter,
 }
 
 /// State of a configured interest (`gateway.north.interests`) on a north face.
@@ -85,8 +88,9 @@ pub(crate) enum UplinkInterestState {
     /// The north remote did not answer within the deadline: the interest was lost on the way, or
     /// the remote does not answer interests.
     Unanswered,
-    /// The interest was not sent: the access control of this node denies it on egress.
-    Denied,
+    /// The interest did not leave this node: its access control denies it on egress, or the
+    /// link could not take it.
+    NotSent,
 }
 
 impl UplinkInterestState {
@@ -95,7 +99,7 @@ impl UplinkInterestState {
             UplinkInterestState::Pending => "pending",
             UplinkInterestState::Finalized => "finalized",
             UplinkInterestState::Unanswered => "unanswered",
-            UplinkInterestState::Denied => "denied",
+            UplinkInterestState::NotSent => "not_sent",
         }
     }
 }
@@ -124,11 +128,16 @@ impl Hat {
             region,
             uplink_interests: Vec::new(),
             default_route: None,
+            uplink_logs: LogLimiter::default(),
         }
     }
 
     pub(crate) fn set_default_route(&mut self, default_route: Arc<DefaultRoute>) {
         self.default_route = Some(default_route);
+    }
+
+    pub(crate) fn default_route(&self) -> Option<&Arc<DefaultRoute>> {
+        self.default_route.as_ref()
     }
 
     pub(crate) fn set_uplink_interests(

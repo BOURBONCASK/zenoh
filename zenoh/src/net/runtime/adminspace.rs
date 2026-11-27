@@ -220,6 +220,9 @@ impl AdminSpace {
         if super::region::is_leaf(config) {
             add_handler!("uplink", uplink_data);
         }
+        if super::region::has_default_route(config) {
+            add_handler!("default_route", default_route_data);
+        }
 
         #[cfg(feature = "plugins")]
         add_handler!("plugins", "**", plugins_data);
@@ -949,6 +952,54 @@ fn uplink_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
         },
         "interests": interests,
     });
+    if let Err(e) = query
+        .reply(prefix, serde_json::to_vec(&json).unwrap())
+        .encoding(Encoding::APPLICATION_JSON)
+        .wait()
+    {
+        tracing::error!("Error sending AdminSpace reply: {:?}", e);
+    }
+}
+
+/// State of the default route of a router (`gateway.north.default_route`): what is eligible, and
+/// the gateway that eligible publications and queries are sent towards, if there is one.
+#[tracing::instrument(level = "trace", skip_all)]
+fn default_route_data(prefix: &keyexpr, context: &AdminContext, query: Query) {
+    use crate::net::routing::hat::{client::Hat as ClientHat, router::Hat as RouterHat};
+
+    let tables = &context.runtime.state.router.tables;
+    // NOTE: collect under the lock, drop the guard, then reply.
+    let json = {
+        let rtables = zread!(tables.tables);
+        let north = rtables.hats[Region::North].as_any();
+        let (default_route, gateway) = if let Some(hat) = north.downcast_ref::<RouterHat>() {
+            (
+                hat.default_route().cloned(),
+                hat.reachable_default_gateway(),
+            )
+        } else if let Some(hat) = north.downcast_ref::<ClientHat>() {
+            // a leaf sends to its north remote
+            let owner = context.runtime.state.north.owner();
+            (
+                hat.default_route().cloned(),
+                owner.filter(|o| !o.closing).map(|o| o.zid),
+            )
+        } else {
+            (None, None)
+        };
+        let Some(default_route) = default_route else {
+            return;
+        };
+        let list = |key_exprs: &[OwnedKeyExpr]| -> Vec<String> {
+            key_exprs.iter().map(|ke| ke.to_string()).collect()
+        };
+        json!({
+            "key_exprs": list(default_route.key_exprs()),
+            "except": list(default_route.except()),
+            // null: eligible publications and queries only reach declared destinations
+            "gateway": gateway.map(|zid| zid.to_string()),
+        })
+    };
     if let Err(e) = query
         .reply(prefix, serde_json::to_vec(&json).unwrap())
         .encoding(Encoding::APPLICATION_JSON)

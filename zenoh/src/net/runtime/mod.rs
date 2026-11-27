@@ -192,6 +192,9 @@ pub(crate) struct RuntimeState {
     namespace: Option<OwnedNonWildKeyExpr>,
     /// Which remote owns the north region of a leaf router. Not used otherwise.
     north: uplink::NorthAdmission<Weak<RuntimeSession>>,
+    /// The remotes that a leaf router refuses are retried by their connector: the warning is
+    /// written once per remote, reason and period.
+    refusals: crate::net::routing::gateway::LogLimiter,
     #[cfg(feature = "stats")]
     stats: zenoh_stats::StatsRegistry,
     span: tracing::Span,
@@ -846,6 +849,7 @@ impl RuntimeBuilder {
                 pending_connections: tokio::sync::Mutex::new(HashSet::new()),
                 namespace,
                 north: uplink::NorthAdmission::default(),
+                refusals: Default::default(),
                 #[cfg(feature = "stats")]
                 stats,
                 span,
@@ -1066,6 +1070,23 @@ struct RuntimeTransportEventHandler {
     runtime: std::sync::RwLock<WeakRuntime>,
 }
 
+impl Runtime {
+    /// Warns that `peer` is refused, once per remote, `reason` and period: the connector of an
+    /// endpoint that leads to a refused remote tries again at each of its retry periods.
+    fn warn_refused(&self, peer: &TransportPeer, reason: &str, message: String) {
+        use crate::net::routing::gateway::LogLimiter;
+
+        if self.state.refusals.due(&format!("{} {reason}", peer.zid)) {
+            tracing::warn!(
+                "{message} (logged at most once per {:?} for this remote and reason)",
+                LogLimiter::PERIOD
+            );
+        } else {
+            tracing::debug!("{message}");
+        }
+    }
+}
+
 impl TransportEventHandler for RuntimeTransportEventHandler {
     #[tracing::instrument(level = "trace", skip_all)]
     fn new_unicast(
@@ -1092,11 +1113,13 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     Ok(relationship) => relationship,
                     Err(e) => {
                         if region::is_leaf(&config) {
-                            tracing::warn!(
-                                "Remote {} refused, it was announced the '{}' mode: {}",
-                                peer.zid,
-                                announced_mode,
-                                e
+                            runtime.warn_refused(
+                                &peer,
+                                "region",
+                                format!(
+                                    "Remote {} refused, it was announced the '{}' mode: {}",
+                                    peer.zid, announced_mode, e
+                                ),
                             );
                         }
                         return Err(e);
@@ -1169,7 +1192,7 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     &remote_bound,
                     announced_mode,
                 ) {
-                    tracing::warn!("{e}");
+                    runtime.warn_refused(&peer, "relationship", e.to_string());
                     return Err(e);
                 }
 
@@ -1199,7 +1222,7 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                                 peer.zid,
                                 owner.zid
                             );
-                            tracing::warn!("{e}");
+                            runtime.warn_refused(&peer, "owner", e.to_string());
                             return Err(e.into());
                         }
                     }

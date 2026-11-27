@@ -112,6 +112,9 @@ pub(crate) struct Hat {
     /// matching declaration (`gateway.north.default_route`). Only set on the hat of the north
     /// region, and `None` by default.
     default_route: Option<Arc<DefaultRoute>>,
+    /// The default gateway this node last logged: `None` before the first routing trees,
+    /// `Some(None)` when it had none it could reach. Only kept with a default route.
+    default_gateway: Option<Option<ZenohIdProto>>,
     #[cfg(test)]
     disable_async_tree_computation: bool,
     /// Tests only: never compute trees on topology changes; the test runs
@@ -136,6 +139,7 @@ impl Hat {
             routers_net: None,
             routers_trees_worker: TreesComputationWorker::new(region),
             default_route: None,
+            default_gateway: None,
             #[cfg(test)]
             disable_async_tree_computation: false,
             #[cfg(test)]
@@ -196,11 +200,7 @@ impl Hat {
         } else {
             net.idx.index() as NodeId
         };
-        let gateway = net
-            .graph
-            .node_indices()
-            .filter(|idx| net.graph[*idx].is_gateway && *idx != net.idx)
-            .max_by_key(|idx| net.graph[*idx].zid)?;
+        let gateway = Self::default_gateway_of(net)?;
         if gateway.index() == source as usize {
             return None;
         }
@@ -213,6 +213,59 @@ impl Hat {
             return None;
         }
         Some((self.face(tables, &net.graph[direction].zid)?, source))
+    }
+
+    /// The default gateway of the region: the one with the greatest ZID among the nodes that
+    /// announce themselves as gateways, this node excluded. Whether that gateway has a north
+    /// remote of its own is not known in this region and plays no part.
+    fn default_gateway_of(net: &Network) -> Option<petgraph::graph::NodeIndex> {
+        net.graph
+            .node_indices()
+            .filter(|idx| net.graph[*idx].is_gateway && *idx != net.idx)
+            .max_by_key(|idx| net.graph[*idx].zid)
+    }
+
+    pub(crate) fn default_route(&self) -> Option<&Arc<DefaultRoute>> {
+        self.default_route.as_ref()
+    }
+
+    /// The default gateway, if this node has a next hop towards it for what it sends itself or
+    /// forwards from another region.
+    pub(crate) fn reachable_default_gateway(&self) -> Option<ZenohIdProto> {
+        let net = self.routers_net.as_ref()?;
+        let gateway = Self::default_gateway_of(net)?;
+        let direction = (*net
+            .trees
+            .get(net.idx.index())?
+            .directions
+            .get(gateway.index())?)?;
+        net.graph
+            .contains_node(direction)
+            .then(|| net.graph[gateway].zid)
+    }
+
+    /// Logs the default gateway when it changes: nothing else tells that the eligible
+    /// publications and queries of this node are dropped for lack of a gateway.
+    fn note_default_gateway(&mut self) {
+        if self.default_route.is_none() {
+            return;
+        }
+        let gateway = self.reachable_default_gateway();
+        if self.default_gateway == Some(gateway) {
+            return;
+        }
+        match gateway {
+            Some(zid) => tracing::info!(
+                "Default route: publications and queries on eligible key expressions are \
+                 also sent towards the gateway {zid}"
+            ),
+            None => tracing::warn!(
+                "Default route: no gateway can be reached in the north region of this node. \
+                 Publications and queries on eligible key expressions only reach the \
+                 destinations declared in this region"
+            ),
+        }
+        self.default_gateway = Some(gateway);
     }
 
     pub(crate) fn net(&self) -> &Network {
@@ -287,6 +340,7 @@ impl Hat {
         self.queries_tree_change(tables, &new_children);
         self.token_tree_change(tables, &new_children);
         self.disable_all_routes(tables);
+        self.note_default_gateway();
     }
 
     fn get_router(&self, face: &FaceState, nodeid: NodeId) -> Option<ZenohIdProto> {

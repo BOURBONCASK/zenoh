@@ -41,7 +41,7 @@ use crate::net::routing::{
         resource::Resource,
         tables::{TablesData, TablesLock},
     },
-    gateway::SubscriberInfo,
+    gateway::{LogLimiter, SubscriberInfo},
     hat::{
         DispatcherContext, HatBaseTrait, HatInterestTrait, HatTrait, Remote,
         RouteCurrentDeclareResult, RouteInterestResult,
@@ -83,18 +83,31 @@ impl Hat {
                     res.expr().to_string(),
                 ));
             if !sent {
-                tracing::error!(
+                // NOTE: the two causes cannot be told apart here. On an uplink that stays
+                // connected it is the access control.
+                let message = format!(
                     "Uplink interest '{}' ({}) was not sent to {}: the access control of this \
                      node denies it on egress (an interest that asks for tokens is checked as \
-                     declare_liveliness_subscriber on its key expression). This node will miss \
-                     the declarations it asks for",
+                     declare_liveliness_subscriber on its key expression), or the link was \
+                     closing. This node will miss the declarations it asks for",
                     res.expr(),
                     options,
                     ctx.src_face.zid,
                 );
+                if self
+                    .uplink_logs
+                    .due(&format!("not sent {} {}", res.expr(), options))
+                {
+                    tracing::error!(
+                        "{message} (logged at most once per {:?} for this interest)",
+                        LogLimiter::PERIOD
+                    );
+                } else {
+                    tracing::debug!("{message}");
+                }
                 if let Some(interest) = self.face_hat_mut(ctx.src_face).uplink_interests.last_mut()
                 {
-                    interest.state = UplinkInterestState::Denied;
+                    interest.state = UplinkInterestState::NotSent;
                 }
             }
         }
@@ -125,7 +138,7 @@ impl Hat {
     ///
     /// + A configured interest includes `key_expr`, asks for the kind and is no longer pending:
     ///   `true`. Finalized, every matching entity of the north remote has been declared to this
-    ///   node. Denied, or unanswered at its deadline, this node does not know the entities of
+    ///   node. Not sent, or unanswered at its deadline, this node does not know the entities of
     ///   the north remote, but south traffic must not flow to the uplink for as long as an
     ///   interest stays without an answer.
     /// + Such an interest is pending: `false`, the entities are not known yet. This is bounded
@@ -174,12 +187,13 @@ impl Hat {
         timeout: Duration,
     ) {
         let mut expired = false;
+        let mut unanswered = vec![];
         let remote = face.zid;
         for interest in &mut self.face_hat_mut(face).uplink_interests {
             if interest.state == UplinkInterestState::Pending {
                 interest.state = UplinkInterestState::Unanswered;
                 expired = true;
-                tracing::error!(
+                let message = format!(
                     "Uplink interest '{}' ({}) was not answered by {} within {:?}: this node may \
                      miss declarations of its north region. Publications and queries on the keys \
                      it includes are now only sent to the uplink towards the declarations received",
@@ -188,6 +202,20 @@ impl Hat {
                     remote,
                     timeout,
                 );
+                unanswered.push((
+                    format!("unanswered {} {}", interest.res.expr(), interest.options),
+                    message,
+                ));
+            }
+        }
+        for (subject, message) in unanswered {
+            if self.uplink_logs.due(&subject) {
+                tracing::error!(
+                    "{message} (logged at most once per {:?} for this interest)",
+                    LogLimiter::PERIOD
+                );
+            } else {
+                tracing::debug!("{message}");
             }
         }
         if expired {
@@ -434,7 +462,7 @@ impl HatInterestTrait for Hat {
                     interest.options,
                     remote
                 ),
-                UplinkInterestState::Finalized | UplinkInterestState::Denied => {}
+                UplinkInterestState::Finalized | UplinkInterestState::NotSent => {}
             }
             interest.state = UplinkInterestState::Finalized;
             return NoBreadcrumb;
