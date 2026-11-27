@@ -33,6 +33,8 @@
 //! test_sessions.close().await;
 //! ```
 
+pub mod proxy;
+
 use std::{
     net::{TcpListener, UdpSocket},
     time::Duration,

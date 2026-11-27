@@ -9,7 +9,14 @@ internal = ["zenoh-config/internal", "zenoh/internal"]
 unstable = ["zenoh-config/unstable", "zenoh/unstable"]
 
 [dependencies]
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "sync",
+  "time",
+] }
 zenoh = { workspace = true, features = ["internal", "unstable"] }
 zenoh-config = { workspace = true }
 zenoh-core = { workspace = true }
