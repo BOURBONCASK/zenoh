@@ -1338,15 +1338,34 @@ impl TransportPeerEventHandler for RuntimeSession {
         if let Some(ticket) = self.north_ticket {
             // NOTE(leaf): without a link this uplink is closing: the next north remote may
             // take over, and the connector started below may be the one that brings it.
-            if self.transport.get_links().map_or(true, |l| l.is_empty()) {
+            if self.transport.get_links().map_or(true, |l| l.is_empty())
+                && self.runtime.state.north.closing(ticket)
+            {
                 tracing::info!(
                     "Uplink: {} lost its last link",
                     self.main_handler.face.state.zid
                 );
-                self.runtime.state.north.link_lost(ticket);
             }
         }
         Runtime::closed_link(self, link.dst.to_endpoint());
+    }
+
+    fn closing(&self) {
+        // NOTE(leaf): a transport is also deleted without losing its links one by one: on a
+        // `Close` of the remote, on a message that could not be sent, on a local close. The
+        // close of its links and tasks is awaited after this call and may take long: the next
+        // north remote may take over now.
+        if let Some(ticket) = self.north_ticket {
+            if self.runtime.state.north.closing(ticket) {
+                tracing::info!(
+                    "Uplink: the transport with {} is closing",
+                    self.main_handler.face.state.zid
+                );
+            }
+        }
+        for handler in &self.slave_handlers {
+            handler.closing();
+        }
     }
 
     fn closed(&self) {

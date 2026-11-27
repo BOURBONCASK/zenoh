@@ -22,9 +22,10 @@
 //! + while the owner has a link, any other candidate is refused;
 //! + two candidates that complete at the same time cannot refuse each other: the first to ask
 //!   becomes the owner at once, before its face is created;
-//! + once the owner has lost its last link it is _closing_, and the next candidate takes over
-//!   without waiting for the close of the old transport to complete, however long that takes. The
-//!   caller closes the face of the previous owner before it creates the new one.
+//! + once the owner has lost its last link, or once its transport starts being deleted, it is
+//!   _closing_, and the next candidate takes over without waiting for the close of the old
+//!   transport to complete, however long that takes. The caller closes the face of the previous
+//!   owner before it creates the new one.
 
 use std::sync::Mutex;
 
@@ -37,7 +38,7 @@ pub(crate) type NorthTicket = u64;
 struct Owner<S> {
     ticket: NorthTicket,
     zid: ZenohIdProto,
-    /// The owner has lost its last link: its transport is closing.
+    /// The owner has lost its last link or is being deleted: its transport is closing.
     closing: bool,
     /// What the caller needs to close the face of the owner (see [`NorthAdmission::bind`]).
     session: Option<S>,
@@ -119,13 +120,18 @@ impl<S> NorthAdmission<S> {
         }
     }
 
-    /// The owner of admission `ticket` has lost its last link.
-    pub(crate) fn link_lost(&self, ticket: NorthTicket) {
+    /// The transport of admission `ticket` is going away: it has lost its last link, or it is
+    /// being deleted. Returns `true` if `ticket` is the owner and was not closing yet.
+    pub(crate) fn closing(&self, ticket: NorthTicket) -> bool {
         let mut state = self.state.lock().unwrap();
-        if let Some(owner) = state.owner.as_mut().filter(|o| o.ticket == ticket) {
-            owner.closing = true;
-            drop(state);
-            self.vacant.notify_waiters();
+        match state.owner.as_mut().filter(|o| o.ticket == ticket) {
+            Some(owner) if !owner.closing => {
+                owner.closing = true;
+                drop(state);
+                self.vacant.notify_waiters();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -233,7 +239,7 @@ mod tests {
         let north = NorthAdmission::<&str>::default();
         let old = north.admit(zid(1)).ok().unwrap();
         north.bind(old.ticket, "old");
-        north.link_lost(old.ticket);
+        north.closing(old.ticket);
         assert!(north.owner().unwrap().closing);
 
         let new = north.admit(zid(2)).ok().unwrap();
@@ -257,7 +263,7 @@ mod tests {
     fn the_same_remote_is_admitted_again_with_a_new_ticket() {
         let north = NorthAdmission::<&str>::default();
         let first = north.admit(zid(1)).ok().unwrap();
-        north.link_lost(first.ticket);
+        north.closing(first.ticket);
 
         let second = north.admit(zid(1)).ok().unwrap();
 
@@ -293,7 +299,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiter.is_finished());
 
-        north.link_lost(granted.ticket);
+        north.closing(granted.ticket);
 
         tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
