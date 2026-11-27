@@ -802,6 +802,7 @@ pub(crate) struct HarnessBuilder {
     start_adminspace: bool,
     manual_tree_computation: bool,
     gateway: Option<String>,
+    config: Vec<(String, String)>,
 }
 
 impl HarnessBuilder {
@@ -814,7 +815,15 @@ impl HarnessBuilder {
             start_adminspace: false,
             manual_tree_computation: false,
             gateway: None,
+            config: Vec::new(),
         }
+    }
+
+    /// Set the value at `key` of the runtime config, in JSON5 (e.g. `routing/interests/timeout`).
+    /// Only meaningful when [`start_runtime`](Self::start_runtime) is `true`.
+    pub(crate) fn config(mut self, key: &str, value: &str) -> Self {
+        self.config.push((key.to_string(), value.to_string()));
+        self
     }
 
     /// Set the `gateway` section of the runtime config, in JSON5.
@@ -900,6 +909,9 @@ impl HarnessBuilder {
             config.plugins_loading.set_enabled(false).unwrap();
             if let Some(gateway) = &self.gateway {
                 config.gateway = json5::from_str(gateway).unwrap();
+            }
+            for (key, value) in &self.config {
+                config.insert_json5(key, value).unwrap();
             }
 
             let runtime = block_on(
@@ -1178,6 +1190,25 @@ impl EstablishedConnection {
             }
 
             out
+        })
+    }
+
+    /// Forward the pending messages **from A to B** for which `keep` is true, and drop the
+    /// others, as an interceptor on the way would. Returns the number of dropped messages.
+    pub(crate) fn fwd_if(&mut self, keep: impl Fn(&Message) -> bool) -> usize {
+        self.a2b.recorder().with_messages(|msgs| {
+            let mut dropped = 0;
+
+            while let Some(msg) = msgs.get(self.nfwd) {
+                if keep(msg) {
+                    Self::inject(&self.b2a, msg);
+                } else {
+                    dropped += 1;
+                }
+                self.nfwd += 1;
+            }
+
+            dropped
         })
     }
 

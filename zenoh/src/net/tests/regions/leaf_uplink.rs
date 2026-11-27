@@ -29,7 +29,10 @@
 //! its north region. Everything is asserted on what the sessions at both ends receive, and on what
 //! crosses the uplink.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    time::Duration,
+};
 
 use zenoh_protocol::{
     core::{Bound, ExprId, Region, WhatAmI, WireExpr},
@@ -37,7 +40,7 @@ use zenoh_protocol::{
         declare::queryable::ext::QueryableInfoType,
         ext,
         interest::{InterestMode, InterestOptions},
-        response, DeclareBody, Mapping, RequestId, Response, ResponseFinal,
+        response, DeclareBody, Interest, Mapping, RequestId, Response, ResponseFinal,
     },
     zenoh::{PushBody, Put, Reply, ResponseBody},
 };
@@ -46,7 +49,10 @@ use super::{
     try_init_tracing_subscriber, Connection, EstablishedConnection, FaceDef, Harness,
     HarnessBuilder, Message, MockFace,
 };
-use crate::net::primitives::Primitives;
+use crate::net::{
+    primitives::Primitives,
+    routing::hat::client::{Hat as ClientHat, UplinkInterestState},
+};
 
 /// On a bridge: the subregion of its south router.
 const SOUTH_ROUTER: Region = Region::South {
@@ -96,6 +102,48 @@ fn leaf_bridge_with(interests: &str) -> Harness {
         .subregions([SOUTH_ROUTER, Region::Local])
         .gateway(&leaf_conf(interests))
         .build()
+}
+
+/// The deadline of the configured interests of [`impatient_leaf_bridge_with`].
+const DEADLINE: Duration = Duration::from_millis(300);
+
+/// A leaf bridge whose configured interests are unanswered after [`DEADLINE`].
+fn impatient_leaf_bridge_with(interests: &str) -> Harness {
+    HarnessBuilder::new()
+        .mode(WhatAmI::Router)
+        .subregions([SOUTH_ROUTER, Region::Local])
+        .gateway(&leaf_conf(interests))
+        .config(
+            "routing/interests/timeout",
+            &DEADLINE.as_millis().to_string(),
+        )
+        .build()
+}
+
+/// The state of each configured interest of a leaf bridge on its north face.
+fn interest_states(bridge: &Harness) -> Vec<Option<UplinkInterestState>> {
+    let tables = bridge.gateway.tables.tables.read().unwrap();
+    let hat = tables.hats[Region::North]
+        .as_any()
+        .downcast_ref::<ClientHat>()
+        .expect("the north hat of a leaf is the client hat");
+    hat.uplink_interests_info(&tables.data)
+        .into_iter()
+        .map(|(_, _, state)| state)
+        .collect()
+}
+
+/// Waits for the deadline of the configured interests declared before the call.
+fn wait_for_the_deadline(bridge: &Harness, expected: &[Option<UplinkInterestState>]) {
+    let until = std::time::Instant::now() + 20 * DEADLINE;
+    while interest_states(bridge) != expected {
+        assert!(
+            std::time::Instant::now() < until,
+            "{:?}",
+            interest_states(bridge)
+        );
+        std::thread::sleep(DEADLINE / 10);
+    }
 }
 
 /// A bridge that is a router of its north region, as without `gateway.north`.
@@ -894,4 +942,327 @@ fn north_mode_selects_the_north_hat() {
     };
     assert_eq!(mode_of(&leaf_bridge(R1)), WhatAmI::Client);
     assert_eq!(mode_of(&router_bridge()), WhatAmI::Router);
+}
+
+/// The kind of entity a configured interest asks for.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Subscribers,
+    Queryables,
+    Tokens,
+}
+
+impl Kind {
+    fn field(self) -> &'static str {
+        match self {
+            Kind::Subscribers => "subscribers",
+            Kind::Queryables => "queryables",
+            Kind::Tokens => "tokens",
+        }
+    }
+
+    fn options(self) -> InterestOptions {
+        InterestOptions::KEYEXPRS
+            + match self {
+                Kind::Subscribers => InterestOptions::SUBSCRIBERS,
+                Kind::Queryables => InterestOptions::QUERYABLES,
+                Kind::Tokens => InterestOptions::TOKENS,
+            }
+    }
+
+    fn declare(self, face: &MockFace, id: u32, key: String) {
+        match self {
+            Kind::Subscribers => face.declare_subscriber(None, id, key),
+            Kind::Queryables => face.declare_queryable(None, id, key, QueryableInfoType::DEFAULT),
+            Kind::Tokens => face.declare_token(None, id, key),
+        }
+    }
+
+    fn declared(self, seen: Seen) -> BTreeSet<String> {
+        match self {
+            Kind::Subscribers => seen.subscribers,
+            Kind::Queryables => seen.queryables,
+            Kind::Tokens => seen.tokens,
+        }
+    }
+}
+
+/// How a session stops being interested.
+#[derive(Clone, Copy, Debug)]
+enum Cancel {
+    /// It undeclares its interest.
+    Undeclare,
+    /// It goes away.
+    Close,
+}
+
+/// A session of the bridge declares the very interest that is configured for the uplink, then
+/// stops being interested. The configured interest is not the session's: an entity the cloud
+/// declares afterwards still reaches the south router, on this connection and on the next one.
+fn configured_interest_outlives_the_same_interest_of_a_session(kind: Kind, cancel: Cancel) {
+    try_init_tracing_subscriber();
+    let c = cloud();
+    let phone = client(&c, CLIENTS);
+    let scope = format!("{R1}/x/**");
+    let mut r = Robot::new(leaf_bridge_with(&format!(
+        r#"{{ key_expr: "{scope}", {}: true }}"#,
+        kind.field()
+    )));
+    let local = r.bridge.new_session();
+    let mut up = leaf_uplink(&r.bridge, &c);
+    settle(&mut [&mut up, &mut r.tether]);
+
+    local.interest(52, InterestMode::CurrentFuture, kind.options(), scope.clone());
+    settle(&mut [&mut up, &mut r.tether]);
+    match cancel {
+        Cancel::Undeclare => local.interest(52, InterestMode::Final, kind.options(), scope.clone()),
+        Cancel::Close => local.face.send_close(),
+    }
+    settle(&mut [&mut up, &mut r.tether]);
+
+    // both interests were declared to the cloud, and at most the session's one is cancelled
+    let modes = |mode| {
+        let sent = a_sent(&up).interests;
+        sent.iter().filter(|(_, m, _)| *m == mode).count()
+    };
+    assert_eq!(modes(InterestMode::CurrentFuture), 2, "{kind:?} {cancel:?}");
+    assert!(modes(InterestMode::Final) <= 1, "{kind:?} {cancel:?}");
+    assert_eq!(
+        interest_states(&r.bridge),
+        [Some(UplinkInterestState::Finalized)]
+    );
+
+    kind.declare(&phone, 98, format!("{R1}/x/late"));
+    settle(&mut [&mut up, &mut r.tether]);
+    assert!(
+        kind.declared(a_sent(&r.tether))
+            .contains(&format!("{R1}/x/late")),
+        "{kind:?} {cancel:?}: the configured interest was cancelled with the session's"
+    );
+
+    // on the next connection only the configured interest is declared, and it works
+    up.disconnect();
+    settle(&mut [&mut r.tether]);
+    let mut up = leaf_uplink(&r.bridge, &c);
+    settle(&mut [&mut up, &mut r.tether]);
+    assert_eq!(
+        a_sent(&up).interests,
+        [(scope, InterestMode::CurrentFuture, kind.options())],
+        "{kind:?} {cancel:?}"
+    );
+    kind.declare(&phone, 99, format!("{R1}/x/later"));
+    settle(&mut [&mut up, &mut r.tether]);
+    assert_eq!(
+        kind.declared(a_sent(&r.tether)),
+        set([&format!("{R1}/x/late"), &format!("{R1}/x/later")]),
+        "{kind:?} {cancel:?}"
+    );
+}
+
+#[test]
+fn configured_subscriber_interest_outlives_a_session_that_undeclares_the_same() {
+    configured_interest_outlives_the_same_interest_of_a_session(
+        Kind::Subscribers,
+        Cancel::Undeclare,
+    );
+}
+
+#[test]
+fn configured_queryable_interest_outlives_a_session_that_undeclares_the_same() {
+    configured_interest_outlives_the_same_interest_of_a_session(
+        Kind::Queryables,
+        Cancel::Undeclare,
+    );
+}
+
+#[test]
+fn configured_token_interest_outlives_a_session_that_undeclares_the_same() {
+    configured_interest_outlives_the_same_interest_of_a_session(Kind::Tokens, Cancel::Undeclare);
+}
+
+#[test]
+fn configured_subscriber_interest_outlives_a_session_that_closes() {
+    configured_interest_outlives_the_same_interest_of_a_session(Kind::Subscribers, Cancel::Close);
+}
+
+#[test]
+fn configured_queryable_interest_outlives_a_session_that_closes() {
+    configured_interest_outlives_the_same_interest_of_a_session(Kind::Queryables, Cancel::Close);
+}
+
+#[test]
+fn configured_token_interest_outlives_a_session_that_closes() {
+    configured_interest_outlives_the_same_interest_of_a_session(Kind::Tokens, Cancel::Close);
+}
+
+/// The north remote never answers the configured interest, here one that asks for subscribers,
+/// queryables and tokens: nothing the bridge sends reaches the cloud, as when the access control
+/// drops the interest. Until the deadline the bridge routes as any client whose interest is
+/// pending: publications and queries on the keys of the interest go to the uplink. After the
+/// deadline they stay south, and the interest is reported unanswered. A late answer finalizes
+/// it.
+#[test]
+fn an_unanswered_interest_stops_sending_north_at_its_deadline() {
+    try_init_tracing_subscriber();
+    let c = cloud();
+    let mut r = Robot::new(impatient_leaf_bridge_with(&all_of(R1)));
+    // the bridge itself subscribes: the publications of the application reach the bridge
+    let local = r.bridge.new_session();
+    local.declare_subscriber(None, 1, "**");
+    r.tether.bi_fwd();
+    // not forwarded: the cloud never receives the interest
+    let mut up = leaf_uplink(&r.bridge, &c);
+    assert_eq!(
+        interest_states(&r.bridge),
+        [Some(UplinkInterestState::Pending)]
+    );
+
+    r.app.put(format!("{R1}/internal/joint"), vec![1]);
+    r.tether.bi_fwd();
+    local.query(1, format!("{R1}/srv/x"));
+    let sent = a_sent(&up);
+    assert_eq!(sent.pushes, [format!("{R1}/internal/joint")]);
+    assert_eq!(sent.requests.len(), 1);
+
+    wait_for_the_deadline(&r.bridge, &[Some(UplinkInterestState::Unanswered)]);
+    r.app.put(format!("{R1}/internal/joint"), vec![2]);
+    r.tether.bi_fwd();
+    local.query(2, format!("{R1}/srv/x"));
+    let sent = a_sent(&up);
+    assert_eq!(
+        sent.pushes.len(),
+        1,
+        "sent north after the deadline: {:?}",
+        sent.pushes
+    );
+    assert_eq!(sent.requests.len(), 1, "{:?}", sent.requests);
+    assert_eq!(seen(&local).pushes.len(), 2, "local delivery goes on");
+    // the second query has no destination and is ended at once; the first one is on its way
+    assert_eq!(seen(&local).response_finals, 1);
+
+    // the answer arrives late
+    settle(&mut [&mut up, &mut r.tether]);
+    assert_eq!(
+        interest_states(&r.bridge),
+        [Some(UplinkInterestState::Finalized)]
+    );
+    assert_eq!(seen(&local).response_finals, 2);
+}
+
+/// The interest that asks for tokens is dropped on the way, as by an access control that denies
+/// `declare_liveliness_subscriber` on its key, and the one that asks for subscribers and
+/// queryables is answered. The first is reported unanswered after the deadline and the south
+/// router does not get the cloud's tokens. The flows of the second are not affected.
+#[test]
+fn a_dropped_token_interest_is_reported_and_leaves_the_other_interests_alone() {
+    try_init_tracing_subscriber();
+    let c = cloud();
+    let phone = client(&c, CLIENTS);
+    phone.declare_subscriber(None, 1, format!("{R1}/tele/**"));
+    phone.declare_token(None, 2, format!("{R1}/alive/phone"));
+    let mut r = Robot::new(impatient_leaf_bridge_with(&format!(
+        r#"{{ key_expr: "{R1}/**", subscribers: true, queryables: true }},
+           {{ key_expr: "{R1}/alive/**", tokens: true }}"#
+    )));
+    let local = r.bridge.new_session();
+    local.declare_subscriber(None, 1, "**");
+    let mut up = leaf_uplink(&r.bridge, &c);
+    let asks_for_tokens =
+        |msg: &Message| matches!(msg, Message::Interest(Interest { options, .. }) if options.tokens());
+    let mut dropped = 0;
+    loop {
+        let before = (a_sent(&up).declarations.len(), b_sent(&up).declarations.len());
+        dropped += up.fwd_if(|msg| !asks_for_tokens(msg));
+        up.rev_fwd();
+        r.tether.bi_fwd();
+        if before == (a_sent(&up).declarations.len(), b_sent(&up).declarations.len())
+            && up.fwd_if(|msg| !asks_for_tokens(msg)) == 0
+            && up.rev_fwd().is_empty()
+        {
+            break;
+        }
+    }
+    assert_eq!(dropped, 1);
+    assert_eq!(
+        interest_states(&r.bridge),
+        [
+            Some(UplinkInterestState::Finalized),
+            Some(UplinkInterestState::Pending)
+        ]
+    );
+
+    wait_for_the_deadline(
+        &r.bridge,
+        &[
+            Some(UplinkInterestState::Finalized),
+            Some(UplinkInterestState::Unanswered),
+        ],
+    );
+    let south = a_sent(&r.tether);
+    assert_eq!(south.subscribers, set([&format!("{R1}/tele/**"), "**"]));
+    assert_eq!(south.tokens, set([]));
+
+    r.app.put(format!("{R1}/tele/vital"), vec![1]);
+    r.app.put(format!("{R1}/internal/joint"), vec![2]);
+    r.tether.bi_fwd();
+    up.fwd_if(|msg| !asks_for_tokens(msg));
+    assert_eq!(seen(&phone).pushes, [format!("{R1}/tele/vital")]);
+    assert_eq!(a_sent(&up).pushes, [format!("{R1}/tele/vital")]);
+}
+
+/// A configured interest has no state when the leaf has no north remote, and is declared anew,
+/// pending, on each connection.
+#[test]
+fn configured_interests_start_pending_on_each_connection() {
+    try_init_tracing_subscriber();
+    let c = cloud();
+    let r = Robot::new(leaf_bridge(R1));
+    assert_eq!(interest_states(&r.bridge), [None]);
+
+    for _ in 0..2 {
+        let mut up = leaf_uplink(&r.bridge, &c);
+        assert_eq!(
+            interest_states(&r.bridge),
+            [Some(UplinkInterestState::Pending)]
+        );
+        up.bi_fwd();
+        assert_eq!(
+            interest_states(&r.bridge),
+            [Some(UplinkInterestState::Finalized)]
+        );
+        up.disconnect();
+        assert_eq!(interest_states(&r.bridge), [None]);
+    }
+}
+
+/// Without `gateway.north`, a client routes as before: a finalized interest of one of its
+/// sessions says nothing about a key that the key expression of that interest merely includes.
+/// A publication or a query on such a key is still sent north.
+#[test]
+fn a_client_without_configured_interests_keeps_the_exact_resource_rule() {
+    try_init_tracing_subscriber();
+    let node = Harness::new_client();
+    let north = node.new_face(
+        FaceDef::default()
+            .region(Region::North)
+            .mode(WhatAmI::Router)
+            .remote_bound(Bound::South),
+    );
+    let session = node.new_session();
+    let options =
+        InterestOptions::KEYEXPRS + InterestOptions::SUBSCRIBERS + InterestOptions::QUERYABLES;
+    session.interest(1, InterestMode::CurrentFuture, options, "a/**");
+    let interests = north.recorder().interests();
+    assert_eq!(interests.len(), 1);
+    north.declare_final(interests[0].id);
+
+    session.put("a/b", vec![1]);
+    session.query(1, "a/b");
+
+    let sent = seen_from(&north, None);
+    assert_eq!(sent.pushes, ["a/b"]);
+    assert_eq!(
+        sent.requests.iter().map(|(_, k)| k).collect::<Vec<_>>(),
+        ["a/b"]
+    );
 }
