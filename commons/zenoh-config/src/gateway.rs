@@ -122,3 +122,42 @@ pub struct GatewayFiltersConf {
     #[serde(default)]
     pub negated: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn north_section_is_parsed() {
+        let conf: GatewayConf = json5::from_str(
+            r#"{
+                north: {
+                    mode: "client",
+                    uplinks: [{ link_protocols: ["quic"] }, { interfaces: ["wwan0"] }],
+                    interests: [
+                        { key_expr: "sn/**", subscribers: true, queryables: true },
+                        { key_expr: "sn/alive/**", tokens: true },
+                    ],
+                },
+            }"#,
+        )
+        .unwrap();
+        let north = conf.north.unwrap();
+        assert_eq!(north.mode, Some(WhatAmI::Client));
+        assert_eq!(north.uplinks.unwrap().len(), 2);
+        assert_eq!(north.interests.len(), 2);
+        assert!(north.interests[0].subscribers && north.interests[0].queryables);
+        assert!(!north.interests[0].tokens && north.interests[1].tokens);
+    }
+
+    #[test]
+    fn north_section_is_optional_and_strict() {
+        let conf: GatewayConf = json5::from_str("{}").unwrap();
+        assert!(conf.north.is_none());
+        assert!(json5::from_str::<GatewayConf>(r#"{ north: { uplink: [] } }"#).is_err());
+        assert!(json5::from_str::<GatewayConf>(
+            r#"{ north: { interests: [{ subscribers: true }] } }"#
+        )
+        .is_err());
+    }
+}
