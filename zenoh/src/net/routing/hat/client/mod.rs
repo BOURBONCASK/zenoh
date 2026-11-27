@@ -85,7 +85,10 @@ impl Hat {
         }
     }
 
-    pub(crate) fn set_uplink_interests(&mut self, interests: Vec<(Arc<Resource>, InterestOptions)>) {
+    pub(crate) fn set_uplink_interests(
+        &mut self,
+        interests: Vec<(Arc<Resource>, InterestOptions)>,
+    ) {
         self.uplink_interests = interests;
     }
 

@@ -17,9 +17,9 @@ use zenoh_config::{
 };
 #[allow(unused_imports)]
 use zenoh_core::polyfill::*;
+use zenoh_link::Link;
 use zenoh_protocol::core::{Bound, Region};
 use zenoh_result::ZResult;
-use zenoh_link::Link;
 use zenoh_transport::TransportPeer;
 
 /// Computes the _transient_ [`Bound`] of a remote.

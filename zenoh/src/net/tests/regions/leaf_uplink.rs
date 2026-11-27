@@ -316,7 +316,9 @@ fn seen_from(face: &MockFace, reverse: Option<&MockFace>) -> Seen {
                     DeclareBody::DeclareFinal(_) => s.declare_finals += 1,
                 },
                 Message::Push(p) => s.pushes.push(full((&ids, &receiver_ids), &p.wire_expr)),
-                Message::Request(r) => s.requests.push((r.id, full((&ids, &receiver_ids), &r.wire_expr))),
+                Message::Request(r) => s
+                    .requests
+                    .push((r.id, full((&ids, &receiver_ids), &r.wire_expr))),
                 Message::Response(r) => s.replies.push(full((&ids, &receiver_ids), &r.wire_expr)),
                 Message::ResponseFinal(_) => s.response_finals += 1,
                 Message::Interest(i) => s.interests.push((
@@ -414,7 +416,8 @@ fn cloud_publication_reaches_robot_subscriber() {
     let phone = client(&c, CLIENTS);
     let mut r = Robot::new(leaf_bridge(R1));
     let mut up = leaf_uplink(&r.bridge, &c);
-    r.app.declare_subscriber(None, 1, format!("{R1}/control/down"));
+    r.app
+        .declare_subscriber(None, 1, format!("{R1}/control/down"));
     settle(&mut [&mut r.tether, &mut up]);
 
     phone.put(format!("{R1}/control/down"), vec![1]);
@@ -513,15 +516,24 @@ fn liveliness_tokens_cross_the_uplink_both_ways() {
     let c = cloud();
     let phone = client(&c, CLIENTS);
     let tokens = InterestOptions::KEYEXPRS + InterestOptions::TOKENS;
-    phone.interest(1, InterestMode::CurrentFuture, tokens, format!("{R1}/alive/**"));
+    phone.interest(
+        1,
+        InterestMode::CurrentFuture,
+        tokens,
+        format!("{R1}/alive/**"),
+    );
     phone.declare_token(None, 1, format!("{R1}/alive/phone"));
     let mut r = Robot::new(leaf_bridge(R1));
     let mut up = leaf_uplink(&r.bridge, &c);
     settle(&mut [&mut up, &mut r.tether]);
 
     r.app.declare_token(None, 1, format!("{R1}/alive/app"));
-    r.app
-        .interest(1, InterestMode::CurrentFuture, tokens, format!("{R1}/alive/**"));
+    r.app.interest(
+        1,
+        InterestMode::CurrentFuture,
+        tokens,
+        format!("{R1}/alive/**"),
+    );
     settle(&mut [&mut r.tether, &mut up]);
 
     assert!(
@@ -590,8 +602,12 @@ fn cloud_wildcards_reach_every_robot() {
     let (mut r1, mut r2) = (Robot::new(leaf_bridge(R1)), Robot::new(leaf_bridge(R2)));
     let (mut up1, mut up2) = (leaf_uplink(&r1.bridge, &c), leaf_uplink(&r2.bridge, &c));
     for (r, sn) in [(&r1, R1), (&r2, R2)] {
-        r.app
-            .declare_queryable(None, 1, format!("{sn}/srv/list"), QueryableInfoType::DEFAULT);
+        r.app.declare_queryable(
+            None,
+            1,
+            format!("{sn}/srv/list"),
+            QueryableInfoType::DEFAULT,
+        );
     }
     settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
 
@@ -617,7 +633,10 @@ fn a_leaf_holds_no_declaration_of_another_robot() {
     /// The declarations the bridge sent to its south router, for a robot `R1` whose bridge is
     /// `bridge`, next to a robot `R2` with a leaf uplink that declares four entities, and a
     /// cloud that declares entities for both robots and for every robot.
-    fn sent_south(bridge: Harness, uplink: fn(&Harness, &Harness) -> EstablishedConnection) -> Seen {
+    fn sent_south(
+        bridge: Harness,
+        uplink: fn(&Harness, &Harness) -> EstablishedConnection,
+    ) -> Seen {
         let c = cloud();
         let phone = client(&c, CLIENTS);
         let mut r1 = Robot::new(bridge);
@@ -630,8 +649,12 @@ fn a_leaf_holds_no_declaration_of_another_robot() {
         phone.declare_subscriber(None, 1, "*/log");
         r2.app.declare_subscriber(None, 1, format!("{R2}/control"));
         r2.app.declare_subscriber(None, 2, format!("{R2}/x"));
-        r2.app
-            .declare_queryable(None, 3, format!("{R2}/srv/list"), QueryableInfoType::DEFAULT);
+        r2.app.declare_queryable(
+            None,
+            3,
+            format!("{R2}/srv/list"),
+            QueryableInfoType::DEFAULT,
+        );
         r2.app.declare_token(None, 4, format!("{R2}/alive/app"));
         settle(&mut [&mut r2.tether, &mut up2, &mut up1, &mut r1.tether]);
         a_sent(&r1.tether)
@@ -715,13 +738,13 @@ fn an_uplink_flap_does_not_disturb_the_south_region() {
     settle(&mut [&mut r.tether, &mut up]);
 
     let after = a_sent(&r.tether);
-    assert_eq!(after.oams, before.oams, "link state sent to the south router");
+    assert_eq!(
+        after.oams, before.oams,
+        "link state sent to the south router"
+    );
     assert_eq!(
         after.declarations[before.declarations.len()..],
-        [
-            format!("-sub {R1}/tele/**"),
-            format!("+sub {R1}/tele/**")
-        ]
+        [format!("-sub {R1}/tele/**"), format!("+sub {R1}/tele/**")]
     );
     assert_eq!(seen(&other_app).pushes.len(), 2);
     assert_eq!(seen(&phone).pushes, [format!("{R1}/tele/vital")]);
@@ -737,11 +760,16 @@ fn uplink_interests_are_declared_on_each_connection() {
         r#"{{ key_expr: "{R1}/**", subscribers: true, queryables: true }},
            {{ key_expr: "{R1}/alive/**", tokens: true }}"#
     )));
-    let entities = InterestOptions::KEYEXPRS + InterestOptions::SUBSCRIBERS + InterestOptions::QUERYABLES;
+    let entities =
+        InterestOptions::KEYEXPRS + InterestOptions::SUBSCRIBERS + InterestOptions::QUERYABLES;
     let tokens = InterestOptions::KEYEXPRS + InterestOptions::TOKENS;
     let expected = [
         (format!("{R1}/**"), InterestMode::CurrentFuture, entities),
-        (format!("{R1}/alive/**"), InterestMode::CurrentFuture, tokens),
+        (
+            format!("{R1}/alive/**"),
+            InterestMode::CurrentFuture,
+            tokens,
+        ),
     ];
 
     for _ in 0..2 {
@@ -828,8 +856,11 @@ fn leaf_and_router_bridges_share_a_cloud_router() {
     let (mut leaf, mut router) = (Robot::new(leaf_bridge(R1)), Robot::new(router_bridge()));
     let mut up1 = leaf_uplink(&leaf.bridge, &c);
     let mut up2 = router_uplink(&router.bridge, &c);
-    leaf.app.declare_subscriber(None, 1, format!("{R1}/control"));
-    router.app.declare_subscriber(None, 1, format!("{R2}/control"));
+    leaf.app
+        .declare_subscriber(None, 1, format!("{R1}/control"));
+    router
+        .app
+        .declare_subscriber(None, 1, format!("{R2}/control"));
     settle(&mut [&mut leaf.tether, &mut router.tether, &mut up1, &mut up2]);
 
     leaf.app.put(format!("{R1}/tele/a"), vec![1]);
