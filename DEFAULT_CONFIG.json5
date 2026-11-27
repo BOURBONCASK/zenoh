@@ -312,10 +312,33 @@
   /// What is sent to the uplink: what the north remote declared a matching subscriber or
   /// queryable for. In addition, a publication or a query for which it declared none is sent
   ///   - if no interest includes its key and asks for subscribers (resp. queryables): the router
-  ///     does not know what the north has for such a key;
+  ///     does not know what the north has for such a key. `default_route` restricts this case;
   ///   - while an interest that includes its key is `pending`, which is bounded by
   ///     `routing/interests/timeout` (10 s by default).
   /// Once such an interest is `finalized`, `unanswered` or `denied`, it is not sent.
+  ///
+  /// `gateway.north.default_route` (unset by default, routers only, with or without `mode`)
+  /// names the key expressions that may have destinations in the north that this router does
+  /// not know, so that sessions below it can reach them without any declaration:
+  ///   - `key_exprs` (at least one): the key expressions concerned;
+  ///   - `except`: those among them whose destinations this router knows, typically its own.
+  /// A publication or a query is eligible iff its key expression is included in one of
+  /// `key_exprs` and in none of `except`. A wildcard that is wider than `key_exprs` (`**`) is
+  /// not eligible. An eligible message is sent, in addition to its declared destinations:
+  ///   - by a router whose north region is a router region: towards the gateway of that region
+  ///     (the one with the greatest Zenoh ID if there are several). Every router between the
+  ///     source and the gateway needs the option. A message that comes from the gateway is not
+  ///     sent back;
+  ///   - by a leaf (`mode: "client"`): to its north remote. With `default_route` set, a leaf
+  ///     does not send north the other keys that no interest includes: they only go north
+  ///     towards a declared subscriber or queryable.
+  /// A query sent this way keeps its target; it is ended by the first router on the way that
+  /// has no destination for it. Liveliness is not concerned: the tokens of the north are only
+  /// known through `interests`.
+  /// Example, on both routers of a robot `robot1` whose fleet uses the keys `<robot>/app/**`:
+  ///   north: {
+  ///     default_route: { key_exprs: ["*/app/**"], except: ["robot1/**"] },
+  ///   }
   ///
   /// State of the uplink, in the admin space at `@/<zid>/router/uplink` (JSON):
   ///   - `state`: `connected`, `closing` (the uplink lost its link, the next north remote is
