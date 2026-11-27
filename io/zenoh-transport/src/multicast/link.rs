@@ -315,6 +315,7 @@ impl TransportLinkMulticastUniversal {
                     .config
                     .max_wait_before_drop_fragments,
                 wait_before_close: self.transport.manager.config.wait_before_close,
+                disable_on_failed_block: false,
                 batching_enabled: self.transport.manager.config.batching,
                 batching_time_limit: self.transport.manager.config.queue_backoff,
                 queue_alloc: self.transport.manager.config.queue_alloc,
