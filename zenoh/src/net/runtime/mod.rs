@@ -1266,7 +1266,7 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     runtime: runtime.clone(),
                     endpoints: std::sync::RwLock::new(HashSet::new()),
                     main_handler,
-                    main_handler_closed: std::sync::Mutex::new(false),
+                    main_handler_closed: std::sync::RwLock::new(false),
                     transport,
                     north_ticket,
                     slave_handlers,
@@ -1318,8 +1318,10 @@ pub(super) struct RuntimeSession {
     pub(super) runtime: Runtime,
     pub(super) endpoints: std::sync::RwLock<HashSet<EndPoint>>,
     pub(super) main_handler: Arc<DeMux>,
-    /// Whether [`Self::main_handler`] was closed. Locked while it is being closed.
-    main_handler_closed: std::sync::Mutex<bool>,
+    /// Whether [`Self::main_handler`] was closed. Locked for writing while it is being closed.
+    /// Locked for reading while a message of the north remote of a leaf router is routed, see
+    /// [`RuntimeSession::handle_message`].
+    main_handler_closed: std::sync::RwLock<bool>,
     transport: TransportUnicast,
     /// The admission of this remote as the north remote of a leaf router, if it is.
     north_ticket: Option<uplink::NorthTicket>,
@@ -1330,8 +1332,13 @@ impl RuntimeSession {
     /// Closes the routing face of this transport, once. Returns when the face is closed,
     /// whoever closes it: a leaf router closes the face of an uplink that lost its link before
     /// it admits the next one, without waiting for the close of the transport.
+    ///
+    /// For the north remote of a leaf router this first waits for the message of that remote
+    /// that is being routed, if there is one, and no message of it is routed afterwards (see
+    /// [`RuntimeSession::handle_message`]). It does not wait for the read tasks of the
+    /// transport, which may still hold a message they have not given to this handler.
     fn close_main_handler(&self) {
-        let mut closed = self.main_handler_closed.lock().unwrap();
+        let mut closed = self.main_handler_closed.write().unwrap();
         if !*closed {
             self.main_handler.closed();
             *closed = true;
@@ -1341,6 +1348,29 @@ impl RuntimeSession {
 
 impl TransportPeerEventHandler for RuntimeSession {
     fn handle_message(&self, msg: NetworkMessageMut) -> ZResult<()> {
+        if self.north_ticket.is_none() {
+            return self.main_handler.handle_message(msg);
+        }
+        // NOTE(leaf): the face of the north remote of a leaf router is closed as soon as the
+        // next remote takes over, which is before the transport of this one has stopped its
+        // read tasks: one of them may hold this handler and call it afterwards, whenever it
+        // is scheduled again. Such a message is dropped, whatever it is: a declaration would
+        // never be withdrawn, since the face is closed only once.
+        //
+        // The message is routed with the lock held for reading, and the face is closed with it
+        // held for writing. A flag tested before routing would not do: the face could be closed
+        // between the test and the routing. And a message that is being routed when the next
+        // remote takes over is routed to its end first, with everything it sends to the other
+        // faces: what the closing of the face withdraws is then sent after what the message
+        // declared, never before.
+        let closed = self.main_handler_closed.read().unwrap();
+        if *closed {
+            tracing::debug!(
+                "Uplink: message of {} dropped, its face is closed",
+                self.main_handler.face.state.zid
+            );
+            return Ok(());
+        }
         self.main_handler.handle_message(msg)
     }
 
