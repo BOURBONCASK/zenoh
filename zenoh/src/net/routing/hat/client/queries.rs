@@ -181,7 +181,7 @@ impl HatQueriesTrait for Hat {
                     .resource()
                     .and_then(|res| res.face_ctxs.get(&face.id))
                     .is_some_and(|ctx| ctx.queryable_interest_finalized)
-                    || self.has_finalized_interest(face, key_expr, |o| o.queryables());
+                    || self.uplink_interests_settle(face, key_expr, |o| o.queryables());
                 if !has_interest_finalized {
                     tracing::debug!(dst = %face, dst.has_unfinalized_queryable_interest = true);
                     let wire_expr = expr.get_best_key(face.id);
