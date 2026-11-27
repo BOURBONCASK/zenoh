@@ -813,3 +813,197 @@ async fn test_regions_leaf_uplink_hands_over_to_the_other_north_remote() {
     );
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Default route (`gateway.north.default_route`): two robots on one cloud router
+//
+//                    cloud (R) ── phone (C)
+//                   /         \
+//     r1:  bridge (R) ── x5 (C)  bridge (R)  :r2
+//            |                     |
+//          south (R) ── app (C)   south (R) ── app (C)
+// ---------------------------------------------------------------------------------------------
+
+/// The keys the robots address each other with.
+const FLEET_KEYS: &str = "*/app/**";
+
+struct Robot {
+    _south: Session,
+    bridge: Session,
+    /// A session of the south router, two hops south of the uplink.
+    app: Session,
+    /// A session of the bridge.
+    x5: Session,
+}
+
+/// A robot named `name` (`r1`, `r2`), whose bridge is a leaf of `cloud` and asks for everything
+/// of its name. With `default_route`, both of its routers have a default route for the keys of
+/// the fleet that are not its own.
+async fn robot(cloud: &Session, name: &str, zid_prefix: &str, default_route: bool) -> Robot {
+    let zid = |n: u8| format!("{zid_prefix}{n:02x}");
+    let default_route = if default_route {
+        format!(r#"default_route: {{ key_exprs: ["{FLEET_KEYS}"], except: ["{name}/**"] }},"#)
+    } else {
+        String::new()
+    };
+    let south_ep = format!(
+        "unixsock-stream/{}",
+        std::env::temp_dir()
+            .join(format!(
+                "zenoh-leaf-{zid_prefix}-{}.sock",
+                std::process::id()
+            ))
+            .display()
+    );
+    let south = ztimeout!(Node::new(Router, &zid(3))
+        .listen(&south_ep)
+        .gateway(format!(r#"{{ north: {{ {default_route} }} }}"#))
+        .open());
+    let bridge = ztimeout!(Node::new(Router, &zid(2))
+        .endpoints("tcp/127.0.0.1:0", &[&south_ep, loc!(cloud)])
+        .gateway(format!(
+            r#"{{
+                north: {{
+                    mode: "client",
+                    uplinks: [{{ link_protocols: ["tcp"] }}],
+                    interests: [
+                        {{ key_expr: "{name}/**", subscribers: true, queryables: true }},
+                    ],
+                    {default_route}
+                }},
+                south: [
+                    {{ filters: [{{ modes: ["router"], zids: ["{}"] }}] }},
+                    {{ filters: [{{ modes: ["client"] }}] }},
+                ],
+            }}"#,
+            zid(3)
+        ))
+        .open());
+    let app = ztimeout!(Node::new(Client, &zid(5)).connect(&[&south_ep]).open());
+    let x5 = ztimeout!(Node::new(Client, &zid(6))
+        .connect(&[loc!(bridge)])
+        .open());
+    eventually_interest_states(&bridge, &["finalized"]).await;
+    Robot {
+        _south: south,
+        bridge,
+        app,
+        x5,
+    }
+}
+
+async fn fleet_of_two(zid_prefix: &str, default_route: bool) -> (Session, Robot, Robot) {
+    let cloud = ztimeout!(Node::new(Router, &format!("{zid_prefix}01"))
+        .listen("tcp/127.0.0.1:0")
+        .gateway(CLOUD_GATEWAY)
+        .open());
+    let r1 = robot(&cloud, "r1", &format!("{zid_prefix}1"), default_route).await;
+    let r2 = robot(&cloud, "r2", &format!("{zid_prefix}2"), default_route).await;
+    (cloud, r1, r2)
+}
+
+/// Sessions of a robot, on its south router and on its bridge, publish to and query a key of
+/// another robot, both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_default_route_reaches_another_robot() {
+    zenoh::init_log_from_env_or("error");
+    let (_cloud, r1, r2) = fleet_of_two("1eafb", true).await;
+
+    let control2 = ztimeout!(r2
+        .app
+        .declare_subscriber("r2/app/control")
+        .with(unbounded_sink()))
+    .unwrap();
+    let control1 = ztimeout!(r1
+        .x5
+        .declare_subscriber("r1/app/control")
+        .with(unbounded_sink()))
+    .unwrap();
+    let _srv2 = ztimeout!(r2
+        .app
+        .declare_queryable("r2/app/srv")
+        .callback(|query| {
+            query.reply("r2/app/srv", "from r2").wait().unwrap();
+        }))
+    .unwrap();
+
+    delivered(&r1.app, "r2/app/control", &control2).await;
+    let seen = control2.count_by(|_| true);
+    delivered(&r2.app, "r1/app/control", &control1).await;
+    delivered(&r2.x5, "r1/app/control", &control1).await;
+    assert_eq!(control2.count_by(|_| true), seen);
+
+    for session in [&r1.app, &r1.x5] {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while replies(session, "r2/app/srv").await != ["from r2"] {
+            assert!(tokio::time::Instant::now() < deadline, "no reply");
+        }
+    }
+    // a query that nobody answers ends at once, without waiting for its timeout
+    let start = tokio::time::Instant::now();
+    assert!(replies(&r1.app, "r2/app/nobody").await.is_empty());
+    assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+}
+
+/// The same sessions without the default route: the session of the bridge reaches the other
+/// robot, the session of the south router does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_without_default_route_only_the_bridge_reaches_another_robot() {
+    zenoh::init_log_from_env_or("error");
+    let (_cloud, r1, r2) = fleet_of_two("1eafc", false).await;
+    let control2 = ztimeout!(r2
+        .app
+        .declare_subscriber("r2/app/control")
+        .with(unbounded_sink()))
+    .unwrap();
+
+    delivered(&r1.x5, "r2/app/control", &control2).await;
+    let seen = control2.count_by(|_| true);
+    for _ in 0..10 {
+        ztimeout!(r1.app.put("r2/app/control", "x")).unwrap();
+        tokio::time::sleep(SLEEP).await;
+    }
+    assert_eq!(control2.count_by(|_| true), seen);
+}
+
+/// A wildcard query inside the keys of the fleet gets the replies of the robot and of the other
+/// one, once each. A key outside the keys of the fleet is not sent to the cloud by a robot with
+/// a default route, even from a session of its bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_default_route_keeps_other_keys_on_the_robot() {
+    zenoh::init_log_from_env_or("error");
+    let (cloud, r1, r2) = fleet_of_two("1eafd", true).await;
+    let phone = ztimeout!(Node::new(Client, "1eafd004")
+        .connect(&[loc!(cloud)])
+        .open());
+    let _status1 = ztimeout!(r1.x5.declare_queryable("r1/app/status").callback(|query| {
+        query.reply("r1/app/status", "r1").wait().unwrap();
+    }))
+    .unwrap();
+    let _status2 = ztimeout!(r2.app.declare_queryable("r2/app/status").callback(|query| {
+        query.reply("r2/app/status", "r2").wait().unwrap();
+    }))
+    .unwrap();
+    // outside of the interests of the bridges: the cloud does not declare them to the robots
+    let outside = ztimeout!(phone.declare_subscriber("rt/**").with(unbounded_sink())).unwrap();
+    let foreign = ztimeout!(phone
+        .declare_subscriber("r9/app/**")
+        .with(unbounded_sink()))
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let mut got = replies(&r1.app, "*/app/status").await;
+        got.sort();
+        if got == ["r1", "r2"] {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{got:?}");
+    }
+
+    delivered(&r1.x5, "r9/app/log", &foreign).await;
+    delivered(&r1.app, "r9/app/log", &foreign).await;
+    not_delivered(&r1.x5, "rt/camera", &outside).await;
+    not_delivered(&r1.app, "rt/camera", &outside).await;
+    assert_eq!(interest_states(&r1.bridge).await, ["finalized"]);
+}
