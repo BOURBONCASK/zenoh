@@ -154,6 +154,44 @@ pub struct DownsamplingItemConf {
     pub flows: Option<NEVec<InterceptorFlow>>,
 }
 
+/// A rule that selects the links whose messages are handed over to an owned sender
+/// (`transport/link/tx/queue/handover/links`).
+#[derive(Serialize, Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HandoverLinkConf {
+    /// A name for logs and metrics.
+    pub id: Option<String>,
+    /// The link protocols selected by this rule. Required.
+    pub link_protocols: Vec<String>,
+    /// The network interfaces selected by this rule: a link is selected when it uses one of
+    /// them. All interfaces when empty.
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+    /// The bytes that messages which fit a batch may hold, for each priority.
+    #[serde(default = "defaults::handover::data_bytes")]
+    pub data_bytes: usize,
+    /// The bytes that messages longer than a batch may hold, all priorities together. Also
+    /// the largest message that the link takes.
+    #[serde(default = "defaults::handover::large_bytes")]
+    pub large_bytes: usize,
+    /// A publication, a query or a reply that has not started to be sent this long after it
+    /// was handed over is dropped. A query is also dropped at the end of its own timeout.
+    /// Default: `congestion_control/block/wait_before_close`.
+    pub max_age_ms: Option<u64>,
+    /// The bytes kept for declarations, interests and the ends of queries, taken from
+    /// `total_max_bytes` when the link is added, whatever the other links hold.
+    #[serde(default = "defaults::handover::reserve_min_bytes")]
+    pub reserve_min_bytes: usize,
+    /// The most that declarations, interests and the ends of queries may hold. They are never
+    /// dropped: when they do not fit, the transport is closed.
+    #[serde(default = "defaults::handover::reserve_max_bytes")]
+    pub reserve_max_bytes: usize,
+    /// The transport is closed when a declaration or an interest has not started to be sent
+    /// this long after it was handed over. Not shorter than `wait_before_close` and
+    /// `max_age_ms`. Default: 10 seconds, or the longer of these two.
+    pub control_max_age_ms: Option<u64>,
+}
+
 #[derive(Serialize, Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LowPassFilterConf {
@@ -763,6 +801,16 @@ validated_struct::validator! {
                         pub allocation: #[derive(Default, Copy, PartialEq, Eq)]
                         QueueAllocConf {
                             pub mode: QueueAllocMode,
+                        },
+                        /// Links whose messages are handed over to a sender that owns them, instead of
+                        /// being pushed into the priority queues above. The caller never waits for such
+                        /// a link: a message is taken at once, within the byte budgets below, or refused.
+                        /// Without rules nothing changes.
+                        pub handover: HandoverConf {
+                            /// The bytes that the selected links of this process may hold all together.
+                            total_max_bytes: usize,
+                            /// The rules that select links. A link matches one rule at most.
+                            links: Vec<HandoverLinkConf>,
                         },
                     },
                     // Number of threads used for TX

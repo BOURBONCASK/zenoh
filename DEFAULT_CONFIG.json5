@@ -682,6 +682,54 @@
             /// - "lazy": batches are allocated when needed up to the maximum number of batches configured in the size configuration parameter.
             mode: "lazy",
           },
+          /// Links whose messages are handed over to a sender that owns them, instead of being pushed
+          /// into the priority queues above. Without rules nothing changes.
+          ///
+          /// A thread that sends on a selected link never waits for it: a message is taken at once,
+          /// within the byte budgets of its rule, or refused. A refused or expired query ends with an
+          /// error reply ("Congestion: query not delivered" or "Congestion: query expired before
+          /// transmission") and its final. When replies are refused or expire, their query gets the
+          /// error reply "Congestion: replies dropped" before its final. A refused or expired
+          /// publication is dropped and counted, also with CongestionControl::Block: a selected link
+          /// does not slow its publishers down. Declarations, interests and finals are never dropped:
+          /// when they do not fit their reserve, or wait longer than `control_max_age_ms`, the
+          /// transport is closed, as it is when nothing is written for `wait_before_close`.
+          ///
+          /// Supported: QUIC links (all priorities go on one stream) of transports with QoS, one
+          /// link, without shared memory and without lowlatency. `wait_before_close` must be
+          /// positive. A rule for anything else is refused at start-up; a selected link that turns
+          /// out not to qualify is refused when it is added. The counters are in the admin space
+          /// (`@/<zid>/router`, key `handover`).
+          // handover: {
+          //   /// The bytes that the selected links of this process may hold all together.
+          //   total_max_bytes: 268435456,
+          //   links: [
+          //     {
+          //       /// A name for logs.
+          //       id: "uplink",
+          //       /// Required. Only "quic".
+          //       link_protocols: ["quic"],
+          //       /// The network interfaces of the selected links. All when absent or empty.
+          //       interfaces: ["eth0"],
+          //       /// Budget of each priority for messages that fit a batch.
+          //       data_bytes: 262144,
+          //       /// Budget, for all priorities, of messages longer than a batch. Also the largest
+          //       /// message that the link takes.
+          //       large_bytes: 16777216,
+          //       /// A publication, a query or a reply not started after this time is dropped.
+          //       /// A query is also dropped at the end of its own timeout, and forwards the time
+          //       /// that it has left. Default: wait_before_close.
+          //       max_age_ms: 5000,
+          //       /// Reserve of declarations, interests and finals: what the link always has, and
+          //       /// the most it can use.
+          //       reserve_min_bytes: 65536,
+          //       reserve_max_bytes: 1048576,
+          //       /// Not shorter than wait_before_close and max_age_ms. Default: 10 seconds, or the
+          //       /// longer of these two.
+          //       control_max_age_ms: 10000,
+          //     },
+          //   ],
+          // },
         },
       },
       /// Configure the zenoh RX parameters of a link

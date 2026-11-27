@@ -300,6 +300,36 @@ impl Default for CongestionControlBlockConf {
     }
 }
 
+pub mod handover {
+    #[allow(non_upper_case_globals)]
+    pub const total_max_bytes: usize = 256 * 1024 * 1024;
+
+    pub fn data_bytes() -> usize {
+        256 * 1024
+    }
+
+    pub fn large_bytes() -> usize {
+        16 * 1024 * 1024
+    }
+
+    pub fn reserve_min_bytes() -> usize {
+        64 * 1024
+    }
+
+    pub fn reserve_max_bytes() -> usize {
+        1024 * 1024
+    }
+}
+
+impl Default for HandoverConf {
+    fn default() -> Self {
+        Self {
+            total_max_bytes: handover::total_max_bytes,
+            links: Vec::new(),
+        }
+    }
+}
+
 impl Default for BatchingConf {
     fn default() -> Self {
         BatchingConf {

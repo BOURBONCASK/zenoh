@@ -438,6 +438,10 @@ impl TransportManagerBuilder {
         self = self.wait_before_close(duration_from_i64us(*cc_block.wait_before_close()));
         self = self.queue_size(link.tx().queue().size().clone());
         self = self.queue_alloc(*link.tx().queue().allocation());
+        if !link.tx().queue().handover().links().is_empty() {
+            // The sender of a selected link is not part of this build yet.
+            bail!("transport/link/tx/queue/handover/links: selecting links is not available yet");
+        }
         self = self.tx_threads(*link.tx().threads());
         self = self.protocols(link.protocols().clone());
         self = self.region_name(config.region_name().clone());
@@ -773,5 +777,35 @@ impl TransportManager {
         let mut lsm = zenoh_runtime::ZRuntime::Net.block_in_place(self.get_locators_multicast());
         lsu.append(&mut lsm);
         lsu
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zenoh_config::Config;
+
+    use super::TransportManagerBuilder;
+
+    // Until the sender of a selected link is complete, a rule is refused when the process
+    // starts: no link is given a part of its behaviour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_rule_that_selects_links_is_refused_for_now() {
+        assert!(TransportManagerBuilder::default()
+            .from_config(&Config::default().expanded())
+            .await
+            .is_ok());
+        let mut config = Config::default();
+        config
+            .insert_json5(
+                "transport/link/tx/queue/handover",
+                r#"{ links: [{ link_protocols: ["quic"] }] }"#,
+            )
+            .unwrap();
+        let e = TransportManagerBuilder::default()
+            .from_config(&config.expanded())
+            .await
+            .err()
+            .expect("the rule is refused");
+        assert!(e.to_string().contains("handover"), "{e}");
     }
 }
