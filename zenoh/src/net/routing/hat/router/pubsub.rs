@@ -366,8 +366,7 @@ impl HatPubSubTrait for Hat {
             );
         }
 
-        if let Some((face, source)) =
-            self.default_route_face(tables, key_expr, src_region, node_id)
+        if let Some((face, source)) = self.default_route_face(tables, key_expr, src_region, node_id)
         {
             route.insert(face.id, || {
                 tracing::debug!(dst = %face, dst.is_default_gateway = true);

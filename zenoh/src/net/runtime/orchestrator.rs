@@ -936,8 +936,7 @@ impl Runtime {
         }
 
         let uplink_of = |peer: &EndPoint| {
-            super::region::is_uplink_endpoint(peer, &self.state.config.lock())
-                .then(|| self.clone())
+            super::region::is_uplink_endpoint(peer, &self.state.config.lock()).then(|| self.clone())
         };
 
         let mut connected_peers = Vec::new();

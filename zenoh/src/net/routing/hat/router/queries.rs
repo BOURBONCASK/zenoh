@@ -382,8 +382,7 @@ impl HatQueriesTrait for Hat {
 
         // NOTE(leaf): the gateway is a destination of unknown content, not a queryable: it is
         // kept by `All` and `AllComplete`, and never preferred by `BestMatching`.
-        if let Some((face, source)) =
-            self.default_route_face(tables, key_expr, src_region, node_id)
+        if let Some((face, source)) = self.default_route_face(tables, key_expr, src_region, node_id)
         {
             tracing::debug!(dst = %face, dst.is_default_gateway = true);
             let wire_expr = expr.get_best_key(face.id);

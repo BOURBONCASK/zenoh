@@ -209,13 +209,15 @@ pub(crate) fn is_uplink_endpoint(endpoint: &EndPoint, config: &ExpandedConfig) -
     let endpoint_config = endpoint.config();
     let iface = endpoint_config.get(BIND_INTERFACE);
     north.uplinks.iter().any(|filter| {
-        filter.link_protocols.as_ref().is_none_or(|protocols| {
-            protocols.iter().any(|p| p.as_str() == protocol.as_str())
-        }) && match (&filter.interfaces, iface) {
-            (None, _) => filter.link_protocols.is_some(),
-            (Some(ifaces), Some(iface)) => ifaces.contains(&Interface(iface.to_owned())),
-            (Some(_), None) => false,
-        }
+        filter
+            .link_protocols
+            .as_ref()
+            .is_none_or(|protocols| protocols.iter().any(|p| p.as_str() == protocol.as_str()))
+            && match (&filter.interfaces, iface) {
+                (None, _) => filter.link_protocols.is_some(),
+                (Some(ifaces), Some(iface)) => ifaces.contains(&Interface(iface.to_owned())),
+                (Some(_), None) => false,
+            }
     })
 }
 
@@ -441,8 +443,7 @@ mod tests {
     /// `announced` to it, and whether the leaf accepts it.
     fn relationship(bound: Option<Bound>, announced: WhatAmI) -> ZResult<(Region, Bound)> {
         let (config, cloud) = (leaf(), remote(WhatAmI::Router, "c10d"));
-        let (region, remote_bound) =
-            compute_region_of(&cloud, &config, bound.as_ref(), announced)?;
+        let (region, remote_bound) = compute_region_of(&cloud, &config, bound.as_ref(), announced)?;
         check_leaf_relationship(&cloud, &config, &region, &remote_bound, announced)?;
         Ok((region, remote_bound))
     }
@@ -499,7 +500,10 @@ mod tests {
         let (region, remote_bound) = check(WhatAmI::Router).unwrap();
         assert!(region.bound().is_south() && remote_bound.is_north());
         let e = check(WhatAmI::Client).unwrap_err();
-        assert!(e.to_string().contains("matches gateway.north.uplinks"), "{e}");
+        assert!(
+            e.to_string().contains("matches gateway.north.uplinks"),
+            "{e}"
+        );
     }
 
     /// A release build has no assertion to stop a client north face whose remote is not south
@@ -515,7 +519,10 @@ mod tests {
             WhatAmI::Client,
         )
         .unwrap_err();
-        assert!(e.to_string().contains("does not put this node south"), "{e}");
+        assert!(
+            e.to_string().contains("does not put this node south"),
+            "{e}"
+        );
     }
 
     fn link(protocol: &str, interfaces: &[&str]) -> Link {
@@ -534,9 +541,8 @@ mod tests {
 
     fn with_uplinks(uplinks: &str) -> ExpandedConfig {
         let mut config = leaf();
-        config.gateway.north = Some(
-            json5::from_str(&format!(r#"{{ mode: "client", uplinks: {uplinks} }}"#)).unwrap(),
-        );
+        config.gateway.north =
+            Some(json5::from_str(&format!(r#"{{ mode: "client", uplinks: {uplinks} }}"#)).unwrap());
         config
     }
 
@@ -560,8 +566,9 @@ mod tests {
     /// A filter matches a link iff all its criteria do.
     #[test]
     fn uplink_filter_criteria_are_combined() {
-        let config =
-            with_uplinks(r#"[{ link_protocols: ["quic"], interfaces: ["wwan0"] }, { link_protocols: ["tls"] }]"#);
+        let config = with_uplinks(
+            r#"[{ link_protocols: ["quic"], interfaces: ["wwan0"] }, { link_protocols: ["tls"] }]"#,
+        );
 
         assert!(announced_mode_on(&link("quic", &["wwan0"]), &config).is_some());
         assert!(announced_mode_on(&link("quic", &["eth0"]), &config).is_none());
@@ -590,7 +597,10 @@ mod tests {
             config.gateway.north = Some(json5::from_str(north).unwrap());
             check_north_config(&config).map_err(|e| e.to_string())
         };
-        let (router, quic) = (WhatAmI::Router, r#"uplinks: [{ link_protocols: ["quic"] }]"#);
+        let (router, quic) = (
+            WhatAmI::Router,
+            r#"uplinks: [{ link_protocols: ["quic"] }]"#,
+        );
 
         assert!(check(router, &format!(r#"{{ mode: "client", {quic} }}"#)).is_ok());
         // `uplinks` omitted or empty does not mean every link
@@ -602,7 +612,8 @@ mod tests {
         let e = check(router, r#"{ mode: "client", uplinks: [{}] }"#).unwrap_err();
         assert!(e.contains("would match every link"), "{e}");
         // an interest must ask for something
-        let nothing = format!(r#"{{ mode: "client", {quic}, interests: [{{ key_expr: "a/**" }}] }}"#);
+        let nothing =
+            format!(r#"{{ mode: "client", {quic}, interests: [{{ key_expr: "a/**" }}] }}"#);
         let e = check(router, &nothing).unwrap_err();
         assert!(e.contains("asks for nothing"), "{e}");
         // only a router can be a leaf, and only a leaf has uplinks and interests
@@ -616,7 +627,11 @@ mod tests {
         // a default route does not need a leaf, but needs a router and a key expression
         let default_route = r#"default_route: { key_exprs: ["*/app/**"], except: ["r1/**"] }"#;
         assert!(check(router, &format!("{{ {default_route} }}")).is_ok());
-        assert!(check(router, &format!(r#"{{ mode: "client", {quic}, {default_route} }}"#)).is_ok());
+        assert!(check(
+            router,
+            &format!(r#"{{ mode: "client", {quic}, {default_route} }}"#)
+        )
+        .is_ok());
         let e = check(WhatAmI::Peer, &format!("{{ {default_route} }}")).unwrap_err();
         assert!(e.contains("default_route only applies to a router"), "{e}");
         let e = check(router, r#"{ default_route: { key_exprs: [] } }"#).unwrap_err();
@@ -631,10 +646,25 @@ mod tests {
         let by_interface = with_uplinks(r#"[{ interfaces: ["wwan0"] }]"#);
         let endpoint = |e: &str| e.parse::<EndPoint>().unwrap();
 
-        assert!(is_uplink_endpoint(&endpoint("quic/cloud:443"), &by_protocol));
-        assert!(!is_uplink_endpoint(&endpoint("tcp/192.168.1.2:7447"), &by_protocol));
-        assert!(!is_uplink_endpoint(&endpoint("tcp/cloud:443"), &by_interface));
-        assert!(is_uplink_endpoint(&endpoint("tcp/cloud:443#iface=wwan0"), &by_interface));
-        assert!(!is_uplink_endpoint(&endpoint("tcp/cloud:443#iface=eth0"), &by_interface));
+        assert!(is_uplink_endpoint(
+            &endpoint("quic/cloud:443"),
+            &by_protocol
+        ));
+        assert!(!is_uplink_endpoint(
+            &endpoint("tcp/192.168.1.2:7447"),
+            &by_protocol
+        ));
+        assert!(!is_uplink_endpoint(
+            &endpoint("tcp/cloud:443"),
+            &by_interface
+        ));
+        assert!(is_uplink_endpoint(
+            &endpoint("tcp/cloud:443#iface=wwan0"),
+            &by_interface
+        ));
+        assert!(!is_uplink_endpoint(
+            &endpoint("tcp/cloud:443#iface=eth0"),
+            &by_interface
+        ));
     }
 }

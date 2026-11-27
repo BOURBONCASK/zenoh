@@ -293,11 +293,7 @@ async fn test_regions_leaf_uplink_listeners_answer_as_a_router() {
         .open());
 
     assert_eq!(mode_of(&local, &bridge).await, Some(Router));
-    let sub = ztimeout!(t
-        .app
-        .declare_subscriber("r1/local")
-        .with(unbounded_sink()))
-    .unwrap();
+    let sub = ztimeout!(t.app.declare_subscriber("r1/local").with(unbounded_sink())).unwrap();
     delivered(&local, "r1/local", &sub).await;
 }
 
@@ -377,10 +373,15 @@ async fn test_regions_leaf_uplink_to_a_router_with_the_auto_preset() {
     let (bridge, cloud) = (t.bridge.zid().to_string(), t.cloud.zid().to_string());
 
     let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while (mode_of(&t.cloud, &bridge).await, mode_of(&t.bridge, &cloud).await)
-        != (Some(Client), Some(Router))
+    while (
+        mode_of(&t.cloud, &bridge).await,
+        mode_of(&t.bridge, &cloud).await,
+    ) != (Some(Client), Some(Router))
     {
-        assert!(tokio::time::Instant::now() < deadline, "uplink not established");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "uplink not established"
+        );
         tokio::time::sleep(SLEEP).await;
     }
 
@@ -802,17 +803,13 @@ async fn test_regions_leaf_uplink_hands_over_to_the_other_north_remote() {
     }
     println!("time without uplink: {:?}", start.elapsed());
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        events_of(owner_zid),
-        [SampleKind::Put, SampleKind::Delete]
-    );
+    assert_eq!(events_of(owner_zid), [SampleKind::Put, SampleKind::Delete]);
     assert_eq!(events_of(other.zid().to_string()), [SampleKind::Put]);
     assert_eq!(
         uplink_state(&bridge).await["remote"],
         other.zid().to_string()
     );
 }
-
 
 // ---------------------------------------------------------------------------------------------
 // Default route (`gateway.north.default_route`): two robots on one cloud router
@@ -880,9 +877,7 @@ async fn robot(cloud: &Session, name: &str, zid_prefix: &str, default_route: boo
         ))
         .open());
     let app = ztimeout!(Node::new(Client, &zid(5)).connect(&[&south_ep]).open());
-    let x5 = ztimeout!(Node::new(Client, &zid(6))
-        .connect(&[loc!(bridge)])
-        .open());
+    let x5 = ztimeout!(Node::new(Client, &zid(6)).connect(&[loc!(bridge)]).open());
     eventually_interest_states(&bridge, &["finalized"]).await;
     Robot {
         _south: south,
@@ -919,12 +914,9 @@ async fn test_regions_leaf_uplink_default_route_reaches_another_robot() {
         .declare_subscriber("r1/app/control")
         .with(unbounded_sink()))
     .unwrap();
-    let _srv2 = ztimeout!(r2
-        .app
-        .declare_queryable("r2/app/srv")
-        .callback(|query| {
-            query.reply("r2/app/srv", "from r2").wait().unwrap();
-        }))
+    let _srv2 = ztimeout!(r2.app.declare_queryable("r2/app/srv").callback(|query| {
+        query.reply("r2/app/srv", "from r2").wait().unwrap();
+    }))
     .unwrap();
 
     delivered(&r1.app, "r2/app/control", &control2).await;
@@ -942,7 +934,11 @@ async fn test_regions_leaf_uplink_default_route_reaches_another_robot() {
     // a query that nobody answers ends at once, without waiting for its timeout
     let start = tokio::time::Instant::now();
     assert!(replies(&r1.app, "r2/app/nobody").await.is_empty());
-    assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 /// The same sessions without the default route: the session of the bridge reaches the other
@@ -973,9 +969,7 @@ async fn test_regions_leaf_uplink_without_default_route_only_the_bridge_reaches_
 async fn test_regions_leaf_uplink_default_route_keeps_other_keys_on_the_robot() {
     zenoh::init_log_from_env_or("error");
     let (cloud, r1, r2) = fleet_of_two("1eafd", true).await;
-    let phone = ztimeout!(Node::new(Client, "1eafd004")
-        .connect(&[loc!(cloud)])
-        .open());
+    let phone = ztimeout!(Node::new(Client, "1eafd004").connect(&[loc!(cloud)]).open());
     let _status1 = ztimeout!(r1.x5.declare_queryable("r1/app/status").callback(|query| {
         query.reply("r1/app/status", "r1").wait().unwrap();
     }))
@@ -986,10 +980,7 @@ async fn test_regions_leaf_uplink_default_route_keeps_other_keys_on_the_robot() 
     .unwrap();
     // outside of the interests of the bridges: the cloud does not declare them to the robots
     let outside = ztimeout!(phone.declare_subscriber("rt/**").with(unbounded_sink())).unwrap();
-    let foreign = ztimeout!(phone
-        .declare_subscriber("r9/app/**")
-        .with(unbounded_sink()))
-    .unwrap();
+    let foreign = ztimeout!(phone.declare_subscriber("r9/app/**").with(unbounded_sink())).unwrap();
 
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {

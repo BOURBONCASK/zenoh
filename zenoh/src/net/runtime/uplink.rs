@@ -144,10 +144,15 @@ impl<S> NorthAdmission<S> {
     }
 
     pub(crate) fn owner(&self) -> Option<NorthOwner> {
-        self.state.lock().unwrap().owner.as_ref().map(|o| NorthOwner {
-            zid: o.zid,
-            closing: o.closing,
-        })
+        self.state
+            .lock()
+            .unwrap()
+            .owner
+            .as_ref()
+            .map(|o| NorthOwner {
+                zid: o.zid,
+                closing: o.closing,
+            })
     }
 
     fn is_vacant(&self) -> bool {

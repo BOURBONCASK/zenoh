@@ -92,10 +92,7 @@ impl Hat {
                     options,
                     ctx.src_face.zid,
                 );
-                if let Some(interest) = self
-                    .face_hat_mut(ctx.src_face)
-                    .uplink_interests
-                    .last_mut()
+                if let Some(interest) = self.face_hat_mut(ctx.src_face).uplink_interests.last_mut()
                 {
                     interest.state = UplinkInterestState::Denied;
                 }

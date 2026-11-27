@@ -179,12 +179,14 @@ mod tests {
             r#"{ north: { default_route: { key_exprs: ["a/**"], local: ["a/b"] } } }"#
         )
         .is_err());
-        assert!(json5::from_str::<GatewayConf>(r#"{ north: { mode: "client" } }"#)
-            .unwrap()
-            .north
-            .unwrap()
-            .default_route
-            .is_none());
+        assert!(
+            json5::from_str::<GatewayConf>(r#"{ north: { mode: "client" } }"#)
+                .unwrap()
+                .north
+                .unwrap()
+                .default_route
+                .is_none()
+        );
     }
 
     #[test]

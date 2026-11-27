@@ -578,10 +578,9 @@ mod default_route_tests {
 
     #[test]
     fn default_route_takes_the_fleet_keys_that_are_not_those_of_the_robot() {
-        let conf = json5::from_str(
-            r#"{ key_exprs: ["*/app/**", "*/bridge/**"], except: ["r1/**"] }"#,
-        )
-        .unwrap();
+        let conf =
+            json5::from_str(r#"{ key_exprs: ["*/app/**", "*/bridge/**"], except: ["r1/**"] }"#)
+                .unwrap();
         let default_route = DefaultRoute::new(&conf);
 
         // another robot

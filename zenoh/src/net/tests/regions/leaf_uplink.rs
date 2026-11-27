@@ -1018,7 +1018,12 @@ fn configured_interest_outlives_the_same_interest_of_a_session(kind: Kind, cance
     let mut up = leaf_uplink(&r.bridge, &c);
     settle(&mut [&mut up, &mut r.tether]);
 
-    local.interest(52, InterestMode::CurrentFuture, kind.options(), scope.clone());
+    local.interest(
+        52,
+        InterestMode::CurrentFuture,
+        kind.options(),
+        scope.clone(),
+    );
     settle(&mut [&mut up, &mut r.tether]);
     match cancel {
         Cancel::Undeclare => local.interest(52, InterestMode::Final, kind.options(), scope.clone()),
@@ -1173,15 +1178,21 @@ fn a_dropped_token_interest_is_reported_and_leaves_the_other_interests_alone() {
     let local = r.bridge.new_session();
     local.declare_subscriber(None, 1, "**");
     let mut up = leaf_uplink(&r.bridge, &c);
-    let asks_for_tokens =
-        |msg: &Message| matches!(msg, Message::Interest(Interest { options, .. }) if options.tokens());
+    let asks_for_tokens = |msg: &Message| matches!(msg, Message::Interest(Interest { options, .. }) if options.tokens());
     let mut dropped = 0;
     loop {
-        let before = (a_sent(&up).declarations.len(), b_sent(&up).declarations.len());
+        let before = (
+            a_sent(&up).declarations.len(),
+            b_sent(&up).declarations.len(),
+        );
         dropped += up.fwd_if(|msg| !asks_for_tokens(msg));
         up.rev_fwd();
         r.tether.bi_fwd();
-        if before == (a_sent(&up).declarations.len(), b_sent(&up).declarations.len())
+        if before
+            == (
+                a_sent(&up).declarations.len(),
+                b_sent(&up).declarations.len(),
+            )
             && up.fwd_if(|msg| !asks_for_tokens(msg)) == 0
             && up.rev_fwd().is_empty()
         {
@@ -1311,7 +1322,10 @@ fn south_router_with_default_route(robot: &str) -> Harness {
     HarnessBuilder::new()
         .mode(WhatAmI::Router)
         .subregions([Region::default_south(WhatAmI::Client), Region::Local])
-        .gateway(&format!(r#"{{ north: {{ {} }} }}"#, default_route_of(robot)))
+        .gateway(&format!(
+            r#"{{ north: {{ {} }} }}"#,
+            default_route_of(robot)
+        ))
         .build()
 }
 
@@ -1347,7 +1361,7 @@ fn a_publication_for_another_robot_reaches_it() {
     r1.app.put(key.clone(), vec![1]);
     settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
 
-    assert_eq!(seen(&r2.app).pushes, [key.clone()]);
+    assert_eq!(seen(&r2.app).pushes, std::slice::from_ref(&key));
     assert_eq!(a_sent(&up1).pushes, [key]);
     // the first robot knows nothing of the second one
     assert_eq!(b_sent(&up1).subscribers, set([]));
@@ -1454,7 +1468,7 @@ fn local_publications_are_not_pulled_towards_the_uplink() {
     }
 
     // what the south router sent to the bridge, and the bridge to the cloud
-    assert_eq!(b_sent(&r1.tether).pushes, [foreign.clone()]);
+    assert_eq!(b_sent(&r1.tether).pushes, std::slice::from_ref(&foreign));
     assert_eq!(a_sent(&up1).pushes, vec![foreign; 2]);
     assert_eq!(a_sent(&r1.tether).pushes, Vec::<String>::new());
 }
@@ -1489,7 +1503,8 @@ fn a_wildcard_query_inside_the_fleet_keys_reaches_local_and_remote_queryables() 
     let mut up2 = leaf_uplink(&r2.bridge, &c);
     let (status1, status2) = (format!("{R1}/app/status"), format!("{R2}/app/status"));
     neighbour.declare_queryable(None, 1, status1.clone(), complete());
-    r2.app.declare_queryable(None, 1, status2.clone(), complete());
+    r2.app
+        .declare_queryable(None, 1, status2.clone(), complete());
     settle(&mut [&mut r1.tether, &mut r2.tether, &mut up1, &mut up2]);
 
     r1.app.query(3, "*/app/status");
@@ -1533,8 +1548,8 @@ fn a_publication_from_the_gateway_is_not_sent_back_to_it() {
     local.put(key.clone(), vec![1]);
     settle(&mut [&mut r1.tether, &mut up1]);
 
-    assert_eq!(seen(&r1.app).pushes, [key.clone()]);
-    assert_eq!(a_sent(&r1.tether).pushes, [key.clone()]);
+    assert_eq!(seen(&r1.app).pushes, std::slice::from_ref(&key));
+    assert_eq!(a_sent(&r1.tether).pushes, std::slice::from_ref(&key));
     assert_eq!(b_sent(&r1.tether).pushes, Vec::<String>::new());
     assert_eq!(a_sent(&up1).pushes, [key]);
 }
@@ -1554,7 +1569,7 @@ fn a_publication_for_another_robot_also_reaches_its_local_subscribers() {
     r1.app.put(key.clone(), vec![1]);
     settle(&mut [&mut r1.tether, &mut up1]);
 
-    assert_eq!(seen(&recorder).pushes, [key.clone()]);
+    assert_eq!(seen(&recorder).pushes, std::slice::from_ref(&key));
     assert_eq!(a_sent(&up1).pushes, [key]);
 }
 
@@ -1610,7 +1625,7 @@ fn the_default_gateway_is_the_one_with_the_greatest_zid() {
     app.put(key.clone(), vec![1]);
     settle(&mut [&mut to_low, &mut to_high, &mut up_low, &mut up_high]);
 
-    assert_eq!(b_sent(&to_high).pushes, [key.clone()]);
+    assert_eq!(b_sent(&to_high).pushes, std::slice::from_ref(&key));
     assert_eq!(b_sent(&to_low).pushes, Vec::<String>::new());
     assert_eq!(seen(&phone).pushes, [key]);
 }
