@@ -1915,3 +1915,267 @@ fn there_is_no_default_route_by_default() {
     // a leaf sends north every key outside its interests
     assert_eq!(a_sent(&up1).pushes, ["rt/camera"]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// A retired north face
+//
+// A leaf closes the face of its north remote when the next remote takes over, which can be
+// before the transport of the old one has stopped reading: a read task that already holds the
+// handler of that transport gives it one more message afterwards. That message reaches a face
+// that is closed, and must change nothing.
+// ---------------------------------------------------------------------------------------------
+
+/// A robot whose application subscribes, serves a queryable and watches tokens, and whose leaf
+/// bridge was handed over from one cloud router to another.
+struct HandedOver {
+    r: Robot,
+    /// The uplink to the first cloud router: its face on the bridge is closed.
+    old: EstablishedConnection,
+    /// The uplink to the second cloud router.
+    new: EstablishedConnection,
+    /// A client session of the second cloud router.
+    phone: MockFace,
+    _clouds: (Harness, Harness),
+}
+
+impl HandedOver {
+    fn new() -> Self {
+        try_init_tracing_subscriber();
+        let clouds = (cloud(), cloud());
+        let mut r = Robot::new(leaf_bridge(R1));
+        r.app.declare_subscriber(None, 1, format!("{R1}/control"));
+        r.app.declare_queryable(
+            None,
+            1,
+            format!("{R1}/srv/list"),
+            QueryableInfoType::DEFAULT,
+        );
+        r.app.interest(
+            1,
+            InterestMode::CurrentFuture,
+            InterestOptions::KEYEXPRS + InterestOptions::TOKENS,
+            format!("{R1}/alive/**"),
+        );
+        let mut old = leaf_uplink(&r.bridge, &clouds.0);
+        settle(&mut [&mut r.tether, &mut old]);
+
+        // what the runtime does when the next north remote is admitted
+        old.a2b.face.send_close();
+        r.tether.bi_fwd();
+        let mut new = leaf_uplink(&r.bridge, &clouds.1);
+        let phone = client(&clouds.1, CLIENTS);
+        settle(&mut [&mut new, &mut r.tether]);
+        Self {
+            r,
+            old,
+            new,
+            phone,
+            _clouds: clouds,
+        }
+    }
+
+    /// The number of messages the bridge sent to the first cloud router.
+    fn sent_to_the_old_remote(&self) -> usize {
+        self.old.a2b.recorder().with_messages(|msgs| msgs.len())
+    }
+
+    /// The second cloud router is served as before: a publication and a query of its client
+    /// reach the application, once.
+    fn assert_the_new_remote_is_served(&mut self) {
+        let (pushes, requests) = (
+            seen(&self.r.app).pushes.len(),
+            seen(&self.r.app).requests.len(),
+        );
+        self.phone.put(format!("{R1}/control"), vec![1]);
+        self.phone.query(41, format!("{R1}/srv/list"));
+        settle(&mut [&mut self.new, &mut self.r.tether]);
+        let app = seen(&self.r.app);
+        assert_eq!(app.pushes.len(), pushes + 1, "{:?}", app.pushes);
+        assert_eq!(app.requests.len(), requests + 1, "{:?}", app.requests);
+    }
+}
+
+/// A token declared on the retired face is not declared south.
+#[test]
+fn a_retired_north_face_declares_no_token() {
+    let mut t = HandedOver::new();
+    let key = format!("{R1}/alive/retired");
+
+    t.old.a2b.declare_token(None, 123, key.clone());
+    t.r.tether.bi_fwd();
+
+    assert!(
+        !a_sent(&t.r.tether).tokens.contains(&key),
+        "a message on the retired north face declared a token south"
+    );
+    assert!(!seen(&t.r.app).tokens.contains(&key));
+    t.assert_the_new_remote_is_served();
+}
+
+/// A subscriber declared on the retired face is not declared south, and gets no publication.
+#[test]
+fn a_retired_north_face_declares_no_subscriber() {
+    let mut t = HandedOver::new();
+    let key = format!("{R1}/tele/retired");
+    let sent = t.sent_to_the_old_remote();
+
+    t.old.a2b.declare_subscriber(None, 123, key.clone());
+    t.r.tether.bi_fwd();
+    t.r.app.put(key.clone(), vec![1]);
+    settle(&mut [&mut t.r.tether, &mut t.new]);
+
+    assert!(
+        !a_sent(&t.r.tether).subscribers.contains(&key),
+        "a message on the retired north face declared a subscriber south"
+    );
+    assert_eq!(t.sent_to_the_old_remote(), sent);
+    t.assert_the_new_remote_is_served();
+}
+
+/// A queryable declared on the retired face is not declared south, and gets no query.
+#[test]
+fn a_retired_north_face_declares_no_queryable() {
+    let mut t = HandedOver::new();
+    let key = format!("{R1}/srv/retired");
+    let sent = t.sent_to_the_old_remote();
+
+    t.old
+        .a2b
+        .declare_queryable(None, 123, key.clone(), QueryableInfoType::DEFAULT);
+    t.r.tether.bi_fwd();
+    t.r.app.query(5, key.clone());
+    settle(&mut [&mut t.r.tether, &mut t.new]);
+
+    assert!(
+        !a_sent(&t.r.tether).queryables.contains(&key),
+        "a message on the retired north face declared a queryable south"
+    );
+    assert_eq!(t.sent_to_the_old_remote(), sent);
+    assert_eq!(seen(&t.r.app).response_finals, 1);
+    t.assert_the_new_remote_is_served();
+}
+
+/// A key expression declared on the retired face is not kept: nothing would ever release it.
+#[test]
+fn a_retired_north_face_declares_no_key_expression() {
+    let mut t = HandedOver::new();
+
+    t.old
+        .a2b
+        .declare_keyexpr(None, 9, format!("{R1}/tele/retired"));
+
+    assert!(
+        t.old.a2b.face.state.remote_mappings.is_empty(),
+        "a message on the retired north face declared a key expression"
+    );
+    t.assert_the_new_remote_is_served();
+}
+
+/// An interest declared on the retired face is not registered and not answered.
+#[test]
+fn a_retired_north_face_declares_no_interest() {
+    let mut t = HandedOver::new();
+    let sent = t.sent_to_the_old_remote();
+
+    t.old.a2b.interest(
+        77,
+        InterestMode::CurrentFuture,
+        InterestOptions::KEYEXPRS + InterestOptions::SUBSCRIBERS + InterestOptions::TOKENS,
+        format!("{R1}/**"),
+    );
+    t.r.app.declare_token(None, 7, format!("{R1}/alive/app"));
+    t.r.app.declare_subscriber(None, 7, format!("{R1}/late"));
+    settle(&mut [&mut t.r.tether, &mut t.new]);
+
+    assert!(
+        t.old.a2b.face.state.remote_key_interests.is_empty(),
+        "a message on the retired north face declared an interest"
+    );
+    assert_eq!(t.sent_to_the_old_remote(), sent);
+    t.assert_the_new_remote_is_served();
+}
+
+/// A publication that comes on the retired face is not delivered.
+#[test]
+fn a_retired_north_face_delivers_no_publication() {
+    let mut t = HandedOver::new();
+
+    t.old.a2b.put(format!("{R1}/control"), vec![9]);
+    t.r.tether.bi_fwd();
+
+    assert_eq!(
+        seen(&t.r.app).pushes,
+        Vec::<String>::new(),
+        "a publication on the retired north face was delivered south"
+    );
+    t.assert_the_new_remote_is_served();
+}
+
+/// A query that comes on the retired face is not delivered, and gets no answer.
+#[test]
+fn a_retired_north_face_delivers_no_query() {
+    let mut t = HandedOver::new();
+    let sent = t.sent_to_the_old_remote();
+
+    t.old.a2b.query(7, format!("{R1}/srv/list"));
+    t.r.tether.bi_fwd();
+
+    assert_eq!(
+        seen(&t.r.app).requests,
+        vec![],
+        "a query on the retired north face was delivered south"
+    );
+    assert_eq!(t.sent_to_the_old_remote(), sent);
+    t.assert_the_new_remote_is_served();
+}
+
+/// The query that the retired face had not answered was ended when the face was closed. Its
+/// reply and its final come late on that face: they are dropped, and they do not touch a query
+/// that the new north face is answering under the same request id.
+#[test]
+fn a_retired_north_face_delivers_no_reply() {
+    try_init_tracing_subscriber();
+    let clouds = (cloud(), cloud());
+    let key = format!("{R1}/srv/credential/issue");
+    let svcs = [client(&clouds.0, CLIENTS), client(&clouds.1, CLIENTS)];
+    for svc in &svcs {
+        svc.declare_queryable(
+            None,
+            1,
+            "**/srv/credential/issue",
+            QueryableInfoType::DEFAULT,
+        );
+    }
+    let mut r = Robot::new(leaf_bridge(R1));
+    let mut old = leaf_uplink(&r.bridge, &clouds.0);
+    settle(&mut [&mut old, &mut r.tether]);
+    r.app.query(3, key.clone());
+    settle(&mut [&mut r.tether, &mut old]);
+    let asked = seen(&svcs[0]).requests;
+    assert_eq!(asked.len(), 1, "{asked:?}");
+
+    old.a2b.face.send_close();
+    r.tether.bi_fwd();
+    assert_eq!(seen(&r.app).response_finals, 1);
+    let mut new = leaf_uplink(&r.bridge, &clouds.1);
+    settle(&mut [&mut new, &mut r.tether]);
+    r.app.query(4, key.clone());
+    settle(&mut [&mut r.tether, &mut new]);
+    let asked_again = seen(&svcs[1]).requests;
+    assert_eq!(asked_again.len(), 1, "{asked_again:?}");
+
+    // the late reply of the first cloud router, then its final
+    reply(&svcs[0], asked[0].0, &key);
+    old.rev_fwd();
+    r.tether.bi_fwd();
+    let app = seen(&r.app);
+    assert_eq!(app.replies, Vec::<String>::new());
+    assert_eq!(app.response_finals, 1);
+
+    // the second query is answered by the second cloud router
+    reply(&svcs[1], asked_again[0].0, &key);
+    settle(&mut [&mut new, &mut r.tether]);
+    let app = seen(&r.app);
+    assert_eq!(app.replies, [key]);
+    assert_eq!(app.response_finals, 2);
+}

@@ -1062,6 +1062,504 @@ async fn test_regions_leaf_uplink_hands_over_before_the_old_transport_is_cleaned
 }
 
 // ---------------------------------------------------------------------------------------------
+// What the old north remote still delivers after the next one took over
+//
+//     cloud a (R)   cloud b (R)      one of them owns the north region of the bridge
+//            \       /
+//           bridge (R)
+//             |
+//           south (R) ── app (C)
+//
+// The take-over does not wait for the clean-up of the transport of the old owner, and that
+// clean-up waits for the read tasks of the transport. A read task that took the handler of the
+// transport before the deletion started gives it its message afterwards, whenever it runs again.
+//
+// The expressions of these last messages start with a wildcard: a router declares no id for
+// such an expression, the message carries it whole. A message that refers to an id is dropped
+// anyway once the face is closed, since the ids of the face are forgotten with it.
+// ---------------------------------------------------------------------------------------------
+
+/// A robot whose leaf bridge has two endpoints that lead north, to cloud routers that are not
+/// started yet: the bridge, a client session of the bridge, its south router and an application
+/// session of that router.
+#[cfg(all(feature = "unstable", feature = "test"))]
+struct RobotOfTwoClouds {
+    bridge: Session,
+    x5: Session,
+    _south: Session,
+    app: Session,
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+async fn robot_of_two_clouds(zid_prefix: &str, ports: (u16, u16)) -> RobotOfTwoClouds {
+    let zid = |n: u8| format!("{zid_prefix}{n:02x}");
+    let south_ep = format!(
+        "unixsock-stream/{}",
+        std::env::temp_dir()
+            .join(format!(
+                "zenoh-leaf-{zid_prefix}-{}.sock",
+                std::process::id()
+            ))
+            .display()
+    );
+    let endpoints = [
+        format!("tcp/127.0.0.1:{}", ports.0),
+        format!("tcp/127.0.0.1:{}", ports.1),
+    ];
+    let south = ztimeout!(Node::new(Router, &zid(3)).listen(&south_ep).open());
+    let bridge = ztimeout!(Node::new(Router, &zid(2))
+        .region("bridge")
+        .endpoints(
+            "tcp/127.0.0.1:0",
+            &[&south_ep, &endpoints[0], &endpoints[1]]
+        )
+        .gateway(bridge_gateway(&zid(3), "tcp"))
+        .insert(
+            "connect/retry",
+            r#"{ period_init_ms: 100, period_max_ms: 400, period_increase_factor: 2 }"#
+        )
+        .open());
+    let app = ztimeout!(Node::new(Client, &zid(5)).connect(&[&south_ep]).open());
+    let x5 = ztimeout!(Node::new(Client, &zid(6)).connect(&[loc!(bridge)]).open());
+    RobotOfTwoClouds {
+        bridge,
+        x5,
+        _south: south,
+        app,
+    }
+}
+
+/// The north remote of `bridge` according to its admin space, if it says so in time: a query of
+/// the bridge also goes to its north remote, which may not answer any more.
+#[cfg(all(feature = "unstable", feature = "test"))]
+async fn north_remote_of(bridge: &Session) -> Option<String> {
+    let replies = bridge
+        .get(format!("@/{}/router/uplink", bridge.zid()))
+        .consolidation(ConsolidationMode::None)
+        .timeout(Duration::from_millis(500))
+        .await
+        .ok()?;
+    while let Ok(reply) = replies.recv_async().await {
+        if let Ok(sample) = reply.result() {
+            let uplink: serde_json::Value =
+                serde_json::from_slice(&sample.payload().to_bytes()).ok()?;
+            return uplink["remote"].as_str().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// The last message of the old north remote.
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Late {
+    Token,
+    Subscriber,
+    Queryable,
+    Publication,
+    Query,
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+impl Late {
+    fn is(self, msg: zenoh_protocol::network::NetworkMessageRef) -> bool {
+        use zenoh_protocol::network::{DeclareBody, NetworkBodyRef};
+
+        match (self, msg.body) {
+            (Late::Publication, NetworkBodyRef::Push(_)) => true,
+            (Late::Query, NetworkBodyRef::Request(_)) => true,
+            (late, NetworkBodyRef::Declare(declare)) => matches!(
+                (late, &declare.body),
+                (Late::Token, DeclareBody::DeclareToken(_))
+                    | (Late::Subscriber, DeclareBody::DeclareSubscriber(_))
+                    | (Late::Queryable, DeclareBody::DeclareQueryable(_))
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// Where the last message of the old north remote is when the next one takes over.
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Caught {
+    /// In the read task of the bridge, which holds the handler of the transport and has not
+    /// given it the message yet.
+    BeforeRouting,
+    /// Inside routing: the tables of the bridge have it, and the thread that routes it has
+    /// released them and is about to send its consequence to a client session of the bridge.
+    /// (What goes to the south router is sent before the tables are released.)
+    InsideRouting,
+}
+
+/// A leaf bridge with two cloud endpoints, a client session, a south router and an application
+/// two hops south of the uplink. The owner of the north region sends one last message, `late`,
+/// which is stopped on the bridge where `caught` says. The transport of the owner is then
+/// deleted and the other cloud router takes over, while that message is still stopped. Then
+/// the message goes on.
+///
+/// Whatever it is, nothing of it is left south once the clean-up of the old transport has
+/// ended: no token, no subscriber, no queryable, no publication, no query. It is looked for two
+/// hops south when the message was stopped before routing, and on the client session of the
+/// bridge when it was stopped on its way there. And the new owner lost nothing to that
+/// clean-up: its token is alive, its subscriber and its queryable are served, the queryable of
+/// the robot answers it.
+///
+/// The bridge gives up on the owner as on a remote that no longer reads, and deletes the
+/// transport without losing a link first. (The same over low-latency transports, which a test
+/// from outside cannot delete while their only read task is stopped, is in
+/// `zenoh/src/tests/leaf_uplink.rs`.)
+#[cfg(all(feature = "unstable", feature = "test"))]
+async fn the_old_north_remote_leaves_nothing_behind(zid_prefix: &str, late: Late, caught: Caught) {
+    use zenoh::{qos::CongestionControl, session::TransportEvent};
+    use zenoh_transport::unicast::test_helpers::{fail_pushes, hold_egress, hold_ingress};
+
+    const QUERY: Duration = Duration::from_millis(300);
+
+    zenoh::init_log_from_env_or("error");
+    let ports = two_free_ports();
+    let robot = robot_of_two_clouds(zid_prefix, ports).await;
+    let (bridge, app) = (&robot.bridge, &robot.app);
+    let (bridge_zid, x5_zid) = (bridge.zid().to_string(), robot.x5.zid().to_string());
+    // where what the last message leaves behind is looked for
+    let observer = match caught {
+        Caught::BeforeRouting => app,
+        Caught::InsideRouting => &robot.x5,
+    };
+    let events = ztimeout!(bridge
+        .info()
+        .transport_events_listener()
+        .with(unbounded_sink()))
+    .unwrap();
+    let alive = ztimeout!(observer
+        .liveliness()
+        .declare_subscriber("r1/alive/**")
+        .with(unbounded_sink()))
+    .unwrap();
+    let to_late_sub = ztimeout!(observer.declare_publisher("r1/late/sub")).unwrap();
+    let to_late_srv = ztimeout!(observer.declare_querier("r1/late/srv")).unwrap();
+    let to_tele = ztimeout!(observer.declare_publisher("r1/tele")).unwrap();
+    // what the robot listens to and offers, two hops south of the uplink
+    let control = ztimeout!(app.declare_subscriber("*/control").with(unbounded_sink())).unwrap();
+    let (asked, late_queries) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let _robot_srv = ztimeout!(app.declare_queryable("*/robot/srv").callback({
+        let (asked, late_queries) = (asked.clone(), late_queries.clone());
+        move |query| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            if query.key_expr().as_str().starts_with("fleet/") {
+                late_queries.fetch_add(1, Ordering::SeqCst);
+            }
+            query
+                .reply(query.key_expr().clone(), "robot")
+                .wait()
+                .unwrap();
+        }
+    }))
+    .unwrap();
+
+    let zids = (format!("{zid_prefix}0a"), format!("{zid_prefix}0b"));
+    let (a, b) = tokio::join!(cloud_on(&zids.0, ports.0), cloud_on(&zids.1, ports.1));
+    // each cloud router has a token, a subscriber and a queryable that names it
+    let mut tokens = vec![];
+    let mut queryables = vec![];
+    let mut teles = vec![];
+    for cloud in [&a, &b] {
+        let zid = cloud.zid().to_string();
+        tokens
+            .push(ztimeout!(cloud.liveliness().declare_token(format!("r1/alive/{zid}"))).unwrap());
+        teles.push(ztimeout!(cloud.declare_subscriber("r1/tele").with(unbounded_sink())).unwrap());
+        queryables.push(
+            ztimeout!(cloud
+                .declare_queryable("r1/cloud/srv")
+                .callback(move |query| {
+                    query.reply("r1/cloud/srv", zid.as_str()).wait().unwrap();
+                }))
+            .unwrap(),
+        );
+    }
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while north_remotes(bridge, &[&a, &b]).await.len() != 1 {
+        assert!(tokio::time::Instant::now() < deadline, "no north remote");
+        tokio::time::sleep(SLEEP).await;
+    }
+    let a_owns = north_remotes(bridge, &[&a, &b]).await[0] == a.zid().to_string();
+    let (owner, other) = if a_owns { (a, b) } else { (b, a) };
+    let (owner_tele, other_tele) = if a_owns {
+        (&teles[0], &teles[1])
+    } else {
+        (&teles[1], &teles[0])
+    };
+    let (owner_zid, other_zid) = (owner.zid().to_string(), other.zid().to_string());
+    let events_of = |zid: &str| -> Vec<SampleKind> {
+        let kinds = std::cell::RefCell::new(vec![]);
+        events.count_by(|e: &TransportEvent| {
+            if e.transport().zid().to_string() == zid {
+                kinds.borrow_mut().push(e.kind());
+            }
+            true
+        });
+        kinds.into_inner()
+    };
+    let tokens_of = |name: &str| -> Vec<SampleKind> {
+        let kinds = std::cell::RefCell::new(vec![]);
+        alive.count_by(|s: &Sample| {
+            if s.key_expr().as_str().ends_with(name) {
+                kinds.borrow_mut().push(s.kind());
+            }
+            true
+        });
+        kinds.into_inner()
+    };
+    let late_publications = || control.count_by(|s| text(s) == "late");
+
+    // the flows with the owner, from two hops south
+    delivered(app, "r1/tele", owner_tele).await;
+    delivered(&owner, "r1/control", &control).await;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while replies(&owner, "r1/robot/srv").await != ["robot"]
+        || replies(app, "r1/cloud/srv").await != [owner_zid.clone()]
+        || tokens_of(&owner_zid) != [SampleKind::Put]
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no flow with the owner"
+        );
+    }
+    assert!(ztimeout!(to_tele.matching_status()).unwrap().matching());
+    assert!(!ztimeout!(to_late_sub.matching_status()).unwrap().matching());
+    assert!(!ztimeout!(to_late_srv.matching_status()).unwrap().matching());
+
+    // the last message of the owner is stopped on the bridge
+    let hold = match caught {
+        Caught::BeforeRouting => hold_ingress(
+            bridge_zid.parse().unwrap(),
+            owner_zid.parse().unwrap(),
+            move |msg| late.is(msg),
+        ),
+        Caught::InsideRouting => hold_egress(
+            bridge_zid.parse().unwrap(),
+            x5_zid.parse().unwrap(),
+            move |msg| late.is(msg),
+        ),
+    };
+    let mut late_declarations: Vec<Box<dyn std::any::Any>> = vec![];
+    match late {
+        Late::Token => late_declarations.push(Box::new(
+            ztimeout!(owner.liveliness().declare_token("*/alive/late")).unwrap(),
+        )),
+        Late::Subscriber => late_declarations.push(Box::new(
+            ztimeout!(owner.declare_subscriber("*/late/sub")).unwrap(),
+        )),
+        Late::Queryable => late_declarations.push(Box::new(
+            ztimeout!(owner.declare_queryable("*/late/srv")).unwrap(),
+        )),
+        // keys outside of `r1`: the bridge declared an id for that prefix with its interest,
+        // and the cloud router would use it
+        Late::Publication => ztimeout!(owner.put("fleet/control", "late")).unwrap(),
+        Late::Query => {
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                let _ = owner
+                    .get("fleet/robot/srv")
+                    .timeout(Duration::from_secs(1))
+                    .await;
+            });
+        }
+    }
+    println!("{late:?} {caught:?}: waiting for the last message of the owner");
+    eventually("the last message of the owner is stopped", || {
+        hold.holding()
+    })
+    .await;
+
+    // the transport of the owner is deleted, and its clean-up cannot end: it waits for the
+    // read task that is stopped, or that waits behind the thread that is
+    let _failing = fail_pushes(bridge_zid.parse().unwrap(), owner_zid.parse().unwrap());
+    ztimeout!(bridge
+        .put("r1/tele", "the one that is not enqueued")
+        .congestion_control(CongestionControl::Block))
+    .unwrap();
+
+    println!("{late:?} {caught:?}: the transport of the owner is going away");
+
+    // the other cloud router is given the north region
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while north_remote_of(bridge).await.as_ref() != Some(&other_zid) {
+        assert!(tokio::time::Instant::now() < deadline, "no take-over");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    println!("{late:?} {caught:?}: the north region is given to the other remote");
+    match caught {
+        Caught::BeforeRouting => {
+            // and takes over completely while the message is stopped: nothing of the old
+            // owner is in routing
+            let handed_over = async {
+                while tokens_of(&owner_zid) != [SampleKind::Put, SampleKind::Delete]
+                    || tokens_of(&other_zid) != [SampleKind::Put]
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                delivered(app, "r1/tele", other_tele).await;
+                while replies_within(app, "r1/cloud/srv", QUERY).await != [other_zid.clone()] {}
+                delivered(&other, "r1/control", &control).await;
+                while replies_within(&other, "r1/robot/srv", QUERY).await != ["robot"] {}
+            };
+            tokio::time::timeout(TIMEOUT, handed_over)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{late:?}: no hand-over while the message is stopped: tokens of the old \
+                         owner {:?}, of the new one {:?}",
+                        tokens_of(&owner_zid),
+                        tokens_of(&other_zid)
+                    )
+                });
+        }
+        Caught::InsideRouting => {
+            // a message of the old owner is inside routing: what it sends south and what the
+            // retirement of its face sends south must not be swapped. Time for a retirement
+            // that does not wait for it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    assert!(hold.holding(), "{late:?}: the message is no longer stopped");
+    assert_eq!(
+        events_of(&owner_zid),
+        [SampleKind::Put],
+        "the old transport is cleaned up"
+    );
+    assert_eq!(late_publications(), 0);
+    assert_eq!(late_queries.load(Ordering::SeqCst), 0);
+
+    // the message goes on, and the clean-up of the old transport ends
+    println!("{late:?} {caught:?}: the last message of the owner goes on");
+    hold.release();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while events_of(&owner_zid) != [SampleKind::Put, SampleKind::Delete] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            events_of(&owner_zid)
+        );
+        tokio::time::sleep(SLEEP).await;
+    }
+    // the new owner is there, with everything it declared
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while tokens_of(&other_zid) != [SampleKind::Put]
+        || replies_within(app, "r1/cloud/srv", QUERY).await != [other_zid.clone()]
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{late:?}: the new owner is not there: its tokens {:?}",
+            tokens_of(&other_zid)
+        );
+        tokio::time::sleep(SLEEP).await;
+    }
+    delivered(app, "r1/tele", other_tele).await;
+    delivered(&other, "r1/control", &control).await;
+    // whatever is still on its way south has arrived
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // nothing of the old owner is left south
+    let late_token = tokens_of("late");
+    assert!(
+        late_token.is_empty() || late_token == [SampleKind::Put, SampleKind::Delete],
+        "{late:?}: a token of the old owner is alive south: {late_token:?}"
+    );
+    assert_eq!(tokens_of(&owner_zid), [SampleKind::Put, SampleKind::Delete]);
+    let alive_now = ztimeout!(observer.liveliness().get("r1/alive/**")).unwrap();
+    let mut alive_keys = vec![];
+    while let Ok(reply) = alive_now.recv_async().await {
+        alive_keys.push(reply.result().unwrap().key_expr().to_string());
+    }
+    assert_eq!(alive_keys, [format!("r1/alive/{other_zid}")], "{late:?}");
+    assert!(
+        !ztimeout!(to_late_sub.matching_status()).unwrap().matching(),
+        "{late:?}: a subscriber of the old owner is left south"
+    );
+    assert!(
+        !ztimeout!(to_late_srv.matching_status()).unwrap().matching(),
+        "{late:?}: a queryable of the old owner is left south"
+    );
+    if caught == Caught::BeforeRouting {
+        // the message never entered routing
+        assert!(late_token.is_empty(), "{late_token:?}");
+        assert_eq!(
+            late_publications(),
+            0,
+            "a publication of the old owner was delivered"
+        );
+        assert_eq!(
+            late_queries.load(Ordering::SeqCst),
+            0,
+            "a query of the old owner was delivered"
+        );
+    }
+    // and the end of the old transport took nothing from the new owner
+    assert_eq!(events_of(&other_zid), [SampleKind::Put]);
+    let uplink = uplink_state(bridge).await;
+    assert_eq!(uplink["remote"], other_zid.as_str());
+    assert_eq!(uplink["state"], "connected");
+    assert_eq!(tokens_of(&other_zid), [SampleKind::Put]);
+    assert!(ztimeout!(to_tele.matching_status()).unwrap().matching());
+    delivered_once(app, "r1/tele", &[other_tele]).await;
+    delivered_once(&other, "r1/control", &[&control]).await;
+    answered_once(&other, "r1/robot/srv", &["robot"], &[&asked]).await;
+    assert_eq!(replies(app, "r1/cloud/srv").await, [other_zid.as_str()]);
+    drop((tokens, queryables, late_declarations, owner));
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_drops_a_token_of_the_old_north_remote_that_comes_late() {
+    the_old_north_remote_leaves_nothing_behind("1eaf90", Late::Token, Caught::BeforeRouting).await;
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_drops_a_subscriber_of_the_old_north_remote_that_comes_late() {
+    the_old_north_remote_leaves_nothing_behind("1eaf91", Late::Subscriber, Caught::BeforeRouting)
+        .await;
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_drops_a_queryable_of_the_old_north_remote_that_comes_late() {
+    the_old_north_remote_leaves_nothing_behind("1eaf92", Late::Queryable, Caught::BeforeRouting)
+        .await;
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_drops_a_publication_of_the_old_north_remote_that_comes_late() {
+    the_old_north_remote_leaves_nothing_behind("1eaf93", Late::Publication, Caught::BeforeRouting)
+        .await;
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_drops_a_query_of_the_old_north_remote_that_comes_late() {
+    the_old_north_remote_leaves_nothing_behind("1eaf94", Late::Query, Caught::BeforeRouting).await;
+}
+
+/// A declaration of the old owner that is inside routing when the next remote takes over: it
+/// is withdrawn south after it was declared there, not before.
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_withdraws_a_token_of_the_old_north_remote_caught_in_routing() {
+    the_old_north_remote_leaves_nothing_behind("1eaf97", Late::Token, Caught::InsideRouting).await;
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_withdraws_a_subscriber_of_the_old_north_remote_caught_in_routing()
+{
+    the_old_north_remote_leaves_nothing_behind("1eaf98", Late::Subscriber, Caught::InsideRouting)
+        .await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Default route (`gateway.north.default_route`): two robots on one cloud router
 //
 //                    cloud (R) ── phone (C)

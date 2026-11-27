@@ -13,6 +13,7 @@
 //
 
 mod interceptor_cache;
+mod leaf_uplink;
 mod link_weights;
 
 mod query_reply;
