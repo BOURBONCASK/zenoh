@@ -15,7 +15,10 @@ use std::{
     any::Any,
     collections::{HashMap, VecDeque},
     fmt::{self, Debug},
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+    },
     time::Duration,
 };
 
@@ -209,6 +212,8 @@ pub struct FaceState {
     pub(crate) hats: RegionMap<Box<dyn Any + Send + Sync>>,
     pub(crate) task_controller: TaskController,
     pub(crate) is_local: bool,
+    /// Whether the face was closed, see [`FaceState::is_closed`].
+    closed: AtomicBool,
     #[cfg(feature = "stats")]
     pub(crate) stats: Option<zenoh_stats::TransportStats>,
 }
@@ -244,6 +249,7 @@ impl FaceStateBuilder {
             hats,
             task_controller: TaskController::default(),
             is_local: false,
+            closed: AtomicBool::new(false),
             #[cfg(feature = "stats")]
             stats: None,
         })
@@ -434,6 +440,25 @@ impl FaceState {
                 .expect("face in_interceptors should not be None when mcast_group is set")
                 .store(interceptor.into());
         }
+    }
+}
+
+impl FaceState {
+    /// Whether the face was closed ([`Face::send_close`]): it is no longer in the tables, what
+    /// it had declared is unregistered, and nothing will unregister what it would declare now.
+    /// A closed face accepts no declaration, no interest, no publication and no query.
+    ///
+    /// A transport stops its read tasks before it closes its face, so no message comes on a
+    /// closed face in that order. A leaf router closes the face of its north remote earlier,
+    /// when the next remote takes over, while the old transport may still be reading.
+    ///
+    /// The flag is set once, with [`TablesLock::ctrl_lock`] and the write lock of
+    /// [`TablesLock::tables`] held, in the critical section that unregisters the face. Read
+    /// it with one of the two held, the one under which the message is processed: the message
+    /// is then processed entirely before the face is unregistered, or not at all.
+    #[inline]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -636,6 +661,10 @@ impl Face {
 impl Primitives for Face {
     fn send_interest(&self, msg: &mut zenoh_protocol::network::Interest) {
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        if self.state.is_closed() {
+            tracing::debug!(src = %self, id = msg.id, "Interest dropped: the face is closed");
+            return;
+        }
         if msg.mode != InterestMode::Final {
             let mut declares = vec![];
             self.interest(msg, &mut |p, m| declares.push((p.clone(), m)));
@@ -650,6 +679,10 @@ impl Primitives for Face {
 
     fn send_declare(&self, msg: &mut zenoh_protocol::network::Declare) {
         let ctrl_lock = zlock!(self.tables.ctrl_lock);
+        if self.state.is_closed() {
+            tracing::debug!(src = %self, "Declaration dropped: the face is closed");
+            return;
+        }
         match &mut msg.body {
             zenoh_protocol::network::DeclareBody::DeclareKeyExpr(m) => {
                 register_expr(&self.tables, &mut self.state.clone(), m.id, &m.wire_expr);
@@ -805,6 +838,11 @@ impl Primitives for Face {
         });
         let mut wtables = zwrite!(self.tables.tables);
         let tables = &mut *wtables;
+
+        // NOTE: from here on the face accepts nothing (see `FaceState::is_closed`). Both locks
+        // are held: a message that is processed under either of them was processed entirely
+        // before this point, and what it registered is unregistered below.
+        self.state.closed.store(true, Ordering::Release);
 
         let mut ctx = DispatcherContext {
             tables_lock: &self.tables,

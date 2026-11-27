@@ -240,6 +240,10 @@ pub fn route_data(
 ) {
     let rtables = zread!(tables_ref.tables);
     let tables = &*rtables;
+    if src_face.is_closed() {
+        tracing::debug!("{} Publication dropped: the face is closed", src_face);
+        return;
+    }
     let Some(prefix) =
         rtables
             .data
