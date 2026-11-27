@@ -20,9 +20,16 @@
 //       |            unix socket: the bridge announces itself as a router
 //     south (R) ── app (C)
 
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use zenoh::{
+    query::ConsolidationMode,
     sample::{Sample, SampleKind},
     Session, Wait,
 };
@@ -82,9 +89,18 @@ async fn eventually<F: Fn() -> bool>(what: &str, pred: F) {
     }
 }
 
-/// The payloads of the replies to a query.
+/// The payloads of the replies to a query: all of them, without consolidation, so that a reply
+/// that comes twice is seen twice.
 async fn replies(session: &Session, key: &str) -> Vec<String> {
-    let replies = ztimeout!(session.get(key).timeout(Duration::from_secs(2))).unwrap();
+    replies_within(session, key, Duration::from_secs(2)).await
+}
+
+async fn replies_within(session: &Session, key: &str, timeout: Duration) -> Vec<String> {
+    let replies = ztimeout!(session
+        .get(key)
+        .consolidation(ConsolidationMode::None)
+        .timeout(timeout))
+    .unwrap();
     let mut payloads = vec![];
     while let Ok(reply) = replies.recv_async().await {
         payloads.push(
@@ -330,30 +346,121 @@ async fn test_regions_leaf_uplink_configuration_is_checked() {
     );
 }
 
-/// Publishes on `key` from `publisher` until `subscriber`, a subscriber of that key, gets it.
+/// A text that nothing else in this process publishes.
+fn fresh(what: &str) -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!("{what}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+fn text(sample: &Sample) -> String {
+    sample
+        .payload()
+        .try_to_string()
+        .map(|text| text.to_string())
+        .unwrap_or_default()
+}
+
+/// Publishes on `key` from `publisher` until `subscriber` gets one of these publications. Their
+/// payloads are those of this call only: what the subscriber got before, from this publisher
+/// or from another one, does not count.
 async fn delivered(publisher: &Session, key: &str, subscriber: &crate::UnboundedSink<Sample>) {
+    let mine = format!("{}/", fresh("delivered"));
     let deadline = tokio::time::Instant::now() + TIMEOUT;
-    while subscriber.count_by(|s| s.key_expr().as_str() == key) == 0 {
+    let mut sent = 0;
+    while subscriber.count_by(|s| text(s).starts_with(&mine)) == 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "{key} not delivered"
         );
-        ztimeout!(publisher.put(key, "x")).unwrap();
+        sent += 1;
+        ztimeout!(publisher.put(key, format!("{mine}{sent}"))).unwrap();
         tokio::time::sleep(SLEEP).await;
     }
 }
 
 /// Publishes on `key` from `publisher` for a while: `subscriber` gets none of it.
 async fn not_delivered(publisher: &Session, key: &str, subscriber: &crate::UnboundedSink<Sample>) {
-    for _ in 0..10 {
-        ztimeout!(publisher.put(key, "x")).unwrap();
+    let mine = format!("{}/", fresh("not-delivered"));
+    for sent in 0..10 {
+        ztimeout!(publisher.put(key, format!("{mine}{sent}"))).unwrap();
         tokio::time::sleep(SLEEP).await;
     }
     assert_eq!(
-        subscriber.count_by(|s| s.key_expr().as_str() == key),
+        subscriber.count_by(|s| text(s).starts_with(&mine)),
         0,
         "{key} delivered"
     );
+}
+
+/// Publishes once on `key` from `publisher`, when the routes are in place: each of
+/// `subscribers` gets that publication, and gets it once.
+async fn delivered_once(
+    publisher: &Session,
+    key: &str,
+    subscribers: &[&crate::UnboundedSink<Sample>],
+) {
+    let mine = fresh("once");
+    let copies =
+        |subscriber: &crate::UnboundedSink<Sample>| subscriber.count_by(|s| text(s) == mine);
+    ztimeout!(publisher.put(key, mine.as_str())).unwrap();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while subscribers.iter().any(|subscriber| copies(subscriber) == 0) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{key} not delivered"
+        );
+        tokio::time::sleep(SLEEP).await;
+    }
+    // a second copy would come by another, possibly longer, path
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let copies = subscribers.iter().map(|s| copies(s)).collect::<Vec<_>>();
+    assert!(copies.iter().all(|n| *n == 1), "{key}: copies {copies:?}");
+}
+
+/// A queryable of `session` on `key` that replies `payload`, and the number of queries it got.
+async fn counting_queryable(
+    session: &Session,
+    key: &'static str,
+    payload: &'static str,
+) -> (zenoh::query::Queryable<()>, Arc<AtomicUsize>) {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let queryable = ztimeout!(session.declare_queryable(key).callback({
+        let asked = asked.clone();
+        move |query| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            query.reply(key, payload).wait().unwrap();
+        }
+    }))
+    .unwrap();
+    (queryable, asked)
+}
+
+/// Queries `key` from `session` until the replies are `want`, then once more: the replies are
+/// `want` again, each once, and each of the queryables behind `asked` got that query once.
+async fn answered_once(session: &Session, key: &str, want: &[&str], asked: &[&Arc<AtomicUsize>]) {
+    let sorted = |mut replies: Vec<String>| {
+        replies.sort();
+        replies
+    };
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let got = sorted(replies(session, key).await);
+        if got == want {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{key}: {got:?}");
+    }
+    let before = asked
+        .iter()
+        .map(|n| n.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    assert_eq!(sorted(replies(session, key).await), want, "{key}");
+    let calls = asked
+        .iter()
+        .zip(before)
+        .map(|(n, before)| n.load(Ordering::SeqCst) - before)
+        .collect::<Vec<_>>();
+    assert!(calls.iter().all(|n| *n == 1), "{key}: calls {calls:?}");
 }
 
 /// A leaf bridge connects to a cloud router that uses the `auto` gateway preset: that router
@@ -492,7 +599,7 @@ async fn eventually_interest_states(bridge: &Session, expected: &[&str]) {
 
 /// The interest that asks for tokens is denied; the one that asks for subscribers and
 /// queryables, sent apart, is answered, and its flows work. The south region does not get the
-/// tokens of the cloud. The admin space of the bridge reports the first interest `denied` when
+/// tokens of the cloud. The admin space of the bridge reports the first interest `not_sent` when
 /// its own access control denies it, and `finalized` when the cloud's does: the cloud answers a
 /// denied interest as one that nothing matches.
 async fn a_denied_token_interest_leaves_the_other_interests_alone(
@@ -546,8 +653,12 @@ async fn a_denied_token_interest_leaves_the_other_interests_alone(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_regions_leaf_uplink_reports_a_token_interest_denied_by_its_access_control() {
-    a_denied_token_interest_leaves_the_other_interests_alone(DeniedBy::Bridge, "denied", "1eaf50")
-        .await;
+    a_denied_token_interest_leaves_the_other_interests_alone(
+        DeniedBy::Bridge,
+        "not_sent",
+        "1eaf50",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -591,7 +702,7 @@ async fn a_denied_mixed_interest_keeps_robot_publications_south(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_regions_leaf_uplink_reports_a_mixed_interest_denied_by_its_access_control() {
-    a_denied_mixed_interest_keeps_robot_publications_south(DeniedBy::Bridge, "denied", "1eaf60")
+    a_denied_mixed_interest_keeps_robot_publications_south(DeniedBy::Bridge, "not_sent", "1eaf60")
         .await;
 }
 
@@ -623,7 +734,9 @@ async fn bridge_of_two_clouds(zid: &str, ports: (u16, u16)) -> Session {
             r#"{ north: {
                 mode: "client",
                 uplinks: [{ link_protocols: ["tcp"] }],
-                interests: [{ key_expr: "r1/**", subscribers: true }],
+                interests: [
+                    { key_expr: "r1/**", subscribers: true, queryables: true, tokens: true },
+                ],
             } }"#
         )
         .insert(
@@ -746,37 +859,77 @@ async fn test_regions_leaf_uplink_shows_no_refused_remote_to_transport_observers
 
 /// A leaf bridge with two endpoints that lead north. While one cloud router owns the north
 /// region, the other one is not announced to the observers of the transports of the bridge.
-/// When the owner goes away, the bridge reaches the other cloud router within
-/// [`HANDOVER_BOUND`], and the observers are told of one closed and one opened transport.
-#[cfg(feature = "unstable")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_regions_leaf_uplink_hands_over_to_the_other_north_remote() {
-    use zenoh::session::TransportEvent;
+/// When the owner goes away, the bridge is admitted by the other cloud router, the declarations
+/// of the old one are withdrawn, and publications and queries work with the new one, all of it
+/// within [`HANDOVER_BOUND`] of the moment the owner starts to close.
+///
+/// Without `slow_close`, the owner closes its session: the bridge loses its link to it.
+///
+/// With `slow_close`, the owner stays up and the bridge gives up on it, as on a remote that no
+/// longer reads: a message that cannot be dropped is not enqueued, and the bridge deletes the
+/// transport at once, without losing a link first. That deletion is then held back, after it
+/// marked the transport closed and before it closes the link and its tasks, until the
+/// hand-over is complete: the clean-up of the old transport takes as long as it wants, and the
+/// hand-over does not wait for it.
+#[cfg(all(feature = "unstable", feature = "test"))]
+async fn hands_over_to_the_other_north_remote(zid_prefix: &str, slow_close: bool) {
+    use zenoh::{qos::CongestionControl, session::TransportEvent};
+    use zenoh_transport::unicast::test_helpers::{fail_pushes, gate_deletions};
 
     /// The retry period of the endpoints is at most 400 ms: a bound of a few of them.
     const HANDOVER_BOUND: Duration = Duration::from_secs(3);
+    const QUERY: Duration = Duration::from_millis(300);
 
     zenoh::init_log_from_env_or("error");
     let ports = two_free_ports();
-    let bridge = bridge_of_two_clouds("1eaf8002", ports).await;
+    let bridge_zid = format!("{zid_prefix}02");
+    let bridge = bridge_of_two_clouds(&bridge_zid, ports).await;
     let events = ztimeout!(bridge
         .info()
         .transport_events_listener()
         .with(unbounded_sink()))
     .unwrap();
-    let (a, b) = tokio::join!(cloud_on("1eaf800a", ports.0), cloud_on("1eaf800b", ports.1));
+    let alive = ztimeout!(bridge
+        .liveliness()
+        .declare_subscriber("r1/alive/**")
+        .with(unbounded_sink()))
+    .unwrap();
+    let _robot_srv = counting_queryable(&bridge, "r1/robot/srv", "robot").await;
+    let zids = (format!("{zid_prefix}0a"), format!("{zid_prefix}0b"));
+    let (a, b) = tokio::join!(cloud_on(&zids.0, ports.0), cloud_on(&zids.1, ports.1));
+    // each cloud router has a token, a subscriber and a queryable that names it
+    let mut tokens = vec![];
+    let mut queryables = vec![];
+    let mut teles = vec![];
+    for cloud in [&a, &b] {
+        let zid = cloud.zid().to_string();
+        tokens
+            .push(ztimeout!(cloud.liveliness().declare_token(format!("r1/alive/{zid}"))).unwrap());
+        teles.push(ztimeout!(cloud.declare_subscriber("r1/tele").with(unbounded_sink())).unwrap());
+        queryables.push(
+            ztimeout!(cloud
+                .declare_queryable("r1/cloud/srv")
+                .callback(move |query| {
+                    query.reply("r1/cloud/srv", zid.as_str()).wait().unwrap();
+                }))
+            .unwrap(),
+        );
+    }
 
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     while north_remotes(&bridge, &[&a, &b]).await.len() != 1 {
         assert!(tokio::time::Instant::now() < deadline, "no north remote");
         tokio::time::sleep(SLEEP).await;
     }
-    let (owner, other) = if north_remotes(&bridge, &[&a, &b]).await[0] == a.zid().to_string() {
-        (a, b)
+    let a_owns = north_remotes(&bridge, &[&a, &b]).await[0] == a.zid().to_string();
+    let (owner, other) = if a_owns { (a, b) } else { (b, a) };
+    let (owner_tele, other_tele) = if a_owns {
+        (&teles[0], &teles[1])
     } else {
-        (b, a)
+        (&teles[1], &teles[0])
     };
-    let events_of = |zid: String| -> Vec<SampleKind> {
+    let (owner_zid, other_zid) = (owner.zid().to_string(), other.zid().to_string());
+    let events_of = |zid: &str| -> Vec<SampleKind> {
         let kinds = std::cell::RefCell::new(vec![]);
         events.count_by(|e: &TransportEvent| {
             if e.transport().zid().to_string() == zid {
@@ -786,29 +939,126 @@ async fn test_regions_leaf_uplink_hands_over_to_the_other_north_remote() {
         });
         kinds.into_inner()
     };
+    let tokens_of = |zid: &str| -> Vec<SampleKind> {
+        let kinds = std::cell::RefCell::new(vec![]);
+        alive.count_by(|s: &Sample| {
+            if s.key_expr().as_str().ends_with(zid) {
+                kinds.borrow_mut().push(s.kind());
+            }
+            true
+        });
+        kinds.into_inner()
+    };
+
+    // the flows with the owner
+    delivered(&bridge, "r1/tele", owner_tele).await;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while replies(&owner, "r1/robot/srv").await != ["robot"]
+        || replies(&bridge, "r1/cloud/srv").await != [owner_zid.clone()]
+        || tokens_of(&owner_zid) != [SampleKind::Put]
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no flow with the owner"
+        );
+    }
     // the other remote is refused, at least if it completed its handshake: no event for it
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(events_of(owner.zid().to_string()), [SampleKind::Put]);
-    assert!(events_of(other.zid().to_string()).is_empty());
+    assert_eq!(events_of(&owner_zid), [SampleKind::Put]);
+    assert!(events_of(&other_zid).is_empty());
+    assert!(tokens_of(&other_zid).is_empty());
 
-    let (owner_zid, start) = (owner.zid().to_string(), tokio::time::Instant::now());
-    ztimeout!(owner.close()).unwrap();
-    while north_remotes(&bridge, &[&other]).await.len() != 1 {
-        assert!(
-            start.elapsed() < HANDOVER_BOUND,
-            "no uplink to the other cloud router after {:?}",
-            start.elapsed()
+    let gate = slow_close.then(|| gate_deletions(bridge_zid.parse().unwrap()));
+    let start = tokio::time::Instant::now();
+    let (closing, _failing, _owner) = if slow_close {
+        let failing = fail_pushes(bridge_zid.parse().unwrap(), owner_zid.parse().unwrap());
+        ztimeout!(bridge
+            .put("r1/tele", "the one that is not enqueued")
+            .congestion_control(CongestionControl::Block))
+        .unwrap();
+        (None, Some(failing), Some(owner))
+    } else {
+        let closing = tokio::spawn(async move { owner.close().await });
+        (Some(closing), None, None)
+    };
+    let handed_over = async {
+        loop {
+            let uplink = uplink_state(&bridge).await;
+            if uplink["remote"] == other_zid.as_str() && uplink["state"] == "connected" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let admitted = start.elapsed();
+        // the declarations of the old owner are withdrawn, those of the new one are there
+        while tokens_of(&owner_zid) != [SampleKind::Put, SampleKind::Delete]
+            || tokens_of(&other_zid) != [SampleKind::Put]
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // and the flows work with the new one
+        delivered(&bridge, "r1/tele", other_tele).await;
+        while replies_within(&other, "r1/robot/srv", QUERY).await != ["robot"] {}
+        while replies_within(&bridge, "r1/cloud/srv", QUERY).await != [other_zid.clone()] {}
+        admitted
+    };
+    let admitted = tokio::time::timeout(HANDOVER_BOUND, handed_over)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "slow close {slow_close}: no complete hand-over within {HANDOVER_BOUND:?}: \
+                 tokens of the old owner {:?}, of the new one {:?}",
+                tokens_of(&owner_zid),
+                tokens_of(&other_zid)
+            )
+        });
+    let complete = start.elapsed();
+    println!("slow close {slow_close}: admitted after {admitted:?}, flows back after {complete:?}");
+    assert!(complete < HANDOVER_BOUND, "{complete:?}");
+
+    if let Some(gate) = gate {
+        // all of this happened while the transport of the old owner was not cleaned up
+        assert!(gate.waiting() >= 1, "the old transport was not held back");
+        assert_eq!(events_of(&owner_zid), [SampleKind::Put]);
+        assert_eq!(
+            north_remotes(&bridge, &[&other]).await,
+            std::slice::from_ref(&other_zid)
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        gate.open();
     }
-    println!("time without uplink: {:?}", start.elapsed());
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(events_of(owner_zid), [SampleKind::Put, SampleKind::Delete]);
-    assert_eq!(events_of(other.zid().to_string()), [SampleKind::Put]);
-    assert_eq!(
-        uplink_state(&bridge).await["remote"],
-        other.zid().to_string()
-    );
+    if let Some(closing) = closing {
+        ztimeout!(closing).unwrap().unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while events_of(&owner_zid) != [SampleKind::Put, SampleKind::Delete] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?}",
+            events_of(&owner_zid)
+        );
+        tokio::time::sleep(SLEEP).await;
+    }
+    assert_eq!(events_of(&other_zid), [SampleKind::Put]);
+    let uplink = uplink_state(&bridge).await;
+    assert_eq!(uplink["remote"], other_zid.as_str());
+    assert_eq!(uplink["state"], "connected");
+    // the late end of the old transport took nothing from the new one
+    delivered_once(&bridge, "r1/tele", &[other_tele]).await;
+    assert_eq!(tokens_of(&other_zid), [SampleKind::Put]);
+    drop((tokens, queryables));
+}
+
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_hands_over_to_the_other_north_remote() {
+    hands_over_to_the_other_north_remote("1eaf80", false).await;
+}
+
+/// The same hand-over while the transport of the old owner cannot be cleaned up.
+#[cfg(all(feature = "unstable", feature = "test"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_hands_over_before_the_old_transport_is_cleaned_up() {
+    hands_over_to_the_other_north_remote("1eaf81", true).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -825,7 +1075,7 @@ async fn test_regions_leaf_uplink_hands_over_to_the_other_north_remote() {
 const FLEET_KEYS: &str = "*/app/**";
 
 struct Robot {
-    _south: Session,
+    south: Session,
     bridge: Session,
     /// A session of the south router, two hops south of the uplink.
     app: Session,
@@ -880,7 +1130,7 @@ async fn robot(cloud: &Session, name: &str, zid_prefix: &str, default_route: boo
     let x5 = ztimeout!(Node::new(Client, &zid(6)).connect(&[loc!(bridge)]).open());
     eventually_interest_states(&bridge, &["finalized"]).await;
     Robot {
-        _south: south,
+        south,
         bridge,
         app,
         x5,
@@ -897,39 +1147,78 @@ async fn fleet_of_two(zid_prefix: &str, default_route: bool) -> (Session, Robot,
     (cloud, r1, r2)
 }
 
+/// The state of the default route of a router, from its admin space.
+async fn default_route_state(router: &Session) -> serde_json::Value {
+    let replies = ztimeout!(router
+        .get(format!("@/{}/router/default_route", router.zid()))
+        .timeout(Duration::from_secs(2)))
+    .unwrap();
+    let reply = ztimeout!(replies.recv_async()).expect("no reply from the admin space");
+    serde_json::from_slice(&reply.result().unwrap().payload().to_bytes()).unwrap()
+}
+
 /// Sessions of a robot, on its south router and on its bridge, publish to and query a key of
-/// another robot, both ways.
+/// another robot, both ways and from each board. Once the routes are in place a publication is
+/// delivered once to its subscriber on the other robot and once to a wildcard subscriber of
+/// the robot it comes from, and a query is answered once by a queryable that was asked once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_regions_leaf_uplink_default_route_reaches_another_robot() {
     zenoh::init_log_from_env_or("error");
-    let (_cloud, r1, r2) = fleet_of_two("1eafb", true).await;
+    let (cloud, r1, r2) = fleet_of_two("1eafb", true).await;
 
+    let control1 = ztimeout!(r1
+        .app
+        .declare_subscriber("r1/app/control")
+        .with(unbounded_sink()))
+    .unwrap();
     let control2 = ztimeout!(r2
         .app
         .declare_subscriber("r2/app/control")
         .with(unbounded_sink()))
     .unwrap();
-    let control1 = ztimeout!(r1
+    // on the bridge of the first robot, for the keys of every robot
+    let recorder1 = ztimeout!(r1
         .x5
-        .declare_subscriber("r1/app/control")
+        .declare_subscriber("*/app/control")
         .with(unbounded_sink()))
     .unwrap();
-    let _srv2 = ztimeout!(r2.app.declare_queryable("r2/app/srv").callback(|query| {
-        query.reply("r2/app/srv", "from r2").wait().unwrap();
-    }))
-    .unwrap();
+    let (_srv1, asked1) = counting_queryable(&r1.x5, "r1/app/srv", "from r1").await;
+    let (_srv2, asked2) = counting_queryable(&r2.app, "r2/app/srv", "from r2").await;
 
-    delivered(&r1.app, "r2/app/control", &control2).await;
-    let seen = control2.count_by(|_| true);
-    delivered(&r2.app, "r1/app/control", &control1).await;
-    delivered(&r2.x5, "r1/app/control", &control1).await;
-    assert_eq!(control2.count_by(|_| true), seen);
+    // what the operator reads: the gateway of each router of the first robot
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while default_route_state(&r1.south).await["gateway"] != r1.bridge.zid().to_string()
+        || default_route_state(&r1.bridge).await["gateway"] != cloud.zid().to_string()
+    {
+        assert!(tokio::time::Instant::now() < deadline, "no default gateway");
+        tokio::time::sleep(SLEEP).await;
+    }
+    let state = default_route_state(&r1.south).await;
+    assert_eq!(state["key_exprs"], serde_json::json!([FLEET_KEYS]));
+    assert_eq!(state["except"], serde_json::json!(["r1/**"]));
+
+    // each board of a robot publishes to the other robot, with publications of its own
+    for source in [&r1.app, &r1.x5] {
+        delivered(source, "r2/app/control", &control2).await;
+        delivered(source, "r2/app/control", &recorder1).await;
+    }
+    for source in [&r2.app, &r2.x5] {
+        delivered(source, "r1/app/control", &control1).await;
+        delivered(source, "r1/app/control", &recorder1).await;
+    }
+    // the routes are in place: one publication, one copy for each subscriber
+    for source in [&r1.app, &r1.x5] {
+        delivered_once(source, "r2/app/control", &[&control2, &recorder1]).await;
+    }
+    for source in [&r2.app, &r2.x5] {
+        delivered_once(source, "r1/app/control", &[&control1, &recorder1]).await;
+    }
 
     for session in [&r1.app, &r1.x5] {
-        let deadline = tokio::time::Instant::now() + TIMEOUT;
-        while replies(session, "r2/app/srv").await != ["from r2"] {
-            assert!(tokio::time::Instant::now() < deadline, "no reply");
-        }
+        answered_once(session, "r2/app/srv", &["from r2"], &[&asked2]).await;
+    }
+    for session in [&r2.app, &r2.x5] {
+        answered_once(session, "r1/app/srv", &["from r1"], &[&asked1]).await;
     }
     // a query that nobody answers ends at once, without waiting for its timeout
     let start = tokio::time::Instant::now();
@@ -954,42 +1243,41 @@ async fn test_regions_leaf_uplink_without_default_route_only_the_bridge_reaches_
     .unwrap();
 
     delivered(&r1.x5, "r2/app/control", &control2).await;
-    let seen = control2.count_by(|_| true);
-    for _ in 0..10 {
-        ztimeout!(r1.app.put("r2/app/control", "x")).unwrap();
-        tokio::time::sleep(SLEEP).await;
-    }
-    assert_eq!(control2.count_by(|_| true), seen);
+    not_delivered(&r1.app, "r2/app/control", &control2).await;
 }
 
-/// A wildcard query inside the keys of the fleet gets the replies of the robot and of the other
-/// one, once each. A key outside the keys of the fleet is not sent to the cloud by a robot with
-/// a default route, even from a session of its bridge.
+/// Wildcards inside the keys of the fleet, which cover the robot and the other ones: a query
+/// gets the replies of the robot and of the other one, once each, and a publication is delivered
+/// once on the robot and once on the other one. A key outside the keys of the fleet is not sent
+/// to the cloud by a robot with a default route, even from a session of its bridge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_regions_leaf_uplink_default_route_keeps_other_keys_on_the_robot() {
     zenoh::init_log_from_env_or("error");
     let (cloud, r1, r2) = fleet_of_two("1eafd", true).await;
     let phone = ztimeout!(Node::new(Client, "1eafd004").connect(&[loc!(cloud)]).open());
-    let _status1 = ztimeout!(r1.x5.declare_queryable("r1/app/status").callback(|query| {
-        query.reply("r1/app/status", "r1").wait().unwrap();
-    }))
+    let (_status1, asked1) = counting_queryable(&r1.x5, "r1/app/status", "r1").await;
+    let (_status2, asked2) = counting_queryable(&r2.app, "r2/app/status", "r2").await;
+    let event1 = ztimeout!(r1
+        .x5
+        .declare_subscriber("r1/app/event")
+        .with(unbounded_sink()))
     .unwrap();
-    let _status2 = ztimeout!(r2.app.declare_queryable("r2/app/status").callback(|query| {
-        query.reply("r2/app/status", "r2").wait().unwrap();
-    }))
+    let event2 = ztimeout!(r2
+        .app
+        .declare_subscriber("r2/app/event")
+        .with(unbounded_sink()))
     .unwrap();
     // outside of the interests of the bridges: the cloud does not declare them to the robots
     let outside = ztimeout!(phone.declare_subscriber("rt/**").with(unbounded_sink())).unwrap();
     let foreign = ztimeout!(phone.declare_subscriber("r9/app/**").with(unbounded_sink())).unwrap();
 
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        let mut got = replies(&r1.app, "*/app/status").await;
-        got.sort();
-        if got == ["r1", "r2"] {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "{got:?}");
+    answered_once(&r1.app, "*/app/status", &["r1", "r2"], &[&asked1, &asked2]).await;
+    answered_once(&r1.x5, "*/app/status", &["r1", "r2"], &[&asked1, &asked2]).await;
+
+    for source in [&r1.app, &r1.x5] {
+        delivered(source, "*/app/event", &event1).await;
+        delivered(source, "*/app/event", &event2).await;
+        delivered_once(source, "*/app/event", &[&event1, &event2]).await;
     }
 
     delivered(&r1.x5, "r9/app/log", &foreign).await;
