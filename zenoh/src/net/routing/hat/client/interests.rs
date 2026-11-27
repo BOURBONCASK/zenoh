@@ -111,14 +111,26 @@ impl Hat {
     /// north face, towards a matching subscriber (resp. queryable) that the north remote
     /// declared. `asks_for` tells if an interest asks for that kind of entity.
     ///
+    /// With a default route (`gateway.north.default_route`), the default route alone decides
+    /// what is sent north without a declaration:
+    ///
+    /// + `key_expr` is not eligible to it: `true`, whatever the state of the configured
+    ///   interests. The keys that the default route excludes are those of this site: they never
+    ///   go north without a declared destination, not even while the interest that includes
+    ///   them is pending after a (re)connection. The declarations of the north remote are
+    ///   served as they arrive.
+    /// + `key_expr` is eligible: as without a default route, below.
+    ///
+    /// Without a default route:
+    ///
     /// + A configured interest includes `key_expr`, asks for the kind and is no longer pending:
     ///   `true`. Finalized, every matching entity of the north remote has been declared to this
     ///   node. Denied, or unanswered at its deadline, this node does not know the entities of
     ///   the north remote, but south traffic must not flow to the uplink for as long as an
     ///   interest stays without an answer.
-    /// + Such an interest is pending: `false`, the entities are not known yet.
-    /// + No configured interest includes `key_expr`: `false`, unless a default route is
-    ///   configured and `key_expr` is not eligible to it.
+    /// + Such an interest is pending: `false`, the entities are not known yet. This is bounded
+    ///   by the deadline of the interest, and happens again at each connection.
+    /// + No configured interest includes `key_expr`: `false`.
     ///
     /// Without configured interests and default route, this returns `false`: the hat routes as
     /// the one of any client.
@@ -134,24 +146,24 @@ impl Hat {
         let Some(hat_face) = face.hats[self.region].downcast_ref::<HatFace>() else {
             return false;
         };
-        let mut pending = false;
-        for interest in hat_face.uplink_interests.iter().filter(|interest| {
-            asks_for(&interest.options)
-                && interest
-                    .res
-                    .keyexpr()
-                    .is_some_and(|interest_ke| interest_ke.includes(key_expr))
-        }) {
-            if interest.state != UplinkInterestState::Pending {
-                return true;
-            }
-            pending = true;
+        if self
+            .default_route
+            .as_ref()
+            .is_some_and(|default_route| !default_route.is_eligible(key_expr))
+        {
+            return true;
         }
-        !pending
-            && self
-                .default_route
-                .as_ref()
-                .is_some_and(|default_route| !default_route.is_eligible(key_expr))
+        hat_face
+            .uplink_interests
+            .iter()
+            .filter(|interest| {
+                asks_for(&interest.options)
+                    && interest
+                        .res
+                        .keyexpr()
+                        .is_some_and(|interest_ke| interest_ke.includes(key_expr))
+            })
+            .any(|interest| interest.state != UplinkInterestState::Pending)
     }
 
     /// Marks the configured interests of `face` that are still pending as unanswered.
