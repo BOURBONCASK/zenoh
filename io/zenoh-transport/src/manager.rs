@@ -17,7 +17,7 @@ use rand::{RngCore, SeedableRng};
 use tokio::sync::Mutex as AsyncMutex;
 use zenoh_config::{ExpandedConfig, LinkRxConf, QueueAllocConf, QueueConf, QueueSizeConf};
 use zenoh_crypto::{BlockCipher, PseudoRng};
-use zenoh_link::{LinkKind, NewLinkChannelSender};
+use zenoh_link::{Link, LinkKind, NewLinkChannelSender};
 use zenoh_protocol::{
     core::{
         Bound, EndPoint, Field, Locator, Priority, RegionName, Resolution, WhatAmI, ZenohIdProto,
@@ -67,6 +67,8 @@ fn duration_from_i64us(us: i64) -> Duration {
 }
 
 pub type RemoteBoundCallback = Arc<dyn Fn(TransportPeer) -> ZResult<Option<Bound>> + Send + Sync>;
+/// Chooses the mode announced on a link during establishment. `None` means the mode of the node.
+pub type LinkWhatAmICallback = Arc<dyn Fn(&Link) -> Option<WhatAmI> + Send + Sync>;
 
 /// # Examples
 /// ```
@@ -142,7 +144,18 @@ pub struct TransportManagerConfig {
     pub tx_threads: usize,
     pub supported_links: Vec<LinkKind>,
     pub bound_callback: Option<RemoteBoundCallback>,
+    pub link_whatami_callback: Option<LinkWhatAmICallback>,
     pub region_name: Option<RegionName>,
+}
+
+impl TransportManagerConfig {
+    /// The mode this node announces on `link` during establishment.
+    pub(crate) fn whatami_on(&self, link: &Link) -> WhatAmI {
+        self.link_whatami_callback
+            .as_ref()
+            .and_then(|callback| callback(link))
+            .unwrap_or(self.whatami)
+    }
 }
 
 impl fmt::Debug for TransportManagerConfig {
@@ -246,6 +259,7 @@ pub struct TransportManagerBuilder {
     supported_links: Option<Vec<LinkKind>>,
     region_name: Option<RegionName>,
     bound_callback: Option<RemoteBoundCallback>,
+    link_whatami_callback: Option<LinkWhatAmICallback>,
     #[cfg(feature = "shared-memory")]
     shm: zenoh_config::ShmConf,
     #[cfg(feature = "shared-memory")]
@@ -411,6 +425,16 @@ impl TransportManagerBuilder {
         self
     }
 
+    /// Sets the callback that chooses the mode announced on each link. Without it, or when it
+    /// returns `None`, the mode of the node is announced.
+    pub fn link_whatami_callback(
+        mut self,
+        callback: impl Fn(&Link) -> Option<WhatAmI> + Send + Sync + 'static,
+    ) -> Self {
+        self.link_whatami_callback = Some(Arc::new(callback));
+        self
+    }
+
     pub async fn from_config(
         mut self,
         config: &ExpandedConfig,
@@ -515,6 +539,7 @@ impl TransportManagerBuilder {
                 .supported_links
                 .unwrap_or_else(|| zenoh_link::ALL_SUPPORTED_LINKS.to_vec()),
             bound_callback: self.bound_callback,
+            link_whatami_callback: self.link_whatami_callback,
             region_name: self.region_name,
         };
 
@@ -613,6 +638,7 @@ impl Default for TransportManagerBuilder {
             supported_links: None,
             region_name: None,
             bound_callback: None,
+            link_whatami_callback: None,
             #[cfg(feature = "shared-memory")]
             shm: zenoh_config::ShmConf::default(),
             #[cfg(feature = "shared-memory")]

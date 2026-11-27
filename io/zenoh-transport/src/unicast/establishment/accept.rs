@@ -738,6 +738,13 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         #[cfg(feature = "shared-memory")]
         LinkShmHandoffConfig::new_disabled().into(),
     );
+    let mine_whatami = manager
+        .config
+        .whatami_on(&zenoh_link_commons::Link::new_unicast(
+            &link_unicast.link,
+            link_unicast.config.priorities.clone(),
+            link_unicast.config.reliability,
+        ));
     let mut fsm = AcceptLink {
         link: &mut link_unicast,
         prng: &manager.prng,
@@ -827,7 +834,7 @@ pub(crate) async fn accept_link(link: LinkUnicast, manager: &TransportManager) -
         let iack_in = SendInitAckIn {
             mine_version: manager.config.version,
             mine_zid: manager.config.zid,
-            mine_whatami: manager.config.whatami,
+            mine_whatami,
             other_zid: isyn_out.other_zid,
             other_whatami: isyn_out.other_whatami,
         };

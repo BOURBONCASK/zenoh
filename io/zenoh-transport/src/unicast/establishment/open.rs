@@ -706,7 +706,13 @@ pub(crate) async fn open_link(
     let isyn_in = SendInitSynIn {
         mine_version: manager.config.version,
         mine_zid: manager.config.zid,
-        mine_whatami: manager.config.whatami,
+        mine_whatami: manager
+            .config
+            .whatami_on(&zenoh_link_commons::Link::new_unicast(
+                &link_unicast.link,
+                link_unicast.config.priorities.clone(),
+                link_unicast.config.reliability,
+            )),
     };
     step!(
         fsm.send_init_syn((&mut link_unicast, &mut state, isyn_in))
