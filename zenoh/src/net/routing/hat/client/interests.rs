@@ -443,28 +443,52 @@ impl HatInterestTrait for Hat {
         debug_assert!(ctx.src_face.region.bound().is_north());
 
         let remote = ctx.src_face.zid;
-        if let Some(interest) = self
+        let mut answered_late = None;
+        let configured = match self
             .face_hat_mut(ctx.src_face)
             .uplink_interests
             .iter_mut()
             .find(|i| i.id == interest_id)
         {
-            match interest.state {
-                UplinkInterestState::Pending => tracing::info!(
-                    "Uplink interest '{}' ({}) answered by {}",
-                    interest.res.expr(),
-                    interest.options,
-                    remote
-                ),
-                UplinkInterestState::Unanswered => tracing::warn!(
-                    "Uplink interest '{}' ({}) answered by {} after its deadline",
-                    interest.res.expr(),
-                    interest.options,
-                    remote
-                ),
-                UplinkInterestState::Finalized | UplinkInterestState::NotSent => {}
+            Some(interest) => {
+                match interest.state {
+                    UplinkInterestState::Pending => tracing::info!(
+                        "Uplink interest '{}' ({}) answered by {}",
+                        interest.res.expr(),
+                        interest.options,
+                        remote
+                    ),
+                    UplinkInterestState::Unanswered => {
+                        answered_late = Some((
+                            format!("late {} {}", interest.res.expr(), interest.options),
+                            format!(
+                                "Uplink interest '{}' ({}) answered by {} after its deadline",
+                                interest.res.expr(),
+                                interest.options,
+                                remote
+                            ),
+                        ))
+                    }
+                    UplinkInterestState::Finalized | UplinkInterestState::NotSent => {}
+                }
+                interest.state = UplinkInterestState::Finalized;
+                true
             }
-            interest.state = UplinkInterestState::Finalized;
+            None => false,
+        };
+        // NOTE: an uplink that reconnects again and again to a remote that answers late would
+        // otherwise log this once per interest and connection.
+        if let Some((subject, message)) = answered_late {
+            if self.uplink_logs.due(&subject) {
+                tracing::warn!(
+                    "{message} (logged at most once per {:?} for this interest)",
+                    LogLimiter::PERIOD
+                );
+            } else {
+                tracing::debug!("{message}");
+            }
+        }
+        if configured {
             return NoBreadcrumb;
         }
 
