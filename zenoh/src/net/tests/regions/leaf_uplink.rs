@@ -565,14 +565,14 @@ fn late_declarations_cross_the_uplink_and_are_withdrawn() {
     settle(&mut [&mut up, &mut r.tether]);
     r.app.put(ctx.clone(), vec![1]);
     settle(&mut [&mut r.tether, &mut up]);
-    assert_eq!(seen(&phone).pushes, [ctx.clone()]);
+    assert_eq!(seen(&phone).pushes, std::slice::from_ref(&ctx));
 
     // and stop when it is undeclared
     phone.undeclare_subscriber(1);
     settle(&mut [&mut up, &mut r.tether]);
     r.app.put(ctx.clone(), vec![2]);
     settle(&mut [&mut r.tether, &mut up]);
-    assert_eq!(seen(&phone).pushes, [ctx.clone()]);
+    assert_eq!(seen(&phone).pushes, std::slice::from_ref(&ctx));
     assert_eq!(a_sent(&up).pushes, [ctx]);
 
     // robot queryable declared late: the cloud reaches it
