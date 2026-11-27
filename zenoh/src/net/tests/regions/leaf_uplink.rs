@@ -135,7 +135,7 @@ fn interest_states(bridge: &Harness) -> Vec<Option<UplinkInterestState>> {
 
 /// Waits for the deadline of the configured interests declared before the call.
 fn wait_for_the_deadline(bridge: &Harness, expected: &[Option<UplinkInterestState>]) {
-    let until = std::time::Instant::now() + 20 * DEADLINE;
+    let until = std::time::Instant::now() + 5 * DEADLINE;
     while interest_states(bridge) != expected {
         assert!(
             std::time::Instant::now() < until,

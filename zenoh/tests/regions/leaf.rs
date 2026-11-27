@@ -690,8 +690,61 @@ async fn test_regions_leaf_uplink_admits_one_of_two_simultaneous_north_remotes()
     }
 }
 
-/// A leaf bridge with two endpoints that lead north. The remote that is refused while the other
-/// one owns the north region is not announced to the observers of the transports of the bridge.
+/// A remote that the leaf refuses is not announced to the observers of its transports. The
+/// first endpoint of the bridge leads to a router that keeps its clients in its north region:
+/// the bridge refuses it at each attempt. The second one leads to a cloud router, started
+/// later, which is admitted: the observers are told of that transport only.
+#[cfg(feature = "unstable")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_regions_leaf_uplink_shows_no_refused_remote_to_transport_observers() {
+    use zenoh::session::TransportEvent;
+
+    zenoh::init_log_from_env_or("error");
+    let ports = two_free_ports();
+    let stranger = ztimeout!(Node::new(Router, "1eafa001")
+        .listen(&format!("tcp/127.0.0.1:{}", ports.0))
+        .gateway(r#"{ south: [{ filters: [{ modes: ["router"] }] }] }"#)
+        .open());
+    let bridge = bridge_of_two_clouds("1eafa003", ports).await;
+    let events = ztimeout!(bridge
+        .info()
+        .transport_events_listener()
+        .with(unbounded_sink()))
+    .unwrap();
+    let events_of = |zid: String| -> Vec<SampleKind> {
+        let kinds = std::cell::RefCell::new(vec![]);
+        events.count_by(|e: &TransportEvent| {
+            if e.transport().zid().to_string() == zid {
+                kinds.borrow_mut().push(e.kind());
+            }
+            true
+        });
+        kinds.into_inner()
+    };
+
+    // several attempts: the retry period is at most 400 ms
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(uplink_state(&bridge).await["state"], "disconnected");
+    assert!(north_remotes(&bridge, &[&stranger]).await.is_empty());
+
+    let cloud = cloud_on("1eafa002", ports.1).await;
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while uplink_state(&bridge).await["remote"] != cloud.zid().to_string() {
+        assert!(tokio::time::Instant::now() < deadline, "no north remote");
+        tokio::time::sleep(SLEEP).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(events_of(cloud.zid().to_string()), [SampleKind::Put]);
+    assert!(events_of(stranger.zid().to_string()).is_empty());
+    assert_eq!(
+        north_remotes(&bridge, &[&stranger, &cloud]).await,
+        [cloud.zid().to_string()]
+    );
+}
+
+/// A leaf bridge with two endpoints that lead north. While one cloud router owns the north
+/// region, the other one is not announced to the observers of the transports of the bridge.
 /// When the owner goes away, the bridge reaches the other cloud router within
 /// [`HANDOVER_BOUND`], and the observers are told of one closed and one opened transport.
 #[cfg(feature = "unstable")]
