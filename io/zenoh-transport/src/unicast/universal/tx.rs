@@ -12,7 +12,7 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use std::sync::atomic::Ordering;
+use std::{sync::atomic::Ordering, time::Instant};
 
 #[cfg(feature = "unstable")]
 use zenoh_protocol::core::CongestionControl;
@@ -22,7 +22,7 @@ use zenoh_protocol::{
 };
 use zenoh_result::ZResult;
 
-use super::transport::TransportUnicastUniversal;
+use super::{handover::RequestLifetime, link::LinkTx, transport::TransportUnicastUniversal};
 use crate::unicast::transport_unicast_inner::TransportUnicastTrait;
 
 impl TransportUnicastUniversal {
@@ -105,7 +105,7 @@ impl TransportUnicastUniversal {
                     .read()
                     .expect("reading `TransportUnicastUniversal::links` should not fail");
                 for tl in transport_links.get_links().iter() {
-                    tl.pipeline.mark_disabled();
+                    tl.mark_tx_disabled();
                 }
             }
             zenoh_runtime::ZRuntime::RX.spawn({
@@ -135,7 +135,11 @@ impl TransportUnicastUniversal {
     #[allow(unused_mut)] // When feature "shared-memory" is not enabled
     #[allow(clippy::let_and_return)] // When feature "stats" is not enabled
     #[inline(always)]
-    pub(crate) fn internal_schedule(&self, mut msg: NetworkMessageMut) -> ZResult<bool> {
+    pub(crate) fn internal_schedule(
+        &self,
+        mut msg: NetworkMessageMut,
+        lifetime: Option<&RequestLifetime>,
+    ) -> ZResult<bool> {
         let transport_links = self
             .links
             .read()
@@ -169,6 +173,41 @@ impl TransportUnicastUniversal {
             .get(transport_link_index)
             .expect("transport link index should be valid");
 
+        let pipeline = match &transport_link.tx {
+            LinkTx::Pipeline(pipeline) => pipeline.clone(),
+            LinkTx::Handover(sender) => {
+                // The link is selected by a hand-over rule: its sender takes the message at
+                // once or refuses it. Nothing here waits for the link, and a refusal does
+                // not close the transport.
+                let sender = sender.clone();
+                #[cfg(feature = "stats")]
+                let stats = transport_link.stats.clone();
+                drop(transport_links);
+                let msg = msg.as_ref();
+                let admitted = match sender.admit(msg, lifetime, Instant::now()) {
+                    Ok(()) => true,
+                    Err(refusal) => {
+                        if sender.should_report(refusal) {
+                            tracing::warn!(
+                                "The link to {} does not take a blocking message ({:?}): {:?}",
+                                self.config.zid,
+                                refusal,
+                                sender.status()
+                            );
+                        }
+                        false
+                    }
+                };
+                #[cfg(feature = "stats")]
+                if admitted {
+                    stats.inc_network_message(zenoh_stats::Tx, msg);
+                } else {
+                    stats.tx_observe_congestion(msg);
+                }
+                return Ok(admitted);
+            }
+        };
+
         #[cfg(feature = "shared-memory")]
         let shm_handoff_transaction = self.shm_context.as_ref().map(|shm_context| {
             crate::common::shm::interop::map_zmsg_to_partner(
@@ -182,7 +221,6 @@ impl TransportUnicastUniversal {
 
         let msg = msg.as_ref();
 
-        let pipeline = transport_link.pipeline.clone();
         tracing::trace!(
             "Scheduled {:?} for transmission to {} ({})",
             msg,

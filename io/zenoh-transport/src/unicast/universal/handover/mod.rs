@@ -24,8 +24,6 @@
 //! [`SenderTask::step`] says what to do next, the caller writes the batch and gives it back
 //! with [`SenderTask::written`]. The link task drives it with the real clock and the real
 //! link; the tests drive it by hand.
-// Nothing selects a link yet: a rule is refused when the process starts.
-#![allow(dead_code, unused_imports)]
 
 use std::{
     any::Any,

@@ -55,6 +55,7 @@ use crate::{
         TransportManagerBuilderMulticast, TransportManagerConfigMulticast,
         TransportManagerStateMulticast,
     },
+    unicast::HandoverRules,
     TransportPeer,
 };
 
@@ -135,6 +136,8 @@ pub struct TransportManagerConfig {
     pub queue_alloc: QueueAllocConf,
     pub defrag_buff_size: usize,
     pub link_rx_buffer_size: usize,
+    /// The rules that select the links whose messages are handed over to an owned sender.
+    pub handover: Option<Arc<HandoverRules>>,
     pub unicast: TransportManagerConfigUnicast,
     pub multicast: TransportManagerConfigMulticast,
     pub link_configs: HashMap<LinkKind, String>, // (protocol, config)
@@ -239,6 +242,7 @@ pub struct TransportManagerBuilder {
     queue_alloc: QueueAllocConf,
     defrag_buff_size: usize,
     link_rx_buffer_size: usize,
+    handover: Option<Arc<HandoverRules>>,
     unicast: TransportManagerBuilderUnicast,
     multicast: TransportManagerBuilderMulticast,
     link_configs: HashMap<LinkKind, String>, // (protocol, config)
@@ -331,6 +335,12 @@ impl TransportManagerBuilder {
 
     pub fn batching_time_limit(mut self, batching_time_limit: Duration) -> Self {
         self.batching_time_limit = batching_time_limit;
+        self
+    }
+
+    /// The rules that select the links whose messages are handed over to an owned sender.
+    pub fn handover(mut self, handover: Option<Arc<HandoverRules>>) -> Self {
+        self.handover = handover;
         self
     }
 
@@ -438,10 +448,7 @@ impl TransportManagerBuilder {
         self = self.wait_before_close(duration_from_i64us(*cc_block.wait_before_close()));
         self = self.queue_size(link.tx().queue().size().clone());
         self = self.queue_alloc(*link.tx().queue().allocation());
-        if !link.tx().queue().handover().links().is_empty() {
-            // The sender of a selected link is not part of this build yet.
-            bail!("transport/link/tx/queue/handover/links: selecting links is not available yet");
-        }
+        self.handover = HandoverRules::from_config(config)?;
         self = self.tx_threads(*link.tx().threads());
         self = self.protocols(link.protocols().clone());
         self = self.region_name(config.region_name().clone());
@@ -510,6 +517,7 @@ impl TransportManagerBuilder {
             queue_alloc: self.queue_alloc,
             defrag_buff_size: self.defrag_buff_size,
             link_rx_buffer_size: self.link_rx_buffer_size,
+            handover: self.handover,
             unicast: unicast.config,
             multicast: multicast.config,
             link_configs: self.link_configs,
@@ -610,6 +618,7 @@ impl Default for TransportManagerBuilder {
             batching_time_limit: Duration::from_millis(backoff),
             defrag_buff_size: *link_rx.max_message_size(),
             link_rx_buffer_size: *link_rx.buffer_size(),
+            handover: None,
             link_configs: HashMap::new(),
             unicast: TransportManagerBuilderUnicast::default(),
             multicast: TransportManagerBuilderMulticast::default(),
@@ -777,35 +786,5 @@ impl TransportManager {
         let mut lsm = zenoh_runtime::ZRuntime::Net.block_in_place(self.get_locators_multicast());
         lsu.append(&mut lsm);
         lsu
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use zenoh_config::Config;
-
-    use super::TransportManagerBuilder;
-
-    // Until the sender of a selected link is complete, a rule is refused when the process
-    // starts: no link is given a part of its behaviour.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn a_rule_that_selects_links_is_refused_for_now() {
-        assert!(TransportManagerBuilder::default()
-            .from_config(&Config::default().expanded())
-            .await
-            .is_ok());
-        let mut config = Config::default();
-        config
-            .insert_json5(
-                "transport/link/tx/queue/handover",
-                r#"{ links: [{ link_protocols: ["quic"] }] }"#,
-            )
-            .unwrap();
-        let e = TransportManagerBuilder::default()
-            .from_config(&config.expanded())
-            .await
-            .err()
-            .expect("the rule is refused");
-        assert!(e.to_string().contains("handover"), "{e}");
     }
 }
